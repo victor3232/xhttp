@@ -1049,19 +1049,19 @@ function restart_system(){
 function ensure_haproxy(){
     print_install "Memastikan HAProxy Aktif"
 
-    # 1) Pastikan hap.pem ada & valid. Jika tidak, bangun ulang dari sertifikat.
-    if [ ! -s /etc/haproxy/hap.pem ] || ! grep -q "BEGIN CERTIFICATE" /etc/haproxy/hap.pem 2>/dev/null; then
-        if [ -s /etc/xray/xray.crt ] && [ -s /etc/xray/xray.key ]; then
-            cat /etc/xray/xray.crt /etc/xray/xray.key > /etc/haproxy/hap.pem
-        else
-            DOM=$(cat /etc/xray/domain 2>/dev/null)
-            [ -z "$DOM" ] && DOM=$(cat /root/domain 2>/dev/null)
-            [ -z "$DOM" ] && DOM="localhost"
-            openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
-                -keyout /etc/xray/xray.key -out /etc/xray/xray.crt \
-                -subj "/CN=${DOM}" >/dev/null 2>&1
-            cat /etc/xray/xray.crt /etc/xray/xray.key > /etc/haproxy/hap.pem
-        fi
+    # 1) Selalu selaraskan hap.pem dengan sertifikat Xray (xray.crt + xray.key).
+    #    Ini mencegah port 443 memakai cert lama/basi setelah renew/ubah domain.
+    if [ -s /etc/xray/xray.crt ] && [ -s /etc/xray/xray.key ]; then
+        cat /etc/xray/xray.crt /etc/xray/xray.key > /etc/haproxy/hap.pem
+        chmod 600 /etc/haproxy/hap.pem 2>/dev/null
+    elif [ ! -s /etc/haproxy/hap.pem ] || ! grep -q "BEGIN CERTIFICATE" /etc/haproxy/hap.pem 2>/dev/null; then
+        DOM=$(cat /etc/xray/domain 2>/dev/null)
+        [ -z "$DOM" ] && DOM=$(cat /root/domain 2>/dev/null)
+        [ -z "$DOM" ] && DOM="localhost"
+        openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+            -keyout /etc/xray/xray.key -out /etc/xray/xray.crt \
+            -subj "/CN=${DOM}" >/dev/null 2>&1
+        cat /etc/xray/xray.crt /etc/xray/xray.key > /etc/haproxy/hap.pem
         chmod 600 /etc/haproxy/hap.pem 2>/dev/null
     fi
 
