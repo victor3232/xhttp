@@ -23,6 +23,14 @@ if [ ! -d "$KYT_DIR" ]; then
   exit 1
 fi
 
+# rapikan kalau struktur paket masih nested (kyt/kyt/...) -> kyt/...
+if [ -f "$KYT_DIR/kyt/__main__.py" ] && [ ! -f "$KYT_DIR/__main__.py" ]; then
+  mv "$KYT_DIR/kyt" /tmp/kyt-flat
+  rm -rf "$KYT_DIR"
+  mv /tmp/kyt-flat "$KYT_DIR"
+  ok "struktur paket bot dirapikan (kyt/kyt -> kyt)"
+fi
+
 say "Diagnosa..."
 echo "     python3 : $(python3 --version 2>&1)"
 echo "     pip     : $(python3 -m pip --version 2>&1 | head -1)"

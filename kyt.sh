@@ -47,6 +47,14 @@ wget -q --timeout=60 -O kyt.zip https://raw.githubusercontent.com/victor3232/xht
 if [ ! -s kyt.zip ]; then bad "kyt.zip gagal diunduh. Cek koneksi."; exit 1; fi
 unzip -oq kyt.zip
 rm -f kyt.zip
+# rapikan kalau struktur zip masih nested (kyt/kyt/...) -> kyt/...
+if [ -f /usr/bin/kyt/kyt/__main__.py ] && [ ! -f /usr/bin/kyt/__main__.py ]; then
+  rm -rf /tmp/kyt-flat
+  mv /usr/bin/kyt/kyt /tmp/kyt-flat
+  rm -rf /usr/bin/kyt
+  mv /tmp/kyt-flat /usr/bin/kyt
+  ok "struktur paket bot dirapikan (kyt/kyt -> kyt)"
+fi
 [ -n "$OLDVAR" ] && printf '%s\n' "$OLDVAR" > /usr/bin/kyt/var.txt
 
 # ---------- dependency (3 lapis, anti PEP 668) ----------
