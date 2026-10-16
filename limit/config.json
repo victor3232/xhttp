@@ -414,12 +414,38 @@
   "outbounds": [
     {
       "protocol": "freedom",
-      "settings": {}
+      "settings": {},
+      "tag": "direct"
+    },
+    {
+      "protocol": "freedom",
+      "settings": {},
+      "tag": "proxy"
+    },
+    {
+      "protocol": "freedom",
+      "settings": {},
+      "tag": "dnsOut"
+    },
+    {
+      "protocol": "freedom",
+      "settings": {},
+      "tag": "api"
+    },
+    {
+      "protocol": "blackhole",
+      "settings": {},
+      "tag": "block"
     },
     {
       "protocol": "blackhole",
       "settings": {},
       "tag": "blocked"
+    },
+    {
+      "protocol": "blackhole",
+      "settings": {},
+      "tag": "reject"
     }
   ],
   "routing": {
