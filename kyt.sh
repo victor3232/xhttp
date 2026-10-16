@@ -80,7 +80,7 @@ import asyncio
 async def _store_poll_loop():
     from kyt.modules.deposit import cek_semua_pending
     while True:
-        await asyncio.sleep(45)
+        await asyncio.sleep(20)
         try:
             await cek_semua_pending()
         except Exception as e:
