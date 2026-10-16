@@ -691,6 +691,19 @@ systemctl start udp-mini-3
 print_success "Limit Quota Service"
 }
 
+# // Installing UDP Custom (SSH UDP) -> biar "Service SSH UDP" ON
+function ins_udp_custom(){
+clear
+print_install "Memasang UDP Custom (SSH UDP)"
+    wget -q -O /root/install-udp.sh "${REPO}limit/install-udp.sh" >/dev/null 2>&1
+    if [ -s /root/install-udp.sh ]; then
+        bash /root/install-udp.sh
+    else
+        echo -e "${RED}[!] Gagal mengunduh installer UDP Custom.${NC}"
+    fi
+print_success "UDP Custom (SSH UDP)"
+}
+
 function ssh_slow(){
 clear
 # // Installing UDP Mini
@@ -1149,6 +1162,7 @@ clear
     menu
     profile
     enable_services
+    ins_udp_custom
     restart_system
 }
 instal
