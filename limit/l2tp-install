@@ -1,0 +1,181 @@
+#!/bin/bash
+# ============================================================
+#  Installer L2TP/IPsec (PSK) + IKEv2 (EAP-MSCHAPv2)
+#  StrongSwan + xl2tpd
+# ============================================================
+Green="\e[92;1m"
+RED="\033[31m"
+YELLOW="\033[33m"
+NC='\e[0m'
+export DEBIAN_FRONTEND=noninteractive
+
+echo -e "${Green}--->${NC} Menginstall L2TP/IPsec & IKEv2 (StrongSwan + xl2tpd)"
+
+apt-get install -y strongswan strongswan-pki libcharon-extra-plugins libstrongswan-extra-plugins xl2tpd ppp >/dev/null 2>&1
+apt-get install -y strongswan-starter >/dev/null 2>&1
+
+domain=$(cat /etc/xray/domain 2>/dev/null)
+[ -z "$domain" ] && domain=$(cat /root/domain 2>/dev/null)
+[ -z "$domain" ] && domain="$HOSTNAME"
+NET=$(ip -4 route ls 2>/dev/null | grep default | grep -Po '(?<=dev )(\S+)' | head -1)
+[ -z "$NET" ] && NET="eth0"
+
+mkdir -p /etc/ipsec.d/cacerts /etc/ipsec.d/certs /etc/ipsec.d/private /etc/l2tp
+chmod 700 /etc/ipsec.d/private
+
+# === Sertifikat IKEv2 : pakai sertifikat domain (Let's Encrypt) bila tersedia ===
+if [ -f /etc/xray/xray.key ] && [ -f /etc/xray/xray.crt ]; then
+    cp -f /etc/xray/xray.crt /etc/ipsec.d/certs/server.crt
+    cp -f /etc/xray/xray.key /etc/ipsec.d/private/server.key
+    if openssl ec -in /etc/ipsec.d/private/server.key -noout >/dev/null 2>&1; then
+        KEYTYPE="ECDSA"
+    else
+        KEYTYPE="RSA"
+    fi
+else
+    ipsec pki --gen --type rsa --size 2048 --outform pem > /etc/ipsec.d/private/server.key 2>/dev/null
+    ipsec pki --self --in /etc/ipsec.d/private/server.key --dn "C=ID, O=HITS VPN, CN=${domain}" --san "${domain}" --flag serverAuth --outform pem > /etc/ipsec.d/certs/server.crt 2>/dev/null
+    KEYTYPE="RSA"
+fi
+chmod 600 /etc/ipsec.d/private/server.key
+
+# === PSK default (untuk L2TP/IPsec) — pertahankan bila sudah ada ===
+if [ -s /etc/l2tp/psk ]; then
+    PSK=$(cat /etc/l2tp/psk)
+else
+    PSK="$(head -c 32 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 16)"
+    [ -z "$PSK" ] && PSK="HitssshVpn2024"
+    echo "$PSK" > /etc/l2tp/psk
+fi
+chmod 600 /etc/l2tp/psk
+
+# === /etc/ipsec.conf ===
+cat >/etc/ipsec.conf <<EOF
+config setup
+    charondebug="ike 1, knl 1, cfg 0"
+    uniqueids=never
+
+conn L2TP-PSK
+    authby=secret
+    auto=add
+    keyexchange=ikev1
+    rekey=no
+    ikelifetime=8h
+    keylife=1h
+    left=%defaultroute
+    leftprotoport=17/1701
+    right=%any
+    rightprotoport=17/%any
+    rightsubnet=vhost:%priv
+    type=transport
+    ike=3des-sha1-modp1024,aes128-sha1-modp1024,aes256-sha1-modp1024!
+    esp=3des-sha1,aes128-sha1,aes256-sha1!
+    dpddelay=30
+    dpdtimeout=120
+    dpdaction=clear
+
+conn IKEv2-EAP
+    keyexchange=ikev2
+    auto=add
+    rekey=no
+    left=%defaultroute
+    leftcert=server.crt
+    leftid=@${domain}
+    leftsendcert=always
+    leftsubnet=0.0.0.0/0
+    leftauth=pubkey
+    right=%any
+    rightauth=eap-mschapv2
+    rightid=%any
+    rightdns=8.8.8.8,1.1.1.1
+    rightsourceip=10.10.10.0/24
+    rightsendcert=never
+    eap_identity=%identity
+    ike=aes256-sha1-modp1024,aes128-sha1-modp1024,aes256-sha256-modp2048,aes128-sha256-modp2048!
+    esp=aes256-sha1,aes128-sha1,aes256-sha256,aes128-sha256!
+    dpddelay=30
+    dpdtimeout=120
+    dpdaction=clear
+EOF
+
+# === /etc/ipsec.secrets : pertahankan akun EAP yang sudah ada ===
+EAP_OLD=""
+if [ -f /etc/ipsec.secrets ]; then
+    EAP_OLD=$(grep -E '^[^:#].*:.*EAP' /etc/ipsec.secrets 2>/dev/null)
+fi
+{
+    echo ": ${KEYTYPE} server.key"
+    echo "%any %any : PSK \"${PSK}\""
+    [ -n "$EAP_OLD" ] && echo "$EAP_OLD"
+} >/etc/ipsec.secrets
+chmod 600 /etc/ipsec.secrets
+
+# === xl2tpd ===
+cat >/etc/xl2tpd/xl2tpd.conf <<EOF
+[global]
+port = 1701
+access control = no
+auth file = /etc/ppp/chap-secrets
+
+[lns default]
+ip range = 192.168.42.10-192.168.42.250
+local ip = 192.168.42.1
+require chap = yes
+refuse pap = yes
+require authentication = yes
+name = l2tpd
+ppp debug = yes
+pppoptfile = /etc/ppp/options.xl2tpd
+length bit = yes
+EOF
+
+cat >/etc/ppp/options.xl2tpd <<EOF
+require-mschap-v2
+ms-dns 8.8.8.8
+ms-dns 1.1.1.1
+asyncmap 0
+auth
+crtscts
+lock
+hide-password
+modem
+name l2tpd
+proxyarp
+lcp-echo-interval 30
+lcp-echo-failure 4
+mtu 1450
+mru 1450
+EOF
+
+[ -f /etc/ppp/chap-secrets ] || touch /etc/ppp/chap-secrets
+touch /etc/l2tp/.l2tp.db
+
+# === IP Forwarding ===
+sed -i '/net.ipv4.ip_forward/d' /etc/sysctl.conf
+echo "net.ipv4.ip_forward = 1" >> /etc/sysctl.conf
+sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1
+
+# === Firewall / NAT (hindari duplikat) ===
+iptables -C INPUT -p udp --dport 500 -j ACCEPT 2>/dev/null || iptables -A INPUT -p udp --dport 500 -j ACCEPT 2>/dev/null
+iptables -C INPUT -p udp --dport 4500 -j ACCEPT 2>/dev/null || iptables -A INPUT -p udp --dport 4500 -j ACCEPT 2>/dev/null
+iptables -C INPUT -p udp --dport 1701 -j ACCEPT 2>/dev/null || iptables -A INPUT -p udp --dport 1701 -j ACCEPT 2>/dev/null
+iptables -C INPUT -p esp -j ACCEPT 2>/dev/null || iptables -A INPUT -p esp -j ACCEPT 2>/dev/null
+iptables -t nat -C POSTROUTING -s 10.10.10.0/24 -o ${NET} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s 10.10.10.0/24 -o ${NET} -j MASQUERADE 2>/dev/null
+iptables -t nat -C POSTROUTING -s 192.168.42.0/24 -o ${NET} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s 192.168.42.0/24 -o ${NET} -j MASQUERADE 2>/dev/null
+netfilter-persistent save >/dev/null 2>&1
+
+# Pastikan plugin stroke aktif (agar file ipsec.conf dibaca)
+if [ -f /etc/strongswan.d/charon/stroke.conf ]; then
+    sed -i 's/^\([[:space:]]*load[[:space:]]*=[[:space:]]*\).*/\1yes/' /etc/strongswan.d/charon/stroke.conf 2>/dev/null
+fi
+
+systemctl daemon-reload
+systemctl enable xl2tpd >/dev/null 2>&1
+systemctl restart xl2tpd >/dev/null 2>&1
+systemctl enable strongswan-starter >/dev/null 2>&1
+systemctl restart strongswan-starter >/dev/null 2>&1
+ipsec restart >/dev/null 2>&1
+
+echo -e "${Green}--->${NC} L2TP/IPsec & IKEv2 Selesai"
+echo -e "${Green}--->${NC} PSK L2TP : ${YELLOW}${PSK}${NC}"
+exit 0
