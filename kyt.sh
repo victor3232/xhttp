@@ -199,6 +199,14 @@ PYBIN=/usr/bin/python3
 MODE=""
 REQ="kyt/requirements.txt"
 
+# Versi telethon MINIMUM yang aman.
+# Di bawah ini, conversation(exclusive=False) / penanganan error bisa
+# berbeda -> bot bisa "diam" setelah beberapa pertanyaan (bug lama).
+# CATATAN: Debian 12 apt memberi 1.25.1, Debian 13 apt memberi 1.40.0.
+# Versi apt itu TIDAK CUKUP, jadi JANGAN dipakai sebagai pilihan utama.
+TELE_MIN="1.36.0"
+TELE_PILIH="1.45.0"
+
 pip_pasang() {
   # $1 = python binary, $2.. = paket
   local PY="$1"; shift
@@ -208,22 +216,83 @@ pip_pasang() {
   return 1
 }
 
-if pip_pasang python3 -r "$REQ"; then
-  MODE="pip (sistem)"
-elif python3 -m venv kyt/venv >/dev/null 2>&1 && \
-     kyt/venv/bin/pip install --no-cache-dir -r "$REQ" >/dev/null 2>&1; then
-  PYBIN=/usr/bin/kyt/venv/bin/python3
-  MODE="venv (terisolasi)"
-elif apt-get install -y python3-telethon python3-requests >/dev/null 2>&1; then
-  MODE="apt (python3-telethon)"
+# cek apakah versi telethon di python ini >= TELE_MIN
+tele_ok() {
+  "$1" - "$TELE_MIN" <<'PYX' >/dev/null 2>&1
+import sys
+try:
+    import telethon
+except Exception:
+    sys.exit(1)
+def v(x):
+    out = []
+    for p in str(x).split("."):
+        n = ""
+        for c in p:
+            if c.isdigit():
+                n += c
+            else:
+                break
+        out.append(int(n or 0))
+    return tuple(out)
+sys.exit(0 if v(telethon.__version__) >= v(sys.argv[1]) else 1)
+PYX
+}
+
+pip_siap() {
+  python3 -m pip --version >/dev/null 2>&1 ||
+    (pasang_paket python3-pip && python3 -m pip --version >/dev/null 2>&1)
+}
+
+# ---------- LANGKAH 1: coba pip sistem (versi PIN, paling stabil) ----------
+pip_siap
+if pip_pasang python3 "telethon==$TELE_PILIH" "requests>=2.31.0" && tele_ok python3; then
+  MODE="pip (sistem, telethon $TELE_PILIH)"
 fi
 
-# kalau versi terbaru bermasalah di Python baru -> coba versi yang terbukti stabil
-if ! $PYBIN -c "import telethon, requests" >/dev/null 2>&1; then
-  warn "versi terbaru gagal, mencoba telethon 1.36.0..."
-  if pip_pasang "$PYBIN" "telethon==1.36.0" "requests"; then
-    MODE="$MODE (pin 1.36.0)"
+# ---------- LANGKAH 2: venv (WAJIB berhasil kalau pip sistem gagal) ----------
+if [ -z "$MODE" ]; then
+  # pastikan modul venv ada (Debian sering belum)
+  python3 -c "import venv" >/dev/null 2>&1 || pasang_paket python3-venv
+  python3 -c "import ensurepip" >/dev/null 2>&1 || pasang_paket python3-venv
+  rm -rf kyt/venv
+  if python3 -m venv kyt/venv >/dev/null 2>&1; then
+    VPY=/usr/bin/kyt/venv/bin/python3
+    pip_pasang "$VPY" --upgrade pip
+    if pip_pasang "$VPY" "telethon==$TELE_PILIH" "requests>=2.31.0" && tele_ok "$VPY"; then
+      PYBIN="$VPY"
+      MODE="venv (terisolasi, telethon $TELE_PILIH)"
+    fi
   fi
+fi
+
+# ---------- LANGKAH 3: apt = CADANGAN TERAKHIR ----------
+# JANGAN dipakai kalau versinya < TELE_MIN (Debian 12 apt = 1.25.1 -> tidak aman)
+if [ -z "$MODE" ]; then
+  if (pasang_paket python3-telethon python3-requests) && tele_ok python3; then
+    MODE="apt (versi $(python3 -c 'import telethon;print(telethon.__version__)' 2>/dev/null))"
+  else
+    warn "python3-telethon dari apt terlalu tua (< $TELE_MIN) - DITOLAK"
+  fi
+fi
+
+# ---------- LANGKAH 4: paksa versi minimum apa pun caranya ----------
+if [ -z "$MODE" ]; then
+  warn "mencoba paksa telethon==$TELE_MIN ..."
+  if pip_pasang python3 "telethon==$TELE_MIN" "requests" && tele_ok python3; then
+    MODE="pip (pin $TELE_MIN)"
+  fi
+fi
+
+# ---------- PILIH PYTHON YANG BENAR-BENAR PUNYA TELEGRAM YANG CUKUP ----------
+# (kalau MODE kosong, service TIDAK boleh dipasang dengan python yang salah)
+if [ -n "$MODE" ]; then
+  PYBIN=/usr/bin/python3
+  tele_ok "$PYBIN" || {
+    if [ -x /usr/bin/kyt/venv/bin/python3 ] && tele_ok /usr/bin/kyt/venv/bin/python3; then
+      PYBIN=/usr/bin/kyt/venv/bin/python3
+    fi
+  }
 fi
 
 # Pillow = OPSIONAL: dipakai merapikan rasio gambar /start ke 16:9.
@@ -237,21 +306,49 @@ else
   warn "Pillow gagal dipasang - gambar /start dikirim apa adanya (tetap jalan)"
 fi
 
-if $PYBIN -c "import telethon, requests" >/dev/null 2>&1; then
+if [ -n "$MODE" ] && tele_ok "$PYBIN"; then
   ok "telethon siap  [$MODE]"
-  $PYBIN -c "import sys,telethon,requests;print('     python   : %s'%sys.version.split()[0]);print('     telethon : %s'%telethon.__version__);print('     requests : %s'%requests.__version__)" 2>/dev/null
+  $PYBIN -c "import sys,telethon,requests;print('     python   : %s'%sys.version.split()[0]);print('     telethon : %s'%telethon.__version__);print('     requests : %s'%requests.__version__);print('     jalur    : %s'%sys.executable)" 2>/dev/null
   # tes asyncio + conversation (inti bot)
   if $PYBIN -c "import asyncio,telethon;from telethon import TelegramClient,events,Button;print('')" >/dev/null 2>&1; then
     ok "API telethon (events/Button) OK"
   else
     bad "API telethon tidak lengkap - cek log di bawah"
   fi
+  # tes conversation(exclusive=False) -- ini inti alur tanya() bot
+  if $PYBIN -c "
+from telethon.tl.custom import conversation as C
+import inspect
+p = inspect.signature(C.Conversation.__init__).parameters
+assert 'exclusive' in p and 'total_timeout' in p
+" >/dev/null 2>&1; then
+    ok "conversation(exclusive=False) didukung (alur tanya aman)"
+  else
+    bad "telethon tidak mendukung conversation(exclusive=False)!"
+    bad "Ini PENYEBAB bot 'diam' setelah beberapa pertanyaan."
+    bad "Perbaiki: python3 -m pip install --break-system-packages telethon==$TELE_PILIH"
+  fi
 else
-  bad "telethon GAGAL dipasang. Diagnosa:"
+  bad "telethon GAGAL dipasang / versinya terlalu tua (< $TELE_MIN)."
+  echo "     Versi apt yang tersedia: $(apt-cache policy python3-telethon 2>/dev/null | grep Candidate | awk '{print $2}')"
   echo "     python3 --version : $(python3 --version 2>&1)"
   echo "     pip               : $(python3 -m pip --version 2>&1 | head -1)"
-  echo "     coba manual       : python3 -m pip install --break-system-packages telethon requests"
-  echo "     (kalau OS sangat baru, coba: python3 -m pip install --break-system-packages telethon==1.36.0)"
+  echo ""
+  echo "     COBA MANUAL (pilih salah satu):"
+  echo "       python3 -m pip install --break-system-packages telethon==$TELE_PILIH requests"
+  echo "       apt install python3-venv && python3 -m venv kyt/venv && kyt/venv/bin/pip install telethon==$TELE_PILIH requests"
+  echo ""
+  echo "     JANGAN lanjut sebelum telethon >= $TELE_MIN, karena bot akan sering 'diam'."
+  echo ""
+  echo -e "\033[1;31m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m"
+  echo -e " \033[1;31m INSTALASI DIHENTIKAN \033[0m"
+  echo -e "\033[1;31m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m"
+  echo " Service bot TIDAK dipasang, karena kalau dipasang akan"
+  echo " sering 'diam' setelah beberapa pertanyaan (bug telethon lama)."
+  echo ""
+  echo " Jalankan perintah manual di atas, lalu ulangi:"
+  echo "   bash kyt.sh"
+  exit 1
 fi
 
 # ---------- konfigurasi (var.txt) ----------
