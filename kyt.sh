@@ -13,6 +13,32 @@ bad(){ echo -e "${RED}  ✘${NC} $*"; }
 
 [ "$(id -u)" = "0" ] || { bad "Jalankan sebagai root."; exit 1; }
 
+# ---------- deteksi OS ----------
+OS_ID=""; OS_VER=""; OS_NAMA=""
+if [ -f /etc/os-release ]; then
+  . /etc/os-release
+  OS_ID="$ID"; OS_VER="$VERSION_ID"; OS_NAMA="$PRETTY_NAME"
+fi
+say "OS terdeteksi: ${OS_NAMA:-tidak diketahui}"
+
+case "$OS_ID" in
+  ubuntu)
+    case "$OS_VER" in
+      20.04|22.04|24.04|24.10|25.04|25.10|26.04) ok "Ubuntu $OS_VER didukung" ;;
+      *) warn "Ubuntu $OS_VER belum diuji, dicoba tetap jalan" ;;
+    esac
+    ;;
+  debian)
+    case "$OS_VER" in
+      11|12|13|14) ok "Debian $OS_VER didukung" ;;
+      *) warn "Debian $OS_VER belum diuji, dicoba tetap jalan" ;;
+    esac
+    ;;
+  *)
+    warn "Distro '$OS_ID' belum diuji (Ubuntu/Debian disarankan)"
+    ;;
+esac
+
 NS=$(cat /etc/xray/dns 2>/dev/null)
 PUB=$(cat /etc/slowdns/server.pub 2>/dev/null)
 domain=$(cat /etc/xray/domain 2>/dev/null)
@@ -36,9 +62,22 @@ rm -f /etc/systemd/system/kyt.service
 # ---------- paket dasar ----------
 say "Install paket dasar..."
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -y >/dev/null 2>&1
-apt-get install -y python3 python3-pip python3-venv git unzip wget curl >/dev/null 2>&1
+apt-get update -y >/dev/null 2>&1 || warn "apt-get update gagal (lanjut)"
+
+pasang_paket() {
+  apt-get install -y "$@" >/dev/null 2>&1 && return 0
+  local _g=""
+  for _p in "$@"; do
+    apt-get install -y "$_p" >/dev/null 2>&1 || _g="$_g $_p"
+  done
+  [ -n "$_g" ] && warn "dilewati (tidak ada di repo):$_g"
+  return 0
+}
+
+pasang_paket python3 python3-pip python3-venv git unzip wget curl
 ok "python3: $(python3 --version 2>&1)"
+command -v pip3 >/dev/null 2>&1 || pasang_paket python3-pip
+command -v unzip >/dev/null 2>&1 || bad "unzip tidak terpasang (penting!)"
 
 # ---------- script pendukung (bot.zip) ----------
 cd /usr/bin || exit 1
@@ -154,27 +193,65 @@ else
   warn "database store belum ada -> mulai dari kosong"
 fi
 
-# ---------- dependency (3 lapis, anti PEP 668) ----------
+# ---------- dependency (anti PEP 668, tahan pip versi lama/baru) ----------
 say "Install dependency bot (telethon)..."
 PYBIN=/usr/bin/python3
 MODE=""
-if python3 -m pip install --break-system-packages --no-cache-dir -r kyt/requirements.txt >/dev/null 2>&1; then
-  MODE="pip --break-system-packages"
+REQ="kyt/requirements.txt"
+
+pip_pasang() {
+  # $1 = python binary, $2.. = paket
+  local PY="$1"; shift
+  "$PY" -m pip install --break-system-packages --no-cache-dir "$@" >/dev/null 2>&1 && return 0
+  # pip lama belum kenal --break-system-packages
+  "$PY" -m pip install --no-cache-dir "$@" >/dev/null 2>&1 && return 0
+  return 1
+}
+
+if pip_pasang python3 -r "$REQ"; then
+  MODE="pip (sistem)"
 elif python3 -m venv kyt/venv >/dev/null 2>&1 && \
-     kyt/venv/bin/pip install --no-cache-dir -r kyt/requirements.txt >/dev/null 2>&1; then
+     kyt/venv/bin/pip install --no-cache-dir -r "$REQ" >/dev/null 2>&1; then
   PYBIN=/usr/bin/kyt/venv/bin/python3
   MODE="venv (terisolasi)"
 elif apt-get install -y python3-telethon python3-requests >/dev/null 2>&1; then
   MODE="apt (python3-telethon)"
 fi
 
+# kalau versi terbaru bermasalah di Python baru -> coba versi yang terbukti stabil
+if ! $PYBIN -c "import telethon, requests" >/dev/null 2>&1; then
+  warn "versi terbaru gagal, mencoba telethon 1.36.0..."
+  if pip_pasang "$PYBIN" "telethon==1.36.0" "requests"; then
+    MODE="$MODE (pin 1.36.0)"
+  fi
+fi
+
+# Pillow = OPSIONAL: dipakai merapikan rasio gambar /start ke 16:9.
+# Kalau gagal dipasang, bot TETAP jalan (gambar dikirim apa adanya).
+say "Install Pillow (opsional, untuk gambar /start)..."
+if $PYBIN -c "import PIL" >/dev/null 2>&1; then
+  ok "Pillow sudah ada"
+elif pip_pasang "$PYBIN" "pillow>=10.0.0"; then
+  ok "Pillow terpasang (gambar /start otomatis 16:9)"
+else
+  warn "Pillow gagal dipasang - gambar /start dikirim apa adanya (tetap jalan)"
+fi
+
 if $PYBIN -c "import telethon, requests" >/dev/null 2>&1; then
   ok "telethon siap  [$MODE]"
+  $PYBIN -c "import sys,telethon,requests;print('     python   : %s'%sys.version.split()[0]);print('     telethon : %s'%telethon.__version__);print('     requests : %s'%requests.__version__)" 2>/dev/null
+  # tes asyncio + conversation (inti bot)
+  if $PYBIN -c "import asyncio,telethon;from telethon import TelegramClient,events,Button;print('')" >/dev/null 2>&1; then
+    ok "API telethon (events/Button) OK"
+  else
+    bad "API telethon tidak lengkap - cek log di bawah"
+  fi
 else
   bad "telethon GAGAL dipasang. Diagnosa:"
   echo "     python3 --version : $(python3 --version 2>&1)"
   echo "     pip               : $(python3 -m pip --version 2>&1 | head -1)"
   echo "     coba manual       : python3 -m pip install --break-system-packages telethon requests"
+  echo "     (kalau OS sangat baru, coba: python3 -m pip install --break-system-packages telethon==1.36.0)"
 fi
 
 # ---------- konfigurasi (var.txt) ----------
