@@ -10,12 +10,67 @@ if [ -f /etc/needrestart/needrestart.conf ]; then
 fi
 # ==========================================
 
+# ============================================================
+#  apt_pasang: install paket dengan aman.
+#  Kalau ada 1 paket yang sudah DIHAPUS di OS baru (mis. ntpdate,
+#  libssl1.1, wondershaper di Debian 13 / Ubuntu 26), paket lain
+#  TETAP terpasang. Tanpa ini, "apt install a b c" GAGAL TOTAL
+#  hanya karena 1 paket tidak ada.
+# ============================================================
+apt_pasang() {
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@" >/dev/null 2>&1 && return 0
+    echo -e "  \033[0;33mSebagian paket tidak tersedia, memasang satu per satu...\033[0m"
+    local _gagal=""
+    for _p in "$@"; do
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$_p" >/dev/null 2>&1 \
+            || _gagal="$_gagal $_p"
+    done
+    [ -n "$_gagal" ] && echo -e "  \033[0;33mDilewati (tidak ada di repo OS ini):$_gagal\033[0m"
+    return 0
+}
+
+# ============================================================
+#  PENGAMAN: JANGAN jalankan script ini di VPS yang ada
+#  PANEL PTERODACTYL / hosting game panel.
+#  Script ini menghentikan & menghapus nginx/apache dan memasang
+#  haproxy di port 80/443 -> panel Pterodactyl akan MATI.
+# ============================================================
+PTERO=0
+[ -d /var/www/pterodactyl ] && PTERO=1
+[ -f /etc/pterodactyl/config.yml ] && PTERO=1
+for u in pteroq wings pterodactyl; do
+  systemctl list-unit-files 2>/dev/null | grep -q "^${u}\.service" && PTERO=1
+done
+if [ "$PTERO" = "1" ]; then
+  echo ""
+  echo "############################################################"
+  echo "#  VPS INI TERDETEKSI MENJALANKAN PANEL PTERODACTYL        #"
+  echo "#                                                          #"
+  echo "#  Script ini akan:                                        #"
+  echo "#    - STOP + HAPUS nginx / apache2                        #"
+  echo "#    - MENIMPA /etc/nginx/nginx.conf                       #"
+  echo "#    - memasang haproxy di port 80 / 443 / 8080            #"
+  echo "#                                                          #"
+  echo "#  Akibatnya PANEL PTERODACTYL kamu akan MATI              #"
+  echo "#  (web tidak bisa dibuka, login gagal).                   #"
+  echo "#                                                          #"
+  echo "#  Pakai VPS LAIN yang khusus untuk VPN tunneling.         #"
+  echo "############################################################"
+  echo ""
+  read -rp "Kalau kamu YAKIN mau lanjut, ketik YA : " paksa
+  if [ "$paksa" != "YA" ]; then
+    echo "Dibatalkan. Tidak ada yang diubah."
+    exit 1
+  fi
+fi
+# ============================================================
+
 # ... lanjut ke kode script Anda di bawah ...
 ### Color
 apt upgrade -y
 apt update -y
-apt install lolcat -y
-apt install wondershaper -y
+apt_pasang lolcat
+apt_pasang wondershaper
 Green="\e[92;1m"
 RED="\033[31m"
 YELLOW="\033[33m"
@@ -31,6 +86,7 @@ red='\e[1;31m'
 green='\e[0;32m'
 
 # === TAMBAHAN FIX UBUNTU 22/24 (Letakkan di baris 21) ===
+
 echo "Membersihkan Port & Service Konflik..."
 systemctl stop apache2
 systemctl disable apache2
@@ -238,16 +294,23 @@ function first_setup(){
         apt-get install --no-install-recommends software-properties-common -y
         
         if [[ "$OS_VERSION" == "22.04" ]] || [[ "$OS_VERSION" == "24.04" ]]; then
-            echo "Terdeteksi Ubuntu Baru ($OS_VERSION)..."
+            echo "Terdeteksi Ubuntu $OS_VERSION..."
             # Install libssl1.1 dari repo legacy
             echo "deb http://security.ubuntu.com/ubuntu focal-security main" | tee /etc/apt/sources.list.d/focal-security.list
             apt-get update
             apt-get install libssl1.1 -y
-            apt-get install haproxy -y
-        else
+            apt_pasang haproxy
+        elif [[ "$OS_VERSION" == "20.04" ]] || [[ "$OS_VERSION" < "22.04" ]]; then
             # Ubuntu 20.04 kebawah
             add-apt-repository ppa:vbernat/haproxy-2.0 -y
             apt-get -y install haproxy=2.0.\*
+        else
+            # Ubuntu 24.10 / 25.xx / 26.xx dst
+            # haproxy dari repo resmi sudah pakai OpenSSL 3 -> libssl1.1 tidak perlu
+            echo "Terdeteksi Ubuntu Baru ($OS_VERSION) - pakai haproxy repo resmi"
+            rm -f /etc/apt/sources.list.d/focal-security.list
+            apt-get update -y
+            apt_pasang haproxy
         fi
 
     # === LOGIC DEBIAN ===
@@ -259,7 +322,7 @@ function first_setup(){
         rm -f /etc/apt/sources.list.d/haproxy.list
         
         if [[ "$OS_VERSION" == "11" ]] || [[ "$OS_VERSION" == "12" ]]; then
-            echo "Terdeteksi Debian Baru ($OS_VERSION)..."
+            echo "Terdeteksi Debian $OS_VERSION..."
             
             # Khusus Debian 12 Wajib Install libssl1.1 (OpenSSL 3 issue)
             if [[ "$OS_VERSION" == "12" ]]; then
@@ -270,8 +333,8 @@ function first_setup(){
             
             # Debian 11 & 12 Install HAProxy langsung dari repo official (Stable)
             apt-get update
-            apt-get install haproxy -y
-        else
+            apt_pasang haproxy
+        elif [[ "$OS_VERSION" == "10" ]]; then
             # Debian 10 (Logic Lama)
             curl https://haproxy.debian.net/bernat.debian.org.gpg | \
                 gpg --dearmor >/usr/share/keyrings/haproxy.debian.net.gpg
@@ -280,6 +343,13 @@ function first_setup(){
                 >/etc/apt/sources.list.d/haproxy.list
             sudo apt-get update
             apt-get -y install haproxy=1.8.\*
+        else
+            # Debian 13 (trixie) dst
+            # haproxy repo resmi sudah OpenSSL 3 -> libssl1.1 TIDAK ADA & tidak perlu
+            echo "Terdeteksi Debian Baru ($OS_VERSION) - pakai haproxy repo resmi"
+            rm -f /etc/apt/sources.list.d/bullseye-security.list
+            apt-get update -y
+            apt_pasang haproxy
         fi
     else
         echo -e " Your OS Is Not Supported ($OS_ID $OS_VERSION)"
@@ -309,8 +379,8 @@ function base_package() {
     clear
     ########
     print_install "Menginstall Packet Yang Dibutuhkan"
-    apt install zip pwgen openssl netcat-openbsd socat cron bash-completion chrony -y
-    apt install figlet -y
+    apt_pasang zip pwgen openssl netcat-openbsd socat cron bash-completion chrony
+    apt_pasang figlet
     apt update -y
     apt upgrade -y
     apt dist-upgrade -y
@@ -320,9 +390,16 @@ function base_package() {
     systemctl restart chrony
     chronyc sourcestats -v
     chronyc tracking -v
-    apt install ntpdate -y
-    ntpdate pool.ntp.org
-    apt install sudo -y
+    # ntpdate sudah DIHAPUS di Debian 13 & Ubuntu 26 -> pakai chrony/sistem
+    apt_pasang ntpdate
+    if command -v ntpdate >/dev/null 2>&1; then
+        ntpdate pool.ntp.org 2>/dev/null || true
+    else
+        echo "  ntpdate tidak ada -> pakai chrony / systemd-timesyncd"
+        systemctl enable --now chrony >/dev/null 2>&1 || \
+        systemctl enable --now systemd-timesyncd >/dev/null 2>&1 || true
+    fi
+    apt_pasang sudo
     sudo apt-get clean all
     sudo apt-get autoremove -y
     sudo apt-get install -y debconf-utils
@@ -335,7 +412,10 @@ function base_package() {
     # PERBAIKAN DISINI:
     # 1. 'python' diganti 'python3' (Wajib untuk Debian 12 / Ubuntu 24)
     # 2. 'libcurl4-nss-dev' diganti 'libcurl4-openssl-dev' (NSS dev sudah dihapus di Debian 12)
-    sudo apt-get install -y speedtest-cli vnstat libnss3-dev libnspr4-dev pkg-config libpam0g-dev libcap-ng-dev libcap-ng-utils libselinux1-dev libcurl4-openssl-dev flex bison make libnss3-tools libevent-dev bc rsyslog dos2unix zlib1g-dev libssl-dev libsqlite3-dev sed dirmngr libxml-parser-perl build-essential gcc g++ python3 htop lsof tar wget curl ruby zip unzip p7zip-full python3-pip libc6 util-linux build-essential msmtp-mta ca-certificates bsd-mailx iptables iptables-persistent netfilter-persistent net-tools openssl ca-certificates gnupg gnupg2 ca-certificates lsb-release gcc shc make cmake git screen socat xz-utils apt-transport-https gnupg1 dnsutils cron bash-completion ntpdate chrony jq openvpn easy-rsa
+    # Paket wajib. Yang sudah dihapus di OS baru (ntpdate, shc) otomatis dilewati.
+    apt_pasang speedtest-cli vnstat libnss3-dev libnspr4-dev pkg-config libpam0g-dev libcap-ng-dev libcap-ng-utils libselinux1-dev libcurl4-openssl-dev flex bison make libnss3-tools libevent-dev bc rsyslog dos2unix zlib1g-dev libssl-dev libsqlite3-dev sed dirmngr libxml-parser-perl build-essential gcc g++ python3 htop lsof tar wget curl ruby zip unzip p7zip-full python3-pip libc6 util-linux msmtp-mta ca-certificates bsd-mailx iptables iptables-persistent netfilter-persistent net-tools openssl gnupg gnupg2 lsb-release shc cmake git screen socat xz-utils apt-transport-https gnupg1 dnsutils cron bash-completion ntpdate chrony jq openvpn easy-rsa
+    # p7zip-full berubah nama jadi 7zip di Debian 13
+    command -v 7z >/dev/null 2>&1 || apt_pasang 7zip
     
     print_success "Packet Yang Dibutuhkan"
 }
@@ -731,7 +811,7 @@ function ins_dropbear(){
 clear
 print_install "Menginstall Dropbear"
 # // Installing Dropbear
-apt-get install dropbear -y > /dev/null 2>&1
+apt_pasang dropbear
 wget -q -O /etc/default/dropbear "${REPO}limit/dropbear.conf"
 chmod +x /etc/default/dropbear
 /etc/init.d/dropbear restart
@@ -785,7 +865,7 @@ function ins_backup(){
 clear
 print_install "Memasang Backup Server"
 #BackupOption
-apt install rclone -y
+apt_pasang rclone
 printf "q\n" | rclone config
 wget -O /root/.config/rclone/rclone.conf "${REPO}limit/rclone.conf"
 #Install Wondershaper
@@ -796,7 +876,7 @@ sudo make install
 cd
 rm -rf wondershaper
 echo > /home/limit
-apt install msmtp-mta ca-certificates bsd-mailx -y
+apt_pasang msmtp-mta ca-certificates bsd-mailx
 cat<<EOF>>/etc/msmtprc
 defaults
 tls on
