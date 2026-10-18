@@ -1,0 +1,94 @@
+#!/bin/bash
+# ============================================================
+#  limit.ssh  -  AUTO KILL multi login SSH (per-user)
+#
+#  Sama seperti limitvmess/limitvless/limittrojan:
+#    - baca limit per user dari /etc/kyt/limit/ssh/ip/<user>
+#    - hitung IP aktif dari log auth
+#    - kalau melebihi limit -> KILL semua sesi user + notif Telegram
+#    - loop tiap ~7 menit
+#
+#  TIDAK menghapus akun (beda dari Xray yang hapus akun).
+#  SSH cukup kill sesi — user bisa login lagi (1 IP).
+# ============================================================
+
+function send_log_ssh(){
+    CHATID=$(grep -E "^#bot# " "/etc/bot/.bot.db" 2>/dev/null | cut -d ' ' -f 3)
+    KEY=$(grep -E "^#bot# " "/etc/bot/.bot.db" 2>/dev/null | cut -d ' ' -f 2)
+    [ -z "$KEY" ] || [ -z "$CHATID" ] && return 0
+    TIME="10"
+    URL="https://api.telegram.org/bot$KEY/sendMessage"
+    TEXT="
+<code>────────────────────</code>
+<b>⚠️ SSH MULTI LOGIN DETECTED ⚠️</b>
+<code>────────────────────</code>
+<code>Username : </code><code>$user</code>
+<code>Limit IP : </code><code>$iplimit</code>
+<code>Login IP : </code><code>$cekcek</code>
+<code>Action   : </code><code>Session killed</code>
+<code>────────────────────</code>
+"
+    curl -s --max-time $TIME -d "chat_id=$CHATID&disable_web_page_preview=1&text=$TEXT&parse_mode=html" $URL >/dev/null
+}
+
+function sship(){
+    while true; do
+        sleep 420
+
+        # tentukan log auth
+        LOG=""
+        [ -f /var/log/auth.log ] && LOG="/var/log/auth.log"
+        [ -f /var/log/secure ] && LOG="/var/log/secure"
+        [ -z "$LOG" ] && continue
+
+        # baca daftar user yang punya limit IP
+        [ -d /etc/kyt/limit/ssh/ip ] || continue
+        data=( $(ls /etc/kyt/limit/ssh/ip 2>/dev/null) )
+        [ ${#data[@]} -eq 0 ] && continue
+
+        for user in "${data[@]}"; do
+            iplimit=$(cat /etc/kyt/limit/ssh/ip/$user 2>/dev/null)
+            [ -z "$iplimit" ] && continue
+            [ "$iplimit" = "0" ] && continue
+
+            # kumpulkan PID sesi aktif user ini
+            pids=""
+            ips=""
+
+            # dropbear
+            for pid in $(ps aux 2>/dev/null | grep -i dropbear | awk '{print $2}'); do
+                if grep -q "Password auth succeeded" /tmp/log-db-ssh-$$.txt 2>/dev/null; then :; fi
+                # cari di log
+                ip=$(grep "dropbear\[$pid\]" "$LOG" 2>/dev/null | grep -i "Password auth succeeded" | grep -w "$user" | awk '{print $12}' | tail -1)
+                if [ -n "$ip" ]; then
+                    pids="$pids $pid"
+                    ips="$ips $ip"
+                fi
+            done
+
+            # sshd
+            for pid in $(ps aux 2>/dev/null | grep "\[priv\]" | awk '{print $2}'); do
+                ip=$(grep "sshd\[$pid\]" "$LOG" 2>/dev/null | grep -i "Accepted password for $user" | awk '{print $11}' | tail -1)
+                if [ -n "$ip" ]; then
+                    pids="$pids $pid"
+                    ips="$ips $ip"
+                fi
+            done
+
+            # hitung IP unik
+            cekcek=$(echo "$ips" | tr ' ' '\n' | grep -v '^$' | sort -u | wc -l)
+
+            if [ "$cekcek" -gt "$iplimit" ]; then
+                # kill semua sesi user
+                for pid in $pids; do
+                    kill -9 "$pid" 2>/dev/null
+                done
+                # juga kill lewat pkill
+                pkill -u "$user" -9 2>/dev/null
+                send_log_ssh
+            fi
+        done
+    done
+}
+
+sship

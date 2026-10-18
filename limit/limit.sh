@@ -11,11 +11,15 @@ chmod +x /etc/xray/limit.vmess
 chmod +x /etc/xray/limit.vless
 chmod +x /etc/xray/limit.trojan
 chmod +x /etc/xray/limit.shadowsocks
+wget -q -O /etc/systemd/system/limitssh.service "${REPO}limit/limitssh.service" && chmod +x limitssh.service >/dev/null 2>&1
+wget -q -O /etc/xray/limit.ssh "${REPO}limit/ssh" >/dev/null 2>&1
+chmod +x /etc/xray/limit.ssh
 systemctl daemon-reload
 systemctl enable --now limitvmess
 systemctl enable --now limitvless
 systemctl enable --now limittrojan
 systemctl enable --now limitshadowsocks
+systemctl enable --now limitssh
 # systemctl start limitvmess
 # systemctl start limitvless
 # systemctl start limittrojan

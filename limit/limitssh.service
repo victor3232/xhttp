@@ -1,0 +1,14 @@
+[Unit]
+Description=Limit Multi Login SSH Service
+Documentation=kyt
+After=syslog.target network-online.target
+
+[Service]
+User=root
+NoNewPrivileges=true
+ExecStart=/etc/xray/limit.ssh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
