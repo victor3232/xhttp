@@ -1,8 +1,8 @@
 
-### TESTED ON OS
+### SUPPORT OS
 ```
-- UBUNTU 22 / 24 / 26
-- DEBIAN 11 / 12 / 13
+- UBUNTU 22 - 24 - 26
+- DEBIAN 11 - 12 - 13
 ```
 ### SIMPLE FEATURE
 ```
