@@ -111,8 +111,9 @@ After=network.target
 Type=simple
 Environment=WS_TARGET=127.0.0.1:${SSH_TARGET_PORT}
 Environment=WS_SSH_MAP=/run/ws-ssh.map
+Environment=WS_PORT=10019
 Environment=PYTHONUNBUFFERED=1
-ExecStart=${PYBIN} -O ${WSPY} -p 10019
+ExecStart=${PYBIN} -O ${WSPY}
 Restart=always
 RestartSec=2
 LimitNOFILE=1048576
@@ -168,15 +169,32 @@ for i, line in enumerate(lines):
             added += 1
 
 text = ''.join(out)
+
+# Support Cloudflare: prefer CF-Connecting-IP, fallback $remote_addr
+cf_map = ('map $http_cf_connecting_ip $real_client_ip {\n'
+          '    ""      $remote_addr;\n'
+          '    default $http_cf_connecting_ip;\n'
+          '}\n')
+if 'real_client_ip' not in text:
+    text = cf_map + text
+
 repl = [
     ('proxy_set_header X-Real-IP $http_x_forwarded_for;',
-     'proxy_set_header X-Real-IP $remote_addr;'),
+     'proxy_set_header X-Real-IP $real_client_ip;'),
     ('proxy_set_header X-Forwarded-For $http_x_forwarded_for;',
-     'proxy_set_header X-Forwarded-For $remote_addr;'),
+     'proxy_set_header X-Forwarded-For $real_client_ip;'),
     ('grpc_set_header X-Real-IP $http_x_forwarded_for;',
-     'grpc_set_header X-Real-IP $remote_addr;'),
+     'grpc_set_header X-Real-IP $real_client_ip;'),
     ('grpc_set_header X-Forwarded-For $http_x_forwarded_for;',
-     'grpc_set_header X-Forwarded-For $remote_addr;'),
+     'grpc_set_header X-Forwarded-For $real_client_ip;'),
+    ('proxy_set_header X-Real-IP $remote_addr;',
+     'proxy_set_header X-Real-IP $real_client_ip;'),
+    ('proxy_set_header X-Forwarded-For $remote_addr;',
+     'proxy_set_header X-Forwarded-For $real_client_ip;'),
+    ('grpc_set_header X-Real-IP $remote_addr;',
+     'grpc_set_header X-Real-IP $real_client_ip;'),
+    ('grpc_set_header X-Forwarded-For $remote_addr;',
+     'grpc_set_header X-Forwarded-For $real_client_ip;'),
     ('proxy_pass http://127.0.0.1:10015;',
      'proxy_pass http://127.0.0.1:10019;'),
 ]
@@ -184,13 +202,13 @@ for old, new in repl:
     text = text.replace(old, new)
 
 open(dst, 'w', encoding='utf-8').write(text)
-print('real_ip_lines=%d real_headers=%d ssh_10019=%d' % (
-    added,
-    text.count('X-Real-IP $remote_addr;') + text.count('X-Forwarded-For $remote_addr;'),
+print('cf_map=%d real_headers=%d ssh_10019=%d' % (
+    1 if 'real_client_ip' in text else 0,
+    text.count('$real_client_ip;'),
     text.count('proxy_pass http://127.0.0.1:10019;')))
 PY
 
-if ! grep -q 'X-Forwarded-For $remote_addr;' "$TMP_NG" || \
+if ! grep -q 'real_client_ip' "$TMP_NG" || \
    ! grep -q 'proxy_pass http://127.0.0.1:10019;' "$TMP_NG"; then
     bad "Hasil patch nginx tidak sesuai harapan"; rm -f "$TMP_NG"; exit 1
 fi
@@ -303,6 +321,10 @@ stripped = '\n'.join(
     if not line.lstrip().startswith('#')
 )
 json.loads(stripped)
+
+# loglevel harus "info" supaya email muncul di access.log
+text = text.replace('"loglevel": "warning"', '"loglevel": "info"')
+
 open(dst, 'w', encoding='utf-8').write(text)
 print('patched=%d skipped=%d' % (patched, skipped))
 PY
@@ -381,7 +403,7 @@ echo -e " ${BLD}${VIO}[5/5]${NC} ${BLD}Verifikasi${NC}"
 _ws="$(systemctl is-active ws-ssh 2>/dev/null)"
 [ "$_ws" = "active" ] && ok "ws-ssh: active" || warn "ws-ssh: $_ws"
 ss -ltn 2>/dev/null | awk '{print $4}' | grep -qE '[:.]10019$' && ok "Listen 10019: OK" || warn "Port 10019 tidak listen"
-_n=$(grep -c 'proxy_set_header X-Real-IP $remote_addr;' "$NGINX_CONF" 2>/dev/null || echo 0)
+_n=$(grep -c 'X-Real-IP $real_client_ip;' "$NGINX_CONF" 2>/dev/null || echo 0)
 [ "$_n" -gt 0 ] && ok "nginx X-Real-IP header: $_n lokasi" || warn "nginx header belum terpasang"
 _n=$(grep -c 'proxy_pass http://127.0.0.1:10019;' "$NGINX_CONF" 2>/dev/null || echo 0)
 [ "$_n" -eq 1 ] && ok "nginx SSH WS upstream: 10019" || warn "SSH WS upstream: $_n"
