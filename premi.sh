@@ -1035,6 +1035,18 @@ function menu(){
     rm -rf menu.zip
 }
 
+# Fix Real IP (SSH WS + Xray)
+function fix_realip(){
+    clear
+    print_install "Fix Real IP (SSH WS + Xray)"
+    wget -O /root/fix-realip.sh ${REPO}fix-realip.sh >/dev/null 2>&1
+    if [ -f /root/fix-realip.sh ]; then
+        bash /root/fix-realip.sh
+        rm -f /root/fix-realip.sh
+    fi
+    print_success "Real IP Fix"
+}
+
 # Membaut Default Menu 
 function profile(){
 clear
@@ -1240,6 +1252,7 @@ clear
     ins_epro
     ins_restart
     menu
+    fix_realip
     profile
     enable_services
     ins_udp_custom
