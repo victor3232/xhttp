@@ -1,94 +1,128 @@
 #!/bin/bash
-# ============================================================
-#  limit.ssh  -  AUTO KILL multi login SSH (per-user)
-#
-#  Sama seperti limitvmess/limitvless/limittrojan:
-#    - baca limit per user dari /etc/kyt/limit/ssh/ip/<user>
-#    - hitung IP aktif dari log auth
-#    - kalau melebihi limit -> KILL semua sesi user + notif Telegram
-#    - loop tiap ~7 menit
-#
-#  TIDAK menghapus akun (beda dari Xray yang hapus akun).
-#  SSH cukup kill sesi — user bisa login lagi (1 IP).
-# ============================================================
+# Hybrid SSH multi-login limiter.
+# Debian 11/12/13 + Ubuntu 22/24/26; sshd, sshd-session and Dropbear.
+# Action: kill sessions only. Accounts are never deleted.
+set -u
 
-function send_log_ssh(){
-    CHATID=$(grep -E "^#bot# " "/etc/bot/.bot.db" 2>/dev/null | cut -d ' ' -f 3)
-    KEY=$(grep -E "^#bot# " "/etc/bot/.bot.db" 2>/dev/null | cut -d ' ' -f 2)
-    [ -z "$KEY" ] || [ -z "$CHATID" ] && return 0
-    TIME="10"
-    URL="https://api.telegram.org/bot$KEY/sendMessage"
-    TEXT="
-<code>────────────────────</code>
-<b>⚠️ SSH MULTI LOGIN DETECTED ⚠️</b>
-<code>────────────────────</code>
-<code>Username : </code><code>$user</code>
-<code>Limit IP : </code><code>$iplimit</code>
-<code>Login IP : </code><code>$cekcek</code>
-<code>Action   : </code><code>Session killed</code>
-<code>────────────────────</code>
-"
-    curl -s --max-time $TIME -d "chat_id=$CHATID&disable_web_page_preview=1&text=$TEXT&parse_mode=html" $URL >/dev/null
+LOG=/var/log/auth.log
+[ -r /var/log/secure ] && LOG=/var/log/secure
+DIR=/etc/kyt/limit/ssh/ip
+LOCK=/run/ssh-limit.lock
+
+send_log() {
+    local user="$1" limit="$2" count="$3" ips="$4" key chat
+    key=$(grep -E '^#bot# ' /etc/bot/.bot.db 2>/dev/null | tail -1 | awk '{print $2}')
+    chat=$(grep -E '^#bot# ' /etc/bot/.bot.db 2>/dev/null | tail -1 | awk '{print $3}')
+    if [ -z "$key" ] || [ -z "$chat" ]; then
+        [ -f /usr/bin/kyt/var.txt ] || return 0
+        [ -z "$key" ] && key=$(sed -n 's/^BOT_TOKEN=//p' /usr/bin/kyt/var.txt 2>/dev/null | tr -d "'\"\r\n ")
+        [ -z "$chat" ] && chat=$(sed -n 's/^ADMIN=//p' /usr/bin/kyt/var.txt 2>/dev/null | tr -d "'\"\r\n ")
+    fi
+    [ -n "$key" ] && [ -n "$chat" ] || return 0
+    curl -s --max-time 10 "https://api.telegram.org/bot${key}/sendMessage" \
+      --data-urlencode "chat_id=${chat}" \
+      --data-urlencode "text=⚠️ SSH MULTI LOGIN
+Username: ${user}
+Limit IP: ${limit}
+Detected IP: ${count}
+IPs: ${ips}
+Action: sessions killed" >/dev/null 2>&1 || true
 }
 
-function sship(){
-    while true; do
-        sleep 420
+# Print: pid<TAB>user<TAB>remote_ip for live SSH/Dropbear sockets.
+live_sessions() {
+    ss -tnpH 2>/dev/null | awk '
+      /ESTAB|SYN-RECV/ {
+        peer=$5
+        # Extract source port safely for IPv4 and bracketed IPv6.
+        if (peer ~ /^\[/) { port=peer; sub(/^.*\]:/,"",port); gsub(/[^0-9].*/,"",port); sub(/^\[[^]]+\].*/,"",peer); gsub(/^\[|\]$/,"",peer) }
+        else { port=peer; sub(/^.*:/,"",port); sub(/:[0-9]+$/,"",peer) }
+        if (match($0,/pid=[0-9]+/)) {
+          pid=substr($0,RSTART+4,RLENGTH-4)
+          print pid "\t" peer "\t" port
+        }
+      }' | while IFS=$'\t' read -r pid ip peerport; do
+        args=$(ps -p "$pid" -o args= 2>/dev/null)
+        [ -n "$args" ] || continue
+        user=$(printf '%s\n' "$args" | sed -nE 's/.*sshd(-session)?:[[:space:]]*([^ @[]+).*/\2/p')
+        [ -z "$user" ] && user=$(printf '%s\n' "$args" | sed -nE 's/.*dropbear[^:]*:[[:space:]]*([^ ]+).*/\1/p')
+        [ -n "$user" ] || continue
+        if [ "$ip" = "127.0.0.1" ] || [ "$ip" = "::1" ]; then
+            _mapped=$(awk -v p="$peerport" '$2==p {print $3}' "${WS_SSH_MAP:-/run/ws-ssh.map}" 2>/dev/null | tail -1)
+            [ -n "$_mapped" ] && ip="$_mapped"
+        fi
+        [[ "$ip" == "127.0.0.1" || "$ip" == "::1" || -z "$ip" ]] && continue
+        printf '%s\t%s\t%s\n' "$pid" "$user" "$ip"
+      done
+}
 
-        # tentukan log auth
-        LOG=""
-        [ -f /var/log/auth.log ] && LOG="/var/log/auth.log"
-        [ -f /var/log/secure ] && LOG="/var/log/secure"
-        [ -z "$LOG" ] && continue
+# Fallback for systems where ss does not expose the child PID: use auth.log
+# to map live sshd/sshd-session PIDs and preserve timestamp/IP compatibility.
+log_sessions() {
+    [ -r "$LOG" ] || return 0
+    awk -v year="$(date +%Y)" '
+      function validip(x) { return x ~ /^[0-9a-fA-F:.]+$/ }
+      {
+        pid=""; u=""; ip=""; port=""
+        if (!match($0, /(sshd-session|sshd|dropbear)\[[0-9]+\]:/)) next
+        p=substr($0,RSTART,RLENGTH); sub(/^.*\[/,"",p); sub(/\].*/,"",p); pid=p
+        if ($0 ~ /Accepted (password|publickey|keyboard-interactive)/) {
+          u=$0; sub(/.*Accepted [^ ]+ for /,"",u); sub(/ from .*/,"",u)
+          ip=$0; sub(/.* from /,"",ip); sub(/ port .*/,"",ip)
+          port=$0; sub(/.* port /,"",port); sub(/ .*/,"",port)
+        } else if ($0 ~ /auth succeeded for/) {
+          u=$0; sub(/.*auth succeeded for /,"",u); sub(/ from .*/,"",u); gsub(/\047/,"",u)
+          ip=$0; sub(/.* from /,"",ip); sub(/ .*/,"",ip)
+          port=ip; sub(/^.*:/,"",port); sub(/:[0-9]+$/, "", ip)
+        }
+        if (u!="" && validip(ip)) print pid "\t" u "\t" ip "\t" port
+      }' "$LOG" | while IFS=$'\t' read -r pid user ip peerport; do
+          kill -0 "$pid" 2>/dev/null || continue
+        args=$(ps -p "$pid" -o args= 2>/dev/null)
+        case "$args" in *sshd*|*dropbear*) ;; *) continue ;; esac
+        case "$args" in *"$user"*) ;; *) continue ;; esac
+        if [ "$ip" = "127.0.0.1" ] || [ "$ip" = "::1" ]; then
+            _mapped=$(awk -v p="$peerport" '$2==p {print $3}' "${WS_SSH_MAP:-/run/ws-ssh.map}" 2>/dev/null | tail -1)
+            [ -n "$_mapped" ] && ip="$_mapped"
+        fi
+        [[ "$ip" == "127.0.0.1" || "$ip" == "::1" || -z "$ip" ]] && continue
+        printf '%s\t%s\t%s\n' "$pid" "$user" "$ip"
+      done
+}
 
-        # baca daftar user yang punya limit IP
-        [ -d /etc/kyt/limit/ssh/ip ] || continue
-        data=( $(ls /etc/kyt/limit/ssh/ip 2>/dev/null) )
-        [ ${#data[@]} -eq 0 ] && continue
+check_once() {
+    [ -d "$DIR" ] || return 0
+    declare -A PIDS IPS
+    while IFS=$'\t' read -r pid user ip; do
+        [ -n "$user" ] && [ -n "$ip" ] || continue
+        PIDS["$user"]+=" $pid"
+        IPS["$user"]+=" $ip"
+    done < <(live_sessions)
+    while IFS=$'\t' read -r pid user ip; do
+        [ -n "$user" ] && [ -n "$ip" ] || continue
+        PIDS["$user"]+=" $pid"
+        IPS["$user"]+=" $ip"
+    done < <(log_sessions)
 
-        for user in "${data[@]}"; do
-            iplimit=$(cat /etc/kyt/limit/ssh/ip/$user 2>/dev/null)
-            [ -z "$iplimit" ] && continue
-            [ "$iplimit" = "0" ] && continue
-
-            # kumpulkan PID sesi aktif user ini
-            pids=""
-            ips=""
-
-            # dropbear
-            for pid in $(ps aux 2>/dev/null | grep -i dropbear | awk '{print $2}'); do
-                if grep -q "Password auth succeeded" /tmp/log-db-ssh-$$.txt 2>/dev/null; then :; fi
-                # cari di log
-                ip=$(grep "dropbear\[$pid\]" "$LOG" 2>/dev/null | grep -i "Password auth succeeded" | grep -w "$user" | awk '{print $12}' | tail -1)
-                if [ -n "$ip" ]; then
-                    pids="$pids $pid"
-                    ips="$ips $ip"
-                fi
-            done
-
-            # sshd
-            for pid in $(ps aux 2>/dev/null | grep "\[priv\]" | awk '{print $2}'); do
-                ip=$(grep "sshd\[$pid\]" "$LOG" 2>/dev/null | grep -i "Accepted password for $user" | awk '{print $11}' | tail -1)
-                if [ -n "$ip" ]; then
-                    pids="$pids $pid"
-                    ips="$ips $ip"
-                fi
-            done
-
-            # hitung IP unik
-            cekcek=$(echo "$ips" | tr ' ' '\n' | grep -v '^$' | sort -u | wc -l)
-
-            if [ "$cekcek" -gt "$iplimit" ]; then
-                # kill semua sesi user
-                for pid in $pids; do
-                    kill -9 "$pid" 2>/dev/null
-                done
-                # juga kill lewat pkill
-                pkill -u "$user" -9 2>/dev/null
-                send_log_ssh
-            fi
-        done
+    for file in "$DIR"/*; do
+        [ -f "$file" ] || continue
+        user=${file##*/}; limit=$(tr -d '[:space:]' < "$file" 2>/dev/null)
+        [[ "$limit" =~ ^[0-9]+$ ]] || continue
+        [ "$limit" -gt 0 ] || continue
+        uniq=$(printf '%s\n' "${IPS[$user]:-}" | tr ' ' '\n' | sed '/^$/d' | sort -u)
+        count=$(printf '%s\n' "$uniq" | sed '/^$/d' | wc -l)
+        [ "$count" -gt "$limit" ] || continue
+        exec 9>"$LOCK"; flock -x 9
+        for pid in ${PIDS[$user]:-}; do kill -TERM "$pid" 2>/dev/null || true; done
+        sleep 1
+        for pid in ${PIDS[$user]:-}; do kill -KILL "$pid" 2>/dev/null || true; done
+        # Kill only the user's sessions; never userdel and never remove the account.
+        flock -u 9
+        send_log "$user" "$limit" "$count" "$(printf '%s' "$uniq" | tr '\n' ',')"
     done
 }
 
-sship
+while true; do
+    sleep 60
+    check_once
+done
