@@ -990,6 +990,66 @@ apt autoremove -y >/dev/null 2>&1
 print_success "ePro WebSocket Proxy"
 }
 
+# HCR relay (SSH tunnel) on dedicated TCP/8811.
+# Does not modify HAProxy/Nginx listeners; refuses to take over an occupied port.
+function ins_hcr(){
+    clear
+    print_install "Memasang HCR SSH Relay (TLS + Plain) pada TCP/8811"
+    local bundle=/tmp/hcr.zip stage=/opt/hcr domain
+    domain=$(cat /etc/xray/domain 2>/dev/null)
+    [ -n "$domain" ] || { echo "HCR dilewati: domain belum tersedia"; return 1; }
+    if ss -H -lnt 2>/dev/null | awk '{print $4}' | grep -Eq '(^|:)8811$'; then
+        echo "ERROR: TCP/8811 sudah digunakan service lain; HCR tidak mengambil alih port."
+        return 1
+    fi
+    [ -s /etc/xray/xray.crt ] && [ -s /etc/xray/xray.key ] || {
+        echo "ERROR: sertifikat domain Xray tidak ditemukan; HCR tidak dipasang."
+        return 1
+    }
+    rm -f "$bundle"
+    wget -q -O "$bundle" "${REPO}limit/hcr.zip" || {
+        echo "ERROR: gagal mengunduh limit/hcr.zip dari repo."
+        rm -f "$bundle"
+        return 1
+    }
+    unzip -tq "$bundle" >/dev/null 2>&1 || {
+        echo "ERROR: limit/hcr.zip tidak valid."
+        rm -f "$bundle"
+        return 1
+    }
+    install -d -o root -g root -m 0755 "$stage"
+    unzip -oq "$bundle" -d "$stage"
+    rm -f "$bundle"
+    [ -x "$stage/install.sh" ] && [ -f "$stage/hcr-server" ] || {
+        echo "ERROR: bundle HCR harus berisi install.sh dan hcr-server."
+        return 1
+    }
+    chown -R root:root "$stage"
+    chmod 0755 "$stage"
+    chmod 0755 "$stage/install.sh" "$stage/hcr-server"
+    # Protect the root-owned files before copying the TLS private key.
+    chmod go-w "$stage" "$stage/install.sh" "$stage/hcr-server"
+    install -o root -g root -m 0644 /etc/xray/xray.crt "$stage/fullchain.pem"
+    install -o root -g root -m 0600 /etc/xray/xray.key "$stage/privkey.pem"
+    (cd "$stage" && ./install.sh --port 8811 --transport auto) || {
+        echo "ERROR: installer HCR gagal; periksa systemctl status/journalctl hcr-server."
+        return 1
+    }
+    iptables -w -C INPUT -p tcp --dport 8811 -j ACCEPT 2>/dev/null ||
+        iptables -w -I INPUT 1 -p tcp --dport 8811 -j ACCEPT
+    if command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -w -C INPUT -p tcp --dport 8811 -j ACCEPT 2>/dev/null ||
+            ip6tables -w -I INPUT 1 -p tcp --dport 8811 -j ACCEPT
+    fi
+    netfilter-persistent save >/dev/null 2>&1 || true
+    systemctl is-active --quiet hcr-server || {
+        echo "ERROR: HCR service tidak active setelah instalasi."
+        return 1
+    }
+    print_success "HCR SSH Relay aktif pada TCP/8811 (TLS + Plain), target 127.0.0.1:22"
+    echo "Catatan: izinkan TCP/8811 pada firewall provider/cloud bila ada."
+}
+
 function ins_restart(){
 clear
 print_install "Restarting  All Packet"
@@ -1250,6 +1310,7 @@ clear
     ins_swab
     ins_Fail2ban
     ins_epro
+    ins_hcr
     ins_restart
     menu
     fix_realip
