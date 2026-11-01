@@ -14,12 +14,16 @@ chmod +x /etc/xray/limit.shadowsocks
 wget -q -O /etc/systemd/system/limitssh.service "${REPO}limit/limitssh.service" && chmod +x limitssh.service >/dev/null 2>&1
 wget -q -O /etc/xray/limit.ssh "${REPO}limit/ssh" >/dev/null 2>&1
 chmod +x /etc/xray/limit.ssh
+wget -q -O /usr/local/sbin/quota-ssh "${REPO}limit/quota-ssh" >/dev/null 2>&1
+chmod +x /usr/local/sbin/quota-ssh
+wget -q -O /etc/systemd/system/quotassh.service "${REPO}limit/quotassh.service" >/dev/null 2>&1
 systemctl daemon-reload
 systemctl enable --now limitvmess
 systemctl enable --now limitvless
 systemctl enable --now limittrojan
 systemctl enable --now limitshadowsocks
 systemctl enable --now limitssh
+systemctl enable --now quotassh
 # systemctl start limitvmess
 # systemctl start limitvless
 # systemctl start limittrojan

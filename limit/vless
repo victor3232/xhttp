@@ -1,7 +1,12 @@
 #!/bin/bash
 function send-log(){
-CHATID=$(grep -E "^#bot# " "/etc/bot/.bot.db" | cut -d ' ' -f 3)
-KEY=$(grep -E "^#bot# " "/etc/bot/.bot.db" | cut -d ' ' -f 2)
+CHATID=$(grep -E "^#bot# " "/etc/bot/.bot.db" 2>/dev/null | cut -d ' ' -f 3)
+KEY=$(grep -E "^#bot# " "/etc/bot/.bot.db" 2>/dev/null | cut -d ' ' -f 2)
+if [ -z "$KEY" ] || [ -z "$CHATID" ]; then
+    [ -f /usr/bin/kyt/var.txt ] && KEY=$(sed -n 's/^BOT_TOKEN=//p' /usr/bin/kyt/var.txt 2>/dev/null | tr -d "'\"\r\n ")
+    [ -f /usr/bin/kyt/var.txt ] && CHATID=$(sed -n 's/^ADMIN=//p' /usr/bin/kyt/var.txt 2>/dev/null | tr -d "'\"\r\n ")
+fi
+[ -n "$KEY" ] && [ -n "$CHATID" ] || return 0
 TIME="10"
 URL="https://api.telegram.org/bot$KEY/sendMessage"
 TEXT="

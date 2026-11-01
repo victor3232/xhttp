@@ -1,0 +1,259 @@
+#!/usr/bin/env python3
+"""
+SSH Quota Accounting and Enforcement Service
+Tracks per-user SSH I/O (download/upload) via /proc/<pid>/io.
+Supports OpenSSH, Dropbear, WebSocket SSH, HCR, etc.
+Safe and isolated: does NOT touch any network port or root services.
+"""
+
+import os
+import sys
+import time
+import glob
+import pwd
+import signal
+import subprocess
+import urllib.request
+import urllib.parse
+
+LIMIT_DIR = "/etc/limit/ssh"
+QUOTA_DIR = "/etc/ssh"
+BOT_DB = "/etc/bot/.bot.db"
+VAR_TXT = "/usr/bin/kyt/var.txt"
+LOCK_SUFFIX = ".lock"
+
+def get_bot_credentials():
+    token, chat_id = None, None
+    if os.path.exists(BOT_DB):
+        try:
+            with open(BOT_DB, "r") as f:
+                for line in f:
+                    if line.startswith("#bot# "):
+                        parts = line.strip().split()
+                        if len(parts) >= 3:
+                            token = parts[1]
+                            chat_id = parts[2]
+                            break
+        except Exception:
+            pass
+    if not token or not chat_id:
+        if os.path.exists(VAR_TXT):
+            try:
+                with open(VAR_TXT, "r") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith("BOT_TOKEN="):
+                            token = line.split("=", 1)[1].strip("'\" ")
+                        elif line.startswith("ADMIN="):
+                            chat_id = line.split("=", 1)[1].strip("'\" ")
+            except Exception:
+                pass
+    return token, chat_id
+
+def send_telegram(user, limit_bytes, usage_bytes):
+    token, chat_id = get_bot_credentials()
+    if not token or not chat_id:
+        return
+    text = (
+        "<code>────────────────────</code>\n"
+        "<b>⚠️NOTIF QUOTA HABIS SSH⚠️</b>\n"
+        "<code>────────────────────</code>\n"
+        f"<code>Username    : </code><code>{user}</code>\n"
+        f"<code>Limit Quota : </code><code>{format_bytes(limit_bytes)}</code>\n"
+        f"<code>Usage       : </code><code>{format_bytes(usage_bytes)}</code>\n"
+        "<code>Status      : </code><code>Akun Otomatis Dikunci</code>\n"
+        "<code>────────────────────</code>"
+    )
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    data = urllib.parse.urlencode({
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "html",
+        "disable_web_page_preview": "1"
+    }).encode("utf-8")
+    try:
+        req = urllib.request.Request(url, data=data, method="POST")
+        urllib.request.urlopen(req, timeout=10)
+    except Exception:
+        pass
+
+def format_bytes(b):
+    if b < 1024:
+        return f"{b} B"
+    elif b < 1048576:
+        return f"{b / 1024:.2f} KB"
+    elif b < 1073741824:
+        return f"{b / 1048576:.2f} MB"
+    else:
+        return f"{b / 1073741824:.2f} GB"
+
+def load_user_usage():
+    usage = {}
+    if not os.path.exists(LIMIT_DIR):
+        os.makedirs(LIMIT_DIR, exist_ok=True)
+    for fname in os.listdir(LIMIT_DIR):
+        if fname.endswith(LOCK_SUFFIX) or fname.endswith(".tmp"):
+            continue
+        fpath = os.path.join(LIMIT_DIR, fname)
+        if os.path.isfile(fpath):
+            try:
+                with open(fpath, "r") as f:
+                    val = int(f.read().strip())
+                    usage[fname] = val
+            except Exception:
+                pass
+    return usage
+
+def save_user_usage(user, total_bytes):
+    fpath = os.path.join(LIMIT_DIR, user)
+    try:
+        tpath = fpath + ".tmp"
+        with open(tpath, "w") as f:
+            f.write(f"{total_bytes}\n")
+        os.replace(tpath, fpath)
+    except Exception:
+        pass
+
+def lock_account(user, limit_bytes, usage_bytes):
+    lock_file = os.path.join(LIMIT_DIR, user + LOCK_SUFFIX)
+    if os.path.exists(lock_file):
+        return
+    
+    subprocess.run(["pkill", "-u", user, "-f", "(sshd|dropbear)"], stderr=subprocess.DEVNULL)
+    subprocess.run(["usermod", "-L", user], stderr=subprocess.DEVNULL)
+    
+    try:
+        with open(lock_file, "w") as f:
+            f.write(f"locked at {time.time()} - usage {usage_bytes} >= {limit_bytes}\n")
+    except Exception:
+        pass
+    
+    send_telegram(user, limit_bytes, usage_bytes)
+
+def unlock_account_if_needed(user, limit_bytes, usage_bytes):
+    lock_file = os.path.join(LIMIT_DIR, user + LOCK_SUFFIX)
+    if os.path.exists(lock_file) and usage_bytes < limit_bytes:
+        try:
+            os.remove(lock_file)
+        except Exception:
+            pass
+        subprocess.run(["usermod", "-U", user], stderr=subprocess.DEVNULL)
+
+def get_quota_limit(user):
+    qpath = os.path.join(QUOTA_DIR, user)
+    if os.path.isfile(qpath):
+        try:
+            with open(qpath, "r") as f:
+                val = int(f.read().strip())
+                if val > 0:
+                    return val
+        except Exception:
+            pass
+    return None
+
+def sync_disk_usage(user, current_mem_usage):
+    fpath = os.path.join(LIMIT_DIR, user)
+    if os.path.isfile(fpath):
+        try:
+            with open(fpath, "r") as f:
+                disk_val = int(f.read().strip())
+                if disk_val < current_mem_usage:
+                    return disk_val
+        except Exception:
+            pass
+    return current_mem_usage
+
+def main():
+    os.makedirs(LIMIT_DIR, exist_ok=True)
+    user_usage = load_user_usage()
+    pid_history = {}
+
+    while True:
+        try:
+            active_pids = set()
+            for p in glob.glob("/proc/[0-9]*/status"):
+                try:
+                    pid = os.path.basename(os.path.dirname(p))
+                    with open(p, "r") as f:
+                        lines = f.readlines()
+                    name = ""
+                    uid = None
+                    for line in lines:
+                        if line.startswith("Name:"):
+                            name = line.split()[1]
+                        elif line.startswith("Uid:"):
+                            uid = int(line.split()[1])
+                    
+                    if uid is None or uid < 1000:
+                        continue
+                    if "sshd" not in name and "dropbear" not in name:
+                        continue
+                    
+                    try:
+                        user = pwd.getpwuid(uid).pw_name
+                    except Exception:
+                        continue
+                    
+                    io_file = f"/proc/{pid}/io"
+                    if not os.path.exists(io_file):
+                        continue
+                    
+                    rchar, wchar = 0, 0
+                    with open(io_file, "r") as f:
+                        for line in f:
+                            if line.startswith("rchar:"):
+                                rchar = int(line.split()[1])
+                            elif line.startswith("wchar:"):
+                                wchar = int(line.split()[1])
+                    
+                    total_io = rchar + wchar
+                    active_pids.add(pid)
+
+                    # Check if admin reset usage on disk
+                    user_usage[user] = sync_disk_usage(user, user_usage.get(user, 0))
+
+                    if pid in pid_history:
+                        prev_user, prev_total = pid_history[pid]
+                        delta = total_io - prev_total
+                        if delta > 0:
+                            current = user_usage.get(user, 0) + delta
+                            user_usage[user] = current
+                            save_user_usage(user, current)
+                    else:
+                        current = user_usage.get(user, 0) + total_io
+                        user_usage[user] = current
+                        save_user_usage(user, current)
+
+                    pid_history[pid] = (user, total_io)
+
+                except Exception:
+                    continue
+
+            stale_pids = [p for p in pid_history if p not in active_pids]
+            for p in stale_pids:
+                del pid_history[p]
+
+            # Check all users with quota limit
+            all_users = set(user_usage.keys())
+            if os.path.exists(QUOTA_DIR):
+                for qf in os.listdir(QUOTA_DIR):
+                    if not qf.startswith(".") and os.path.isfile(os.path.join(QUOTA_DIR, qf)):
+                        all_users.add(qf)
+
+            for user in all_users:
+                cur_usage = sync_disk_usage(user, user_usage.get(user, 0))
+                user_usage[user] = cur_usage
+                limit_val = get_quota_limit(user)
+                if limit_val is not None:
+                    if cur_usage >= limit_val:
+                        lock_account(user, limit_val, cur_usage)
+                    else:
+                        unlock_account_if_needed(user, limit_val, cur_usage)
+
+        except Exception:
+            pass
+
+        time.sleep(5)
+
+if __name__ == "__main__":
+    main()

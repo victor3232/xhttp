@@ -1,0 +1,14 @@
+[Unit]
+Description=Limit Usage SSH Service
+Documentation=kyt
+After=syslog.target network-online.target
+
+[Service]
+User=root
+NoNewPrivileges=true
+ExecStart=/usr/local/sbin/quota-ssh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
