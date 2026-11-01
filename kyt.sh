@@ -351,7 +351,22 @@ else
   exit 1
 fi
 
-# ---------- konfigurasi (var.txt) ----------
+# ---------- konfigurasi (var.txt & .bot.db) ----------
+if [ -f /etc/bot/.bot.db ] && [ ! -s /usr/bin/kyt/var.txt ]; then
+  _db_tok=$(awk '$1 == "#bot#" {print $2}' /etc/bot/.bot.db 2>/dev/null | tail -1)
+  _db_adm=$(awk '$1 == "#bot#" {print $3}' /etc/bot/.bot.db 2>/dev/null | tail -1)
+  if [ -n "$_db_tok" ] && [ -n "$_db_adm" ]; then
+    mkdir -p /usr/bin/kyt
+    {
+      echo "BOT_TOKEN='$_db_tok'"
+      echo "ADMIN='$_db_adm'"
+      echo "DOMAIN='$domain'"
+      echo "PUB='$PUB'"
+      echo "HOST='$NS'"
+    } > /usr/bin/kyt/var.txt
+  fi
+fi
+
 if [ ! -s /usr/bin/kyt/var.txt ]; then
   echo ""
   echo -e "\033[1;36m━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\033[0m"
@@ -369,9 +384,17 @@ if [ ! -s /usr/bin/kyt/var.txt ]; then
     echo "PUB='$PUB'"
     echo "HOST='$NS'"
   } > /usr/bin/kyt/var.txt
+  mkdir -p /etc/bot
+  echo "#bot# $bottoken $admin" > /etc/bot/.bot.db
   clear
 else
   ok "var.txt lama dipakai (token tidak perlu diinput ulang)"
+  _vtok=$(sed -n "s/^BOT_TOKEN=//p" /usr/bin/kyt/var.txt | tr -d "'\"\r\n ")
+  _vadm=$(sed -n "s/^ADMIN=//p" /usr/bin/kyt/var.txt | tr -d "'\"\r\n ")
+  if [ -n "$_vtok" ] && [ -n "$_vadm" ]; then
+    mkdir -p /etc/bot
+    echo "#bot# $_vtok $_vadm" > /etc/bot/.bot.db
+  fi
 fi
 
 # ---------- service ----------
