@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# ============================================================
+#  nameserver - Installer SlowDNS Server (DNSTT) untuk premi.sh
+# ============================================================
+set -euo pipefail
+
+REPO_CONF="/etc/kyt-repo.conf"
+[ -f "$REPO_CONF" ] && REPO_URL=$(cat "$REPO_CONF" 2>/dev/null)
+REPO="${REPO_URL:-https://raw.githubusercontent.com/victor3232/xhttp/main/}"
+[[ "$REPO" != */ ]] && REPO="${REPO}/"
+
+MYIP=$(curl -sS ipv4.icanhazip.com || wget -qO- ipv4.icanhazip.com || curl -sS ifconfig.me)
+domain=$(cat /etc/xray/domain 2>/dev/null || cat /root/domain 2>/dev/null || echo "$MYIP")
+ns_domain="ns.${domain}"
+
+echo "Memasang SlowDNS Server untuk domain: $domain ($ns_domain)..."
+
+# 1. Hapus redirect lawas UDP 53 -> 5300 jika ada
+while iptables -t nat -C PREROUTING -i eth0 -p udp --dport 53 -j REDIRECT --to-ports 5300 2>/dev/null; do
+  iptables -t nat -D PREROUTING -i eth0 -p udp --dport 53 -j REDIRECT --to-ports 5300
+done
+sed -i '\|iptables -t nat -I PREROUTING -p udp --dport 53 -j REDIRECT --to-ports 5300|d' /etc/rc.local 2>/dev/null || true
+sed -i '\|-A PREROUTING -i eth0 -p udp -m udp --dport 53 -j REDIRECT --to-ports 5300|d' /etc/iptables/rules.v4 /etc/iptables.up.rules 2>/dev/null || true
+
+# 2. Unduh bundle slowdns jika belum ada
+ARCHIVE="/root/slowdns-linux-amd64.tar.gz"
+if [ ! -s "$ARCHIVE" ]; then
+    wget -4 -q --timeout=30 -O "$ARCHIVE" "${REPO}limit/slowdns-linux-amd64.tar.gz" || \
+    curl -4 -fsSL --max-time 30 -o "$ARCHIVE" "${REPO}limit/slowdns-linux-amd64.tar.gz" || true
+fi
+
+if [ ! -s "$ARCHIVE" ]; then
+    echo "Peringatan: Gagal mengunduh bundle slowdns dari repo. Mengabaikan pemasangan."
+    exit 0
+fi
+
+# 3. Ekstrak ke /root/slowdns
+WORK="/root/slowdns"
+rm -rf "$WORK"
+install -d -m 0700 "$WORK"
+tar -xzf "$ARCHIVE" -C "$WORK"
+chown -R root:root "$WORK"
+chmod 0700 "$WORK"
+chmod 0755 "$WORK/slowdns" "$WORK/install.sh"
+chmod 0644 "$WORK/README.md"
+
+# 4. Simpan NS domain
+mkdir -p /etc/xray /etc/slowdns
+echo "$ns_domain" > /etc/xray/dns
+
+# 5. Pasang service otomatis
+printf '%s\n53\n%s\n127.0.0.1:22\n' "$MYIP" "$domain" | bash "$WORK/install.sh" install
+
+# 6. Kompatibilitas symlink
+ln -sfn /root/slowdns/server.pub /etc/slowdns/server.pub
+
+if systemctl is-active --quiet slowdns; then
+    echo "SlowDNS Server berhasil aktif pada UDP 53 -> SSH 22!"
+else
+    echo "Peringatan: slowdns.service belum berjalan aktif."
+fi
