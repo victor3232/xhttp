@@ -23,7 +23,10 @@ if [ -z "$BIND_IP" ]; then
   BIND_IP="$MYIP"
 fi
 
-domain=$(cat /etc/xray/domain 2>/dev/null || cat /root/domain 2>/dev/null || echo "$MYIP")
+xray_domain=$(cat /etc/xray/domain 2>/dev/null || cat /root/domain 2>/dev/null || echo "$MYIP")
+# Pisahkan domain SlowDNS dari domain Xray supaya delegasi NS tidak
+# menimpa resolusi domain Xray.
+domain="dns.${xray_domain}"
 ns_domain="ns.${domain}"
 
 echo "Memasang SlowDNS Server untuk domain: $domain ($ns_domain)..."

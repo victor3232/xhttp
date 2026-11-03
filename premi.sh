@@ -3,6 +3,21 @@
 # FIX: Agar tidak muncul layar pink (Interactive)
 export DEBIAN_FRONTEND=noninteractive
 
+# Paksa IPv4 dan sediakan pengambil binary berbasis base64.
+wget() { command wget -4 "$@"; }
+curl() { command curl -4 "$@"; }
+export -f wget curl 2>/dev/null || true
+
+# Ambil binary lewat base64 supaya proxy/CDN tidak merusak byte non-teks.
+get_b64() {
+    local url="$1" out="$2" tmp="${2}.b64"
+    wget -q --timeout=30 -O "$tmp" "$url" || curl -fsSL --max-time 60 -o "$tmp" "$url" || return 1
+    [ -s "$tmp" ] || { rm -f "$tmp"; return 1; }
+    base64 -d "$tmp" > "$out" || { rm -f "$out" "$tmp"; return 1; }
+    chmod 755 "$out"
+    rm -f "$tmp"
+}
+
 # FIX: Agar tidak tanya restart service (Ubuntu 22/24)
 if [ -f /etc/needrestart/needrestart.conf ]; then
     sed -i 's/#$nrconf{restart} = '"'"'i'"'"';/$nrconf{restart} = '"'"'a'"'"';/g' /etc/needrestart/needrestart.conf
@@ -207,7 +222,7 @@ fi
 echo -e "\e[32mloading...\e[0m"
 clear
 # REPO    
-    REPO="https://raw.githubusercontent.com/victor3232/xhttp/main/"
+    REPO="https://installer.pteroqhost.com/"
 
 ####
 start=$(date +%s)
@@ -751,7 +766,7 @@ systemctl enable trip
 #SERVICE VMESS
 # // Installing UDP Mini
 mkdir -p /usr/local/kyt/
-wget -q -O /usr/local/kyt/udp-mini "${REPO}limit/udp-mini"
+get_b64 "${REPO}limit/udp-mini.b64" /usr/local/kyt/udp-mini
 chmod +x /usr/local/kyt/udp-mini
 wget -q -O /etc/systemd/system/udp-mini-1.service "${REPO}limit/udp-mini-1.service"
 wget -q -O /etc/systemd/system/udp-mini-2.service "${REPO}limit/udp-mini-2.service"
@@ -952,7 +967,7 @@ print_success "Fail2ban"
 function ins_epro(){
 clear
 print_install "Menginstall ePro WebSocket Proxy"
-    wget -O /usr/bin/ws "${REPO}limit/ws" >/dev/null 2>&1
+    get_b64 "${REPO}limit/ws.b64" /usr/bin/ws
     wget -O /usr/bin/tun.conf "${REPO}limit/tun.conf" >/dev/null 2>&1
     wget -O /etc/systemd/system/ws.service "${REPO}limit/ws.service" >/dev/null 2>&1
     chmod +x /etc/systemd/system/ws.service
@@ -965,7 +980,7 @@ systemctl start ws
 systemctl restart ws
 wget -q -O /usr/local/share/xray/geosite.dat "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat" >/dev/null 2>&1
 wget -q -O /usr/local/share/xray/geoip.dat "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat" >/dev/null 2>&1
-wget -O /usr/sbin/ftvpn "${REPO}limit/ftvpn" >/dev/null 2>&1
+get_b64 "${REPO}limit/ftvpn.b64" /usr/sbin/ftvpn
 chmod +x /usr/sbin/ftvpn
 iptables -A FORWARD -m string --string "get_peers" --algo bm -j DROP
 iptables -A FORWARD -m string --string "announce_peer" --algo bm -j DROP
