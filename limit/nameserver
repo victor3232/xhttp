@@ -6,14 +6,28 @@ set -euo pipefail
 
 REPO_CONF="/etc/kyt-repo.conf"
 [ -f "$REPO_CONF" ] && REPO_URL=$(cat "$REPO_CONF" 2>/dev/null)
-REPO="${REPO_URL:-https://raw.githubusercontent.com/victor3232/xhttp/main/}"
+REPO="${REPO_URL:-https://installer.pteroqhost.com/}"
 [[ "$REPO" != */ ]] && REPO="${REPO}/"
 
 MYIP=$(curl -sS ipv4.icanhazip.com || wget -qO- ipv4.icanhazip.com || curl -sS ifconfig.me)
+# EC2/Lightsail memakai public IP sebagai NAT, bukan IP interface.
+# SlowDNS harus bind ke IP yang benar-benar ada di interface.
+BIND_IP="$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]\+\).*/\1/p' | head -n1 || true)"
+if [ -z "$BIND_IP" ]; then
+  BIND_IP="$(ip -4 -o addr show scope global 2>/dev/null | awk '{split($4,a,"/"); print a[1]; exit}' || true)"
+fi
+if [ -z "$BIND_IP" ]; then
+  BIND_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+fi
+if [ -z "$BIND_IP" ]; then
+  BIND_IP="$MYIP"
+fi
+
 domain=$(cat /etc/xray/domain 2>/dev/null || cat /root/domain 2>/dev/null || echo "$MYIP")
 ns_domain="ns.${domain}"
 
 echo "Memasang SlowDNS Server untuk domain: $domain ($ns_domain)..."
+echo "Menggunakan listener IP interface: $BIND_IP (public: $MYIP)"
 
 # 1. Hapus redirect lawas UDP 53 -> 5300 jika ada
 while iptables -t nat -C PREROUTING -i eth0 -p udp --dport 53 -j REDIRECT --to-ports 5300 2>/dev/null; do
@@ -44,12 +58,14 @@ chmod 0700 "$WORK"
 chmod 0755 "$WORK/slowdns" "$WORK/install.sh"
 chmod 0644 "$WORK/README.md"
 
-# 4. Simpan NS domain
-mkdir -p /etc/xray /etc/slowdns
-echo "$ns_domain" > /etc/xray/dns
+# 4. Simpan domain SlowDNS (bukan host NS) untuk semua output akun
+mkdir -p /etc/xray /etc/slowdns /root/slowdns
+echo "$domain" > /etc/xray/dns
+echo "$domain" > /root/slowdns/dns_domain
+echo "$domain" > /etc/xray/dns_domain 2>/dev/null || true
 
 # 5. Pasang service otomatis
-printf '%s\n53\n%s\n127.0.0.1:22\n' "$MYIP" "$domain" | bash "$WORK/install.sh" install
+printf '%s\n53\n%s\n127.0.0.1:22\n' "$BIND_IP" "$domain" | bash "$WORK/install.sh" install
 
 # 6. Kompatibilitas symlink
 ln -sfn /root/slowdns/server.pub /etc/slowdns/server.pub
