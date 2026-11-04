@@ -1,0 +1,389 @@
+#!/bin/bash
+# ============================================================
+#  restore  -  RESTORE DATA VPN DARI FILE .ZIP
+#
+#  Cara pakai:
+#    1. Upload file .zip hasil backup ke /root  (SFTP/WinSCP)
+#    2. menu 10 -> 02 RESTORE
+#    3. Pilih nomor file zip yang tampil
+#
+#  Pengaman:
+#    - zip diperiksa dulu (rusak / bukan backup -> ditolak)
+#    - data SEKARANG dicadangkan otomatis sebelum ditimpa
+#    - kalau /etc/shadow hasil restore tidak punya root ->
+#      DIBATALKAN (biar tidak terkunci dari VPS)
+#    - hak akses berkas penting diperbaiki
+#    - layanan VPN di-restart otomatis
+# ============================================================
+
+# ==== GARIS RGB (selaras dengan menu utama) ====
+KYTRB=("255;0;0" "255;64;0" "255;128;0" "255;192;0" "255;255;0" "192;255;0" \
+"128;255;0" "64;255;0" "0;255;0" "0;255;64" "0;255;128" "0;255;192" \
+"0;255;255" "0;192;255" "0;128;255" "0;64;255" "0;0;255" "64;0;255" \
+"128;0;255" "192;0;255" "255;0;255" "255;0;192" "255;0;128" "255;0;64")
+kytline() {
+    local n="${1:-19}" i=0 out="" c
+    while [ "$i" -lt "$n" ]; do
+        c=${KYTRB[$(( i % ${#KYTRB[@]} ))]}
+        out+=$'\033[38;2;'"$c"$'m━'
+        i=$((i+1))
+    done
+    printf '%s\033[0m\n' "$out"
+}
+# ==== akhir garis RGB ====
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+clear
+kytline 50
+echo -e "  \033[1;97;41m            RESTORE DATA VPN (.zip)            \033[0m"
+kytline 50
+echo ""
+
+# ---------- cari file zip ----------
+echo -e " ${CYAN}File .zip yang tersedia:${NC}"
+echo ""
+i=0
+DAFTAR=""
+for f in /root/*.zip /root/backup/*.zip; do
+    [ -f "$f" ] || continue
+    i=$((i + 1))
+    UK=$(stat -c%s "$f" 2>/dev/null || echo 0)
+    if [ "$UK" -lt 1048576 ]; then
+        T="$((UK / 1024)) KB"
+    else
+        T=$(awk "BEGIN{printf \"%.2f MB\", $UK/1048576}")
+    fi
+    printf "   [%d] %-42s %s\n" "$i" "$(basename "$f")" "$T"
+    DAFTAR="$DAFTAR$f\n"
+done
+
+if [ "$i" = "0" ]; then
+    echo -e "   ${YELLOW}(tidak ada file .zip di /root atau /root/backup)${NC}"
+    echo ""
+    kytline 50
+    echo -e " ${YELLOW}Cara upload:${NC}"
+    echo -e "   1. Buka SFTP / WinSCP ke VPS ini"
+    echo -e "   2. Masuk folder ${GREEN}/root${NC}"
+    echo -e "   3. Upload file .zip hasil backup ke situ"
+    echo -e "   4. Jalankan menu ini lagi"
+    kytline 50
+    echo ""
+    echo -e " ${CYAN}[T]${NC} Restore dari Telegram File ID"
+    echo ""
+    read -rp " Pilih [T] File ID / Enter untuk kembali: " PILIH
+    if [[ -z "$PILIH" ]]; then menu-backup; exit 0; fi
+else
+echo ""
+echo -e " ${CYAN}[T]${NC} Restore dari Telegram File ID"
+echo ""
+read -rp " Pilih nomor file / [T] File ID: " PILIH
+fi
+
+if [[ "$PILIH" == "t" || "$PILIH" == "T" ]]; then
+    KEY=""; CHATID=""
+    [ -f /etc/bot/.bot.db ] && {
+        KEY=$(grep -E "^#bot# " /etc/bot/.bot.db 2>/dev/null | tail -1 | awk '{print $2}')
+        CHATID=$(grep -E "^#bot# " /etc/bot/.bot.db 2>/dev/null | tail -1 | awk '{print $3}')
+    }
+    if { [ -z "$KEY" ] || [ -z "$CHATID" ]; } && [ -f /usr/bin/kyt/var.txt ]; then
+        [ -z "$KEY" ] && KEY=$(sed -n "s/^BOT_TOKEN=//p" /usr/bin/kyt/var.txt 2>/dev/null | tr -d "'\"\r\n ")
+        [ -z "$CHATID" ] && CHATID=$(sed -n "s/^ADMIN=//p" /usr/bin/kyt/var.txt 2>/dev/null | tr -d "'\"\r\n ")
+    fi
+    if [ -z "$KEY" ]; then
+        echo -e " ${YELLOW}Bot belum diatur. Masukkan manual:${NC}"
+        read -rp " Bot Token: " KEY
+        [ -z "$KEY" ] && { echo -e " ${RED}Token kosong.${NC}"; read -n1 -s -rp " Press any key..."; menu-backup; exit 1; }
+    fi
+    echo ""
+    read -rp " Paste File ID: " FIDS
+    [ -z "$FIDS" ] && { menu-backup; exit 0; }
+    echo -e " ${CYAN}Downloading dari Telegram...${NC}"
+    FPATH=$(curl -s "https://api.telegram.org/bot${KEY}/getFile?file_id=${FIDS}" | python3 -c "import sys,json;print(json.load(sys.stdin).get('result',{}).get('file_path',''))" 2>/dev/null)
+    if [ -z "$FPATH" ]; then
+        echo -e " ${RED}File ID tidak valid atau bot error.${NC}"
+        read -n1 -s -rp " Press any key..."; menu-backup; exit 1
+    fi
+    DLURL="https://api.telegram.org/file/bot${KEY}/${FPATH}"
+    DLNAME="/root/backup/restore-$(date +%Y%m%d%H%M%S).zip"
+    mkdir -p /root/backup
+    if curl -fsSL --max-time 300 "$DLURL" -o "$DLNAME"; then
+        echo -e " ${GREEN}Downloaded: $(basename $DLNAME) ($(stat -c%s "$DLNAME" | awk '{printf "%.1f MB",$1/1048576}'))${NC}"
+        PILIH="$DLNAME"
+    else
+        echo -e " ${RED}Download gagal.${NC}"
+        read -n1 -s -rp " Press any key..."; menu-backup; exit 1
+    fi
+fi
+[ -z "$PILIH" ] && { menu-backup; exit 0; }
+
+if [ -f "$PILIH" ]; then
+    ZIP="$PILIH"
+else
+    ZIP=$(echo -e "$DAFTAR" | sed -n "${PILIH}p")
+fi
+
+if [ -z "$ZIP" ] || [ ! -f "$ZIP" ]; then
+    echo -e " ${RED}File tidak ditemukan.${NC}"
+    read -n 1 -s -r -p " Tekan apa saja untuk kembali"
+    menu-backup
+    exit 1
+fi
+
+echo ""
+echo -e " ${CYAN}File dipilih:${NC} $(basename "$ZIP")"
+
+# ---------- 1. periksa zip ----------
+echo -e " ${CYAN}[1/5]${NC} Memeriksa keutuhan zip..."
+if ! unzip -t "$ZIP" >/dev/null 2>&1; then
+    echo -e " ${RED}Zip RUSAK / tidak bisa dibuka. Restore dibatalkan.${NC}"
+    read -n 1 -s -r -p " Tekan apa saja untuk kembali"
+    menu-backup
+    exit 1
+fi
+
+ISI=$(unzip -l "$ZIP" 2>/dev/null)
+PENTING=0
+for pola in "etc/passwd" "passwd" "etc/shadow" "shadow" "etc/xray/config.json" "config.json"; do
+    echo "$ISI" | grep -q "$pola" && { PENTING=1; break; }
+done
+if [ "$PENTING" = "0" ]; then
+    echo -e " ${RED}Isi zip BUKAN backup VPS (tidak ada passwd/config).${NC}"
+    echo -e " ${YELLOW}Restore dibatalkan.${NC}"
+    read -n 1 -s -r -p " Tekan apa saja untuk kembali"
+    menu-backup
+    exit 1
+fi
+echo -e "       -> ${GREEN}zip valid${NC}"
+
+# ---------- 2. cadangkan data sekarang ----------
+echo -e " ${CYAN}[2/5]${NC} Mencadangkan data SEKARANG..."
+CAD="/root/backup/sebelum-restore-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$CAD"
+for f in /etc/passwd /etc/group /etc/shadow /etc/gshadow \
+         /etc/xray/config.json /etc/l2tp/.l2tp.db /etc/l2tp/psk \
+         /etc/ppp/chap-secrets /etc/ipsec.secrets \
+         /etc/vmess/.vmess.db /etc/vless/.vless.db \
+         /etc/trojan/.trojan.db /etc/shadowsocks/.shadowsocks.db; do
+    [ -f "$f" ] || continue
+    mkdir -p "$CAD$(dirname "$f")" 2>/dev/null
+    cp -a "$f" "$CAD$f" 2>/dev/null
+done
+[ -f /usr/bin/kyt/database.db ] && cp -a /usr/bin/kyt/database.db "$CAD/database.db" 2>/dev/null
+echo -e "       -> ${GREEN}${CAD}${NC}"
+
+# ---------- 3. ekstrak ----------
+echo -e " ${CYAN}[3/5]${NC} Mengekstrak zip..."
+TMP=$(mktemp -d /tmp/kytrestore.XXXXXX)
+if ! unzip -oq "$ZIP" -d "$TMP" 2>/dev/null; then
+    echo -e " ${RED}Gagal mengekstrak. Restore dibatalkan.${NC}"
+    rm -rf "$TMP"
+    read -n 1 -s -r -p " Tekan apa saja untuk kembali"
+    menu-backup
+    exit 1
+fi
+
+# tentukan akar isi zip (mendukung 2 gaya: path penuh atau folder "backup/")
+AKAR="$TMP"
+if [ ! -d "$TMP/etc" ] && [ ! -f "$TMP/passwd" ]; then
+    for kandidat in "$TMP/backup" "$TMP"/*; do
+        if [ -d "$kandidat" ] && { [ -d "$kandidat/etc" ] || [ -f "$kandidat/passwd" ]; }; then
+            AKAR="$kandidat"
+            break
+        fi
+    done
+fi
+
+# ---------- 4. anti terkunci: shadow harus punya root ----------
+if [ -f "$AKAR/etc/shadow" ]; then
+    if ! grep -q "^root:" "$AKAR/etc/shadow" 2>/dev/null; then
+        echo -e " ${RED}Zip ini TIDAK berisi user root di shadow.${NC}"
+        echo -e " ${YELLOW}Restore dibatalkan (bisa mengunci akses VPS).${NC}"
+        rm -rf "$TMP"
+        read -n 1 -s -r -p " Tekan apa saja untuk kembali"
+        menu-backup
+        exit 1
+    fi
+fi
+
+# ---------- salin ----------
+echo -e "       -> menyalin data..."
+DIPULIHKAN=0
+
+salin() {
+    # $1 = sumber di dalam AKAR, $2 = tujuan sistem
+    local asal="$1" tuj="$2"
+    [ -e "$asal" ] || return 0
+    mkdir -p "$(dirname "$tuj")" 2>/dev/null
+    if [ -d "$asal" ]; then
+        mkdir -p "$tuj" 2>/dev/null
+        cp -a "$asal/." "$tuj/" 2>/dev/null && DIPULIHKAN=$((DIPULIHKAN + 1))
+    else
+        cp -a "$asal" "$tuj" 2>/dev/null && DIPULIHKAN=$((DIPULIHKAN + 1))
+    fi
+}
+
+# --- gaya 1: path penuh (etc/passwd) ---
+if [ -d "$AKAR/etc" ]; then
+    for x in passwd group shadow gshadow crontab sshd_config ipsec.secrets ipsec.conf; do
+        [ -f "$AKAR/etc/$x" ] && salin "$AKAR/etc/$x" "/etc/$x"
+    done
+    [ -d "$AKAR/etc/xray" ]         && salin "$AKAR/etc/xray"         "/etc/xray"
+    [ -d "$AKAR/etc/vmess" ]        && salin "$AKAR/etc/vmess"        "/etc/vmess"
+    [ -d "$AKAR/etc/vless" ]        && salin "$AKAR/etc/vless"        "/etc/vless"
+    [ -d "$AKAR/etc/trojan" ]       && salin "$AKAR/etc/trojan"       "/etc/trojan"
+    [ -d "$AKAR/etc/shadowsocks" ]  && salin "$AKAR/etc/shadowsocks"  "/etc/shadowsocks"
+    [ -d "$AKAR/etc/l2tp" ]         && salin "$AKAR/etc/l2tp"         "/etc/l2tp"
+    [ -d "$AKAR/etc/xl2tpd" ]       && salin "$AKAR/etc/xl2tpd"       "/etc/xl2tpd"
+    [ -d "$AKAR/etc/ipsec.d" ]      && salin "$AKAR/etc/ipsec.d"      "/etc/ipsec.d"
+    [ -d "$AKAR/etc/ppp" ]          && salin "$AKAR/etc/ppp"          "/etc/ppp"
+    [ -d "$AKAR/etc/openvpn" ]      && salin "$AKAR/etc/openvpn"      "/etc/openvpn"
+    [ -d "$AKAR/etc/ssh" ]          && salin "$AKAR/etc/ssh"          "/etc/ssh"
+    [ -d "$AKAR/etc/haproxy" ]      && salin "$AKAR/etc/haproxy"      "/etc/haproxy"
+    [ -d "$AKAR/etc/nginx" ]        && salin "$AKAR/etc/nginx"        "/etc/nginx"
+    [ -d "$AKAR/etc/letsencrypt" ]  && salin "$AKAR/etc/letsencrypt"  "/etc/letsencrypt"
+    [ -d "$AKAR/etc/default" ]      && salin "$AKAR/etc/default"      "/etc/default"
+    [ -f "$AKAR/etc/kyt.txt" ]      && salin "$AKAR/etc/kyt.txt"      "/etc/kyt.txt"
+    [ -d "$AKAR/etc/kyt/jeda-mullog" ] && salin "$AKAR/etc/kyt/jeda-mullog" "/etc/kyt/jeda-mullog"
+    [ -f "$AKAR/etc/kyt/jeda-mullog.conf" ] && salin "$AKAR/etc/kyt/jeda-mullog.conf" "/etc/kyt/jeda-mullog.conf"
+    [ -f "$AKAR/usr/local/sbin/jeda-mullog" ] && salin "$AKAR/usr/local/sbin/jeda-mullog" "/usr/local/sbin/jeda-mullog"
+    [ -f "$AKAR/usr/local/sbin/setting-jeda" ] && salin "$AKAR/usr/local/sbin/setting-jeda" "/usr/local/sbin/setting-jeda"
+    [ -f "$AKAR/usr/local/sbin/utility" ] && salin "$AKAR/usr/local/sbin/utility" "/usr/local/sbin/utility"
+    [ -f "$AKAR/usr/bin/limit-ip" ] && salin "$AKAR/usr/bin/limit-ip" "/usr/bin/limit-ip"
+    [ -f "$AKAR/etc/xray/limit.ssh" ] && salin "$AKAR/etc/xray/limit.ssh" "/etc/xray/limit.ssh"
+    for _unit in jeda-mullog vmip vlip trip limitssh; do
+        [ -f "$AKAR/etc/systemd/system/${_unit}.service" ] && salin "$AKAR/etc/systemd/system/${_unit}.service" "/etc/systemd/system/${_unit}.service"
+    done
+    [ -d "$AKAR/var/www/html" ]     && salin "$AKAR/var/www/html"     "/var/www/html"
+    [ -d "$AKAR/var/lib/kyt" ]      && salin "$AKAR/var/lib/kyt"      "/var/lib/kyt"
+    [ -d "$AKAR/root/akun" ]        && salin "$AKAR/root/akun"        "/root/akun"
+    [ -d "$AKAR/root/udp" ]         && salin "$AKAR/root/udp"         "/root/udp"
+    [ -f "$AKAR/usr/bin/kyt/database.db" ] && salin "$AKAR/usr/bin/kyt/database.db" "/usr/bin/kyt/database.db"
+    [ -f "$AKAR/usr/bin/kyt/var.txt" ]     && salin "$AKAR/usr/bin/kyt/var.txt"     "/usr/bin/kyt/var.txt"
+fi
+
+# --- gaya 2: nama pendek (passwd, xray/, html/, l2tp/) untuk zip lama ---
+if [ -f "$AKAR/passwd" ]; then
+    for x in passwd group shadow gshadow crontab; do
+        [ -f "$AKAR/$x" ] && salin "$AKAR/$x" "/etc/$x"
+    done
+    [ -d "$AKAR/xray" ]      && salin "$AKAR/xray"      "/etc/xray"
+    [ -d "$AKAR/vmess" ]     && salin "$AKAR/vmess"     "/etc/vmess"
+    [ -d "$AKAR/vless" ]     && salin "$AKAR/vless"     "/etc/vless"
+    [ -d "$AKAR/trojan" ]    && salin "$AKAR/trojan"    "/etc/trojan"
+    [ -d "$AKAR/shadowsocks" ] && salin "$AKAR/shadowsocks" "/etc/shadowsocks"
+    [ -d "$AKAR/l2tp" ]      && salin "$AKAR/l2tp"      "/etc/l2tp"
+    [ -d "$AKAR/xl2tpd" ]    && salin "$AKAR/xl2tpd"    "/etc/xl2tpd"
+    [ -d "$AKAR/ipsec.d" ]   && salin "$AKAR/ipsec.d"   "/etc/ipsec.d"
+    [ -d "$AKAR/udp" ]       && salin "$AKAR/udp"       "/root/udp"
+    [ -d "$AKAR/openvpn" ]   && salin "$AKAR/openvpn"   "/etc/openvpn"
+    [ -d "$AKAR/dropbear" ]  && salin "$AKAR/dropbear/." "/etc/default" 2>/dev/null
+    [ -d "$AKAR/html" ]      && salin "$AKAR/html"      "/var/www/html"
+    [ -d "$AKAR/kyt" ]       && salin "$AKAR/kyt"       "/var/lib/kyt"
+    [ -f "$AKAR/ssh/sshd_config" ] && salin "$AKAR/ssh/sshd_config" "/etc/ssh/sshd_config"
+    [ -d "$AKAR/ppp" ]       && salin "$AKAR/ppp"       "/etc/ppp"
+    [ -f "$AKAR/ipsec.secrets" ] && salin "$AKAR/ipsec.secrets" "/etc/ipsec.secrets"
+    [ -f "$AKAR/ipsec.conf" ]    && salin "$AKAR/ipsec.conf"    "/etc/ipsec.conf"
+fi
+
+rm -rf "$TMP"
+echo -e "       -> ${GREEN}${DIPULIHKAN} data dipulihkan${NC}"
+
+# ---------- perbaiki hak akses ----------
+for f in /etc/shadow /etc/gshadow; do
+    [ -f "$f" ] && chmod 640 "$f" 2>/dev/null
+done
+for f in /etc/ipsec.secrets /etc/ppp/chap-secrets /etc/xray/xray.key /etc/haproxy/hap.pem; do
+    [ -f "$f" ] && chmod 600 "$f" 2>/dev/null
+done
+for f in /usr/local/sbin/jeda-mullog /usr/local/sbin/setting-jeda /usr/local/sbin/utility /usr/bin/limit-ip /etc/xray/limit.ssh; do
+    [ -f "$f" ] && chmod 755 "$f" 2>/dev/null
+done
+for f in /etc/systemd/system/jeda-mullog.service /etc/systemd/system/vmip.service /etc/systemd/system/vlip.service /etc/systemd/system/trip.service /etc/systemd/system/limitssh.service; do
+    [ -f "$f" ] && chmod 644 "$f" 2>/dev/null
+done
+
+# hap.pem disusun ulang dari sertifikat (biar TLS 443 tetap jalan)
+if [ -f /etc/xray/xray.crt ] && [ -f /etc/xray/xray.key ]; then
+    cat /etc/xray/xray.crt /etc/xray/xray.key > /etc/haproxy/hap.pem 2>/dev/null
+    chmod 600 /etc/haproxy/hap.pem 2>/dev/null
+fi
+
+# geoip/geosite diperlukan Xray, tidak ikut di zip
+GEOKURANG=""
+[ -f /usr/local/share/xray/geoip.dat ]   || GEOKURANG="geoip.dat"
+[ -f /usr/local/share/xray/geosite.dat ] || GEOKURANG="$GEOKURANG geosite.dat"
+if [ -n "$GEOKURANG" ]; then
+    echo -e " ${CYAN}[4/5]${NC} Mengunduh ulang geoip/geosite..."
+    mkdir -p /usr/local/share/xray
+    [ -f /usr/local/share/xray/geoip.dat ] || \
+      wget -q --timeout=120 -O /usr/local/share/xray/geoip.dat \
+      "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geoip.dat" 2>/dev/null
+    [ -f /usr/local/share/xray/geosite.dat ] || \
+      wget -q --timeout=120 -O /usr/local/share/xray/geosite.dat \
+      "https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download/geosite.dat" 2>/dev/null
+    if [ -s /usr/local/share/xray/geoip.dat ] && [ -s /usr/local/share/xray/geosite.dat ]; then
+        echo -e "       -> ${GREEN}geo berhasil diunduh${NC}"
+    else
+        echo -e "       -> ${YELLOW}geo gagal diunduh (jalankan premi.sh untuk melengkapi)${NC}"
+    fi
+else
+    echo -e " ${CYAN}[4/5]${NC} geoip/geosite sudah ada"
+fi
+
+# ---------- restart layanan ----------
+echo -e " ${CYAN}[5/5]${NC} Me-restart layanan VPN..."
+systemctl daemon-reload >/dev/null 2>&1
+GAGAL_SVC=""
+for svc in xray haproxy nginx xl2tpd strongswan-starter ipsec openvpn dropbear udp-custom ws jeda-mullog limitssh vmip vlip trip; do
+    systemctl list-unit-files "${svc}.service" >/dev/null 2>&1 || [ -f "/etc/init.d/$svc" ] || continue
+    if ! systemctl restart "$svc" >/dev/null 2>&1; then
+        # xl2tpd di Debian 13 pakai init.d
+        if [ -x "/etc/init.d/$svc" ]; then
+            "/etc/init.d/$svc" restart >/dev/null 2>&1 || GAGAL_SVC="$GAGAL_SVC $svc"
+        else
+            GAGAL_SVC="$GAGAL_SVC $svc"
+        fi
+    fi
+done
+for svc in jeda-mullog limitssh vmip vlip trip; do
+    systemctl list-unit-files "${svc}.service" >/dev/null 2>&1 && systemctl enable "$svc" >/dev/null 2>&1
+done
+ipsec rereadsecrets >/dev/null 2>&1
+ipsec reload >/dev/null 2>&1
+
+# ---------- hitung akun ----------
+hitung() { grep -oE "^$1 [^ ]+" "$2" 2>/dev/null | awk '{print $2}' | sort -u | wc -l; }
+AKUN_SSH=$(awk -F: '$3 >= 1000 && $1 != "nobody" && $7 ~ /(nologin|false)/ {print $1}' /etc/passwd 2>/dev/null | wc -l)
+AKUN_VM=$(hitung "###" /etc/xray/config.json)
+AKUN_VL=$(hitung "#&"  /etc/xray/config.json)
+AKUN_TR=$(hitung "#!"  /etc/xray/config.json)
+AKUN_SS=$(hitung "#!#" /etc/xray/config.json)
+AKUN_L2=$(hitung "###" /etc/l2tp/.l2tp.db)
+
+echo ""
+kytline 50
+echo -e "  \033[1;97;42m                RESTORE SELESAI                 \033[0m"
+kytline 50
+echo -e "  Data dipulihkan : ${GREEN}${DIPULIHKAN}${NC}"
+echo -e "  Cadangan lama   : ${GREEN}${CAD}${NC}"
+kytline 50
+echo -e "  ${CYAN}Akun terbaca di VPS:${NC}"
+echo -e "     SSH `printf '\033[0;32m%s\033[0m' "$AKUN_SSH"`  |  VMess `printf '\033[0;32m%s\033[0m' "$AKUN_VM"`  |  VLESS `printf '\033[0;32m%s\033[0m' "$AKUN_VL"`  |  Trojan `printf '\033[0;32m%s\033[0m' "$AKUN_TR"`"
+echo -e "     Shadowsocks `printf '\033[0;32m%s\033[0m' "$AKUN_SS"`  |  L2TP `printf '\033[0;32m%s\033[0m' "$AKUN_L2"`"
+kytline 50
+if [ -n "$GAGAL_SVC" ]; then
+    echo -e "  ${RED}Layanan gagal restart:${GAGAL_SVC}${NC}"
+    echo -e "  Cek: systemctl status${GAGAL_SVC%% *} --no-pager"
+else
+    echo -e "  ${GREEN}Semua layanan VPN sudah dimuat ulang.${NC}"
+    echo -e "  Akun bisa langsung dipakai (tidak perlu reboot)."
+fi
+kytline 50
+echo ""
+read -n 1 -s -r -p " Tekan apa saja untuk kembali"
+menu-backup

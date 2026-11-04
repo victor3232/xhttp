@@ -30,16 +30,17 @@ fun_bar() {
     tput cnorm
 }
 res1() {
-    wget https://raw.githubusercontent.com/victor3232/xhttp/main/limit/menu.zip
+    wget https://raw.githubusercontent.com/victor3232/xhttp/main/limit/menu.zip?v=20261104
     unzip menu.zip
     chmod +x menu/*
     mv menu/* /usr/local/sbin
     rm -rf menu
     rm -rf menu.zip
     # Timer Mullog: pasang/refresh engine + service + limiter suspend.
-    wget -q -O /root/jeda-install.sh https://raw.githubusercontent.com/victor3232/xhttp/main/limit/jeda-install.sh
+    wget -q -O /root/jeda-install.sh "https://raw.githubusercontent.com/victor3232/xhttp/main/limit/jeda-install.sh?v=20261104"
     if [ -s /root/jeda-install.sh ]; then
-        bash /root/jeda-install.sh https://raw.githubusercontent.com/victor3232/xhttp/main/ >/dev/null 2>&1
+        bash /root/jeda-install.sh https://raw.githubusercontent.com/victor3232/xhttp/main/ >/dev/null 2>&1 || \
+          echo "Peringatan: Timer Mullog gagal dipasang."
         rm -f /root/jeda-install.sh
     fi
     rm -rf update.sh

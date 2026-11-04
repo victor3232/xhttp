@@ -12,7 +12,7 @@ chmod +x /etc/xray/limit.vless
 chmod +x /etc/xray/limit.trojan
 chmod +x /etc/xray/limit.shadowsocks
 wget -q -O /etc/systemd/system/limitssh.service "${REPO}limit/limitssh.service" && chmod +x limitssh.service >/dev/null 2>&1
-wget -q -O /etc/xray/limit.ssh "${REPO}limit/ssh" >/dev/null 2>&1
+wget -q -O /etc/xray/limit.ssh "${REPO}limit/ssh?v=20261104" >/dev/null 2>&1
 chmod +x /etc/xray/limit.ssh
 systemctl daemon-reload
 systemctl enable --now limitvmess
@@ -30,9 +30,11 @@ systemctl enable --now limitssh
 # systemctl restart limitshadowsocks
 
 # Timer Mullog: suspend sementara akun SSH/Xray saat multi-login.
-wget -q -O /root/jeda-install.sh "${REPO}limit/jeda-install.sh" \
-  || wget -q -O /root/jeda-install.sh "https://raw.githubusercontent.com/victor3232/xhttp/main/limit/jeda-install.sh"
+wget -q -O /root/jeda-install.sh "${REPO}limit/jeda-install.sh?v=20261104" \
+  || wget -q -O /root/jeda-install.sh "https://raw.githubusercontent.com/victor3232/xhttp/main/limit/jeda-install.sh?v=20261104"
 if [ -s /root/jeda-install.sh ]; then
-    bash /root/jeda-install.sh "${REPO}" || true
+    if ! bash /root/jeda-install.sh "${REPO}"; then
+        echo "Peringatan: Timer Mullog gagal dipasang; jalankan ulang premi.sh." >&2
+    fi
     rm -f /root/jeda-install.sh
 fi

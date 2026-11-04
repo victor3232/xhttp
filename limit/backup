@@ -1,0 +1,290 @@
+#!/bin/bash
+# ============================================================
+#  backup  -  BACKUP DATA VPN KE FILE .ZIP  (tanpa rclone/email)
+#
+#  Hasil:
+#    /root/backup/<host>-backup-<tanggal>.zip
+#    + dikirim ke Telegram admin (kalau bot terpasang)
+#
+#  Isi zip: semua data akun buyer + konfigurasi + sertifikat.
+#  geoip.dat / geosite.dat TIDAK ikut (besar, bisa diunduh ulang).
+# ============================================================
+
+# ==== GARIS RGB (selaras dengan menu utama) ====
+KYTRB=("255;0;0" "255;64;0" "255;128;0" "255;192;0" "255;255;0" "192;255;0" \
+"128;255;0" "64;255;0" "0;255;0" "0;255;64" "0;255;128" "0;255;192" \
+"0;255;255" "0;192;255" "0;128;255" "0;64;255" "0;0;255" "64;0;255" \
+"128;0;255" "192;0;255" "255;0;255" "255;0;192" "255;0;128" "255;0;64")
+kytline() {
+    local n="${1:-19}" i=0 out="" c
+    while [ "$i" -lt "$n" ]; do
+        c=${KYTRB[$(( i % ${#KYTRB[@]} ))]}
+        out+=$'\033[38;2;'"$c"$'m━'
+        i=$((i+1))
+    done
+    printf '%s\033[0m\n' "$out"
+}
+# ==== akhir garis RGB ====
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+BKPDIR="/root/backup"
+BATAS_FILE=8388608          # 8 MB - file lebih besar dilewati
+
+clear
+kytline 50
+echo -e "  \033[1;97;42m            BACKUP DATA VPN (.zip)            \033[0m"
+kytline 50
+echo ""
+
+mkdir -p "$BKPDIR"
+
+HOST=$(hostname 2>/dev/null | tr -cd 'A-Za-z0-9._-')
+[ -z "$HOST" ] && HOST=$(curl -s --max-time 8 ipv4.icanhazip.com 2>/dev/null | tr -d '\r\n')
+[ -z "$HOST" ] && HOST="vps"
+NAMA="kyt-${HOST}-$(date +%Y%m%d-%H%M%S).zip"
+ZIP="$BKPDIR/$NAMA"
+
+# ---------- daftar berkas akun & konfigurasi ----------
+BERKAS="
+/etc/passwd
+/etc/group
+/etc/shadow
+/etc/gshadow
+/etc/crontab
+/etc/ssh/.ssh.db
+/etc/ssh/sshd_config
+/etc/vmess/.vmess.db
+/etc/vless/.vless.db
+/etc/trojan/.trojan.db
+/etc/shadowsocks/.shadowsocks.db
+/etc/l2tp/.l2tp.db
+/etc/l2tp/psk
+/etc/ppp/chap-secrets
+/etc/ipsec.secrets
+/etc/ipsec.conf
+/etc/xray/config.json
+/etc/xray/domain
+/etc/xray/city
+/etc/xray/isp
+/etc/xray/dns
+/etc/xray/xray.crt
+/etc/xray/xray.key
+/etc/haproxy/haproxy.cfg
+/etc/haproxy/hap.pem
+/etc/nginx/nginx.conf
+/etc/nginx/conf.d/xray.conf
+/etc/default/dropbear
+/etc/kyt.txt
+/etc/kyt/jeda-mullog.conf
+/etc/xray/limit.ssh
+/usr/bin/limit-ip
+/usr/local/sbin/jeda-mullog
+/usr/local/sbin/setting-jeda
+/usr/local/sbin/utility
+/etc/systemd/system/jeda-mullog.service
+/etc/systemd/system/vmip.service
+/etc/systemd/system/vlip.service
+/etc/systemd/system/trip.service
+/etc/systemd/system/limitssh.service
+"
+
+# ---------- folder yang ikut (rekursif) ----------
+FOLDER="
+/var/www/html
+/etc/l2tp
+/etc/xl2tpd
+/etc/ipsec.d
+/etc/openvpn
+/root/udp
+/root/akun
+/var/lib/kyt
+/etc/kyt/jeda-mullog
+/usr/bin/kyt/database.db
+/usr/bin/kyt/var.txt
+"
+
+echo -e " ${CYAN}[1/4]${NC} Mengumpulkan data akun..."
+JUMLAH=0
+SEMENTARA=$(mktemp -d /tmp/kytbackup.XXXXXX)
+LEWAT=""
+
+siapkan() {
+    # $1 = path asli
+    local p="$1"
+    [ -e "$p" ] || return 0
+    if [ -f "$p" ]; then
+        local sz
+        sz=$(stat -c%s "$p" 2>/dev/null || echo 0)
+        if [ "$sz" -gt "$BATAS_FILE" ]; then
+            LEWAT="$LEWAT $p"
+            return 0
+        fi
+    fi
+    local tujuan="$SEMENTARA/${p#/}"
+    mkdir -p "$(dirname "$tujuan")" 2>/dev/null
+    cp -a "$p" "$tujuan" 2>/dev/null && JUMLAH=$((JUMLAH + 1))
+}
+
+for f in $BERKAS; do
+    siapkan "$f"
+done
+
+for d in $FOLDER; do
+    if [ -d "$d" ]; then
+        # telusuri isi folder, lewati file besar
+        while IFS= read -r f; do
+            siapkan "$f"
+        done < <(find "$d" -type f 2>/dev/null)
+    else
+        siapkan "$d"
+    fi
+done
+
+if [ "$JUMLAH" = "0" ]; then
+    echo -e " ${RED}Tidak ada data yang bisa dibackup.${NC}"
+    rm -rf "$SEMENTARA"
+    read -n 1 -s -r -p " Tekan apa saja untuk kembali"
+    menu-backup
+    exit 1
+fi
+
+echo -e "       -> ${GREEN}${JUMLAH} berkas${NC} terkumpul"
+[ -n "$LEWAT" ] && echo -e "       -> dilewati (terlalu besar):${YELLOW}${LEWAT}${NC}"
+
+# ---------- buat zip ----------
+echo -e " ${CYAN}[2/4]${NC} Membuat file .zip ..."
+cd "$SEMENTARA" || exit 1
+if ! zip -rq "$ZIP" . -x "*.pyc" >/dev/null 2>&1; then
+    echo -e " ${RED}Gagal membuat zip.${NC}"
+    cd /; rm -rf "$SEMENTARA"
+    read -n 1 -s -r -p " Tekan apa saja untuk kembali"
+    menu-backup
+    exit 1
+fi
+cd /; rm -rf "$SEMENTARA"
+
+UKURAN=$(stat -c%s "$ZIP" 2>/dev/null || echo 0)
+if [ "$UKURAN" -lt 1024 ]; then
+    TAMPIL="$UKURAN byte"
+elif [ "$UKURAN" -lt 1048576 ]; then
+    TAMPIL="$((UKURAN / 1024)) KB"
+else
+    TAMPIL=$(awk "BEGIN{printf \"%.2f MB\", $UKURAN/1048576}")
+fi
+
+# ---------- ringkasan isi ----------
+echo -e " ${CYAN}[3/4]${NC} Memeriksa isi zip ..."
+ISI=$(unzip -l "$ZIP" 2>/dev/null)
+cek_isi() {
+    if echo "$ISI" | grep -q "$1"; then
+        echo -e "    ${GREEN}[ok]${NC} $2"
+    else
+        echo -e "    ${YELLOW}[ - ]${NC} $2 (belum ada / belum dipakai)"
+    fi
+}
+cek_isi "etc/passwd"                 "akun SSH & akun sistem"
+cek_isi "etc/vmess/.vmess.db"        "akun VMess"
+cek_isi "etc/vless/.vless.db"        "akun VLESS"
+cek_isi "etc/trojan/.trojan.db"      "akun Trojan"
+cek_isi "etc/shadowsocks/.shadowsocks.db" "akun Shadowsocks"
+cek_isi "etc/l2tp/.l2tp.db"          "akun L2TP"
+cek_isi "etc/ppp/chap-secrets"       "akun L2TP (CHAP)"
+cek_isi "etc/ipsec.secrets"          "akun IKEv2"
+cek_isi "etc/xray/config.json"       "konfigurasi Xray"
+cek_isi "etc/xray/xray.key"          "sertifikat TLS Xray"
+cek_isi "etc/haproxy/hap.pem"        "sertifikat haproxy"
+cek_isi "usr/bin/kyt/database.db"    "database bot (saldo/pesanan)"
+
+# ---------- kirim ke Telegram ----------
+KEY=""
+CHATID=""
+if [ -f /etc/bot/.bot.db ]; then
+    KEY=$(grep -E "^#bot# " /etc/bot/.bot.db 2>/dev/null | tail -1 | awk '{print $2}')
+    CHATID=$(grep -E "^#bot# " /etc/bot/.bot.db 2>/dev/null | tail -1 | awk '{print $3}')
+fi
+# cadangan: ambil dari var.txt bot
+if { [ -z "$KEY" ] || [ -z "$CHATID" ]; } && [ -f /usr/bin/kyt/var.txt ]; then
+    [ -z "$KEY" ] && KEY=$(sed -n "s/^BOT_TOKEN=//p" /usr/bin/kyt/var.txt 2>/dev/null | tr -d "'\"\r\n ")
+    [ -z "$CHATID" ] && CHATID=$(sed -n "s/^ADMIN=//p" /usr/bin/kyt/var.txt 2>/dev/null | tr -d "'\"\r\n ")
+fi
+
+echo -e " ${CYAN}[4/4]${NC} Mengirim ke Telegram..."
+KIRIM=""
+if [ -n "$KEY" ] && [ -n "$CHATID" ]; then
+    HOSTN=$(hostname 2>/dev/null)
+    CAPTION="BACKUP VPS
+Host : ${HOSTN}
+Tanggal : $(date '+%d-%m-%Y %H:%M')
+Isi : ${JUMLAH} berkas (${TAMPIL})
+Simpan file ini. Untuk restore: menu 10 -> 02, upload zip ke /root lalu pilih."
+    RESP=$(curl -s --max-time 120 \
+        -F "chat_id=${CHATID}" \
+        -F "document=@${ZIP}" \
+        -F "caption=${CAPTION}" \
+        "https://api.telegram.org/bot${KEY}/sendDocument" 2>/dev/null)
+    if echo "$RESP" | grep -q '"ok":true'; then
+        KIRIM="ya"
+        FILE_ID=$(echo "$RESP" | python3 -c "import sys,json;d=json.load(sys.stdin);print(d.get('result',{}).get('document',{}).get('file_id',''))" 2>/dev/null)
+        if [ -n "$FILE_ID" ]; then
+            echo "$FILE_ID" > /root/backup/last_file_id.txt
+            curl -s --max-time 30 -X POST "https://api.telegram.org/bot${KEY}/sendMessage"                 -d "chat_id=${CHATID}"                 -d "parse_mode=html"                 -d "text=<b>🔑 FILE ID RESTORE</b>
+<code>${FILE_ID}</code>
+
+Tap kode di atas untuk copy.
+Paste di VPS baru: menu 10 → 02 → [T]" >/dev/null 2>&1
+        fi
+    else
+        KIRIM="gagal"
+    fi
+else
+    KIRIM="tidak"
+fi
+
+# ---------- retention backup lokal ----------
+# Auto-backup tetap dikirim ke Telegram/File ID. Di VPS lokal cukup simpan
+# 3 arsip kyt-*.zip terbaru agar disk tidak cepat penuh.
+if [ "${1:-}" = "--auto" ]; then
+    _old_backup=$(find "$BKPDIR" -maxdepth 1 -type f -name 'kyt-*.zip' -printf '%T@ %p\n' 2>/dev/null \
+        | sort -rn | tail -n +4 | cut -d' ' -f2-)
+    if [ -n "$_old_backup" ]; then
+        while IFS= read -r _f; do
+            [ -f "$_f" ] && rm -f -- "$_f"
+        done <<< "$_old_backup"
+    fi
+fi
+
+# ---------- hasil ----------
+echo ""
+kytline 50
+echo -e "  \033[1;97;42m                 BACKUP SELESAI                 \033[0m"
+kytline 50
+echo -e "  File      : ${GREEN}${ZIP}${NC}"
+echo -e "  Ukuran    : ${GREEN}${TAMPIL}${NC}"
+echo -e "  Berkas    : ${GREEN}${JUMLAH}${NC}"
+case "$KIRIM" in
+    ya)    echo -e "  Telegram  : ${GREEN}terkirim ke admin${NC}"
+           if [ -n "$FILE_ID" ]; then
+               echo -e "  File ID   : ${GREEN}${FILE_ID}${NC}"
+               echo -e "  ${YELLOW}Simpan File ID ini! Untuk restore di VPS baru:${NC}"
+               echo -e "  ${YELLOW}  menu 10 -> 02 -> pilih 'Telegram File ID'${NC}"
+           fi ;;
+    gagal) echo -e "  Telegram  : ${YELLOW}gagal kirim (file tetap ada di VPS)${NC}" ;;
+    *)     echo -e "  Telegram  : ${YELLOW}bot belum diatur (file tetap ada di VPS)${NC}" ;;
+esac
+kytline 50
+echo -e "  ${YELLOW}Cara ambil file dari VPS:${NC}"
+echo -e "    SFTP / WinSCP -> buka ${GREEN}/root/backup/${NC}"
+echo -e "    lalu unduh ${GREEN}${NAMA}${NC}"
+kytline 50
+echo ""
+if [ "${1:-}" = "--auto" ]; then
+    echo "Auto backup selesai $(date '+%Y-%m-%d %H:%M')" >> /var/log/auto-backup.log
+else
+    read -n 1 -s -r -p " Tekan apa saja untuk kembali"
+    menu-backup
+fi

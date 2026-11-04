@@ -719,10 +719,10 @@ print_success "Password SSH"
 function udp_mini(){
 clear
 print_install "Memasang Service Limit Quota"
-wget -q -O /root/limit.sh "${REPO}limit/limit.sh" && chmod +x /root/limit.sh && bash /root/limit.sh
+wget -q -O /root/limit.sh "${REPO}limit/limit.sh?v=20261104" && chmod +x /root/limit.sh && bash /root/limit.sh
 
 cd
-wget -q -O /usr/bin/limit-ip "${REPO}limit/limit-ip"
+wget -q -O /usr/bin/limit-ip "${REPO}limit/limit-ip?v=20261104"
 chmod +x /usr/bin/*
 cd /usr/bin
 sed -i 's/\r//' limit-ip
@@ -1120,7 +1120,7 @@ print_success "All Packet"
 function menu(){
     clear
     print_install "Memasang Menu Packet"
-    wget ${REPO}limit/menu.zip
+    wget ${REPO}limit/menu.zip?v=20261104
     unzip menu.zip
     chmod +x menu/*
     mv menu/* /usr/local/sbin
@@ -1132,12 +1132,15 @@ function menu(){
 function jeda_mullog(){
     clear
     print_install "Memasang Timer Mullog"
-    wget -q -O /root/jeda-install.sh "${REPO}limit/jeda-install.sh" \
-      || wget -q -O /root/jeda-install.sh "https://raw.githubusercontent.com/victor3232/xhttp/main/limit/jeda-install.sh"
+    wget -q -O /root/jeda-install.sh "${REPO}limit/jeda-install.sh?v=20261104" \
+      || wget -q -O /root/jeda-install.sh "https://raw.githubusercontent.com/victor3232/xhttp/main/limit/jeda-install.sh?v=20261104"
     if [ -s /root/jeda-install.sh ]; then
-        bash /root/jeda-install.sh "$REPO" || true
+        if bash /root/jeda-install.sh "$REPO"; then
+            print_success "Timer Mullog"
+        else
+            echo -e "${RED}Timer Mullog gagal dipasang. Jalankan ulang premi.sh.${NC}"
+        fi
         rm -f /root/jeda-install.sh
-        print_success "Timer Mullog"
     else
         echo -e "${RED}Gagal mengunduh installer Timer Mullog${NC}"
     fi
