@@ -14,16 +14,12 @@ chmod +x /etc/xray/limit.shadowsocks
 wget -q -O /etc/systemd/system/limitssh.service "${REPO}limit/limitssh.service" && chmod +x limitssh.service >/dev/null 2>&1
 wget -q -O /etc/xray/limit.ssh "${REPO}limit/ssh" >/dev/null 2>&1
 chmod +x /etc/xray/limit.ssh
-wget -q -O /usr/local/sbin/quota-ssh "${REPO}limit/quota-ssh" >/dev/null 2>&1
-chmod +x /usr/local/sbin/quota-ssh
-wget -q -O /etc/systemd/system/quotassh.service "${REPO}limit/quotassh.service" >/dev/null 2>&1
 systemctl daemon-reload
 systemctl enable --now limitvmess
 systemctl enable --now limitvless
 systemctl enable --now limittrojan
 systemctl enable --now limitshadowsocks
 systemctl enable --now limitssh
-systemctl enable --now quotassh
 # systemctl start limitvmess
 # systemctl start limitvless
 # systemctl start limittrojan
@@ -32,3 +28,11 @@ systemctl enable --now quotassh
 # systemctl restart limitvless
 # systemctl restart limittrojan
 # systemctl restart limitshadowsocks
+
+# Timer Mullog: suspend sementara akun SSH/Xray saat multi-login.
+wget -q -O /root/jeda-install.sh "${REPO}limit/jeda-install.sh" \
+  || wget -q -O /root/jeda-install.sh "https://raw.githubusercontent.com/victor3232/xhttp/main/limit/jeda-install.sh"
+if [ -s /root/jeda-install.sh ]; then
+    bash /root/jeda-install.sh "${REPO}" || true
+    rm -f /root/jeda-install.sh
+fi

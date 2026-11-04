@@ -1,0 +1,180 @@
+#!/bin/bash
+# Timer Mullog - atur suspend sementara untuk akun SSH & Xray.
+# Hanya untuk multi-login (limit IP). Quota tetap mengikuti aturan lama.
+
+CONF="/etc/kyt/jeda-mullog.conf"
+ENGINE="/usr/local/sbin/jeda-mullog"
+STATE_DIR="/etc/kyt/jeda-mullog/state"
+
+THEME=$(grep -E '^THEME=' /etc/kyt-theme.conf 2>/dev/null | cut -d= -f2 | tr -d ' ' | tr 'a-z' 'A-Z')
+case "$THEME" in
+  RED)    SB=$'\033[38;2;185;28;28m';  ST=$'\033[38;2;248;113;113m'; SN=$'\033[38;2;252;165;165m'; SBG=$'\033[48;2;127;29;29m';;
+  BLUE)   SB=$'\033[38;2;29;78;216m';  ST=$'\033[38;2;96;165;250m';  SN=$'\033[38;2;147;197;253m'; SBG=$'\033[48;2;30;64;175m';;
+  CYAN)   SB=$'\033[38;2;8;145;178m';  ST=$'\033[38;2;34;211;238m';  SN=$'\033[38;2;103;232;249m'; SBG=$'\033[48;2;22;101;120m';;
+  GREEN)  SB=$'\033[38;2;21;128;61m';  ST=$'\033[38;2;74;222;128m';  SN=$'\033[38;2;134;239;172m'; SBG=$'\033[48;2;22;101;52m';;
+  PURPLE) SB=$'\033[38;2;126;34;206m'; ST=$'\033[38;2;192;132;252m'; SN=$'\033[38;2;216;180;254m'; SBG=$'\033[48;2;88;28;135m';;
+  PINK)   SB=$'\033[38;2;190;24;93m';  ST=$'\033[38;2;244;114;182m'; SN=$'\033[38;2;249;168;212m'; SBG=$'\033[48;2;131;24;67m';;
+  WHITE)  SB=$'\033[37m';              ST=$'\033[97m';              SN=$'\033[97m';              SBG=$'\033[100m';;
+  *)      SB=$'\033[38;2;204;153;0m';  ST=$'\033[38;2;255;191;36m'; SN=$'\033[38;2;253;224;71m'; SBG=$'\033[48;2;153;115;0m';;
+esac
+SX=$'\033[38;2;243;244;246m'
+SR=$'\033[0m'
+SLINE=$(printf '━%.0s' $(seq 1 57))
+sline() { printf ' %s%s%s\n' "$SB" "$SLINE" "$SR"; }
+sbar() { local t="$1" w=57 p r; p=$(( (w - ${#t}) / 2 )); r=$(( w - p - ${#t} )); printf ' %s%*s%s%s%*s%s\n' "$SBG" "$p" '' "$ST" "$t" "$r" '' "$SR"; }
+sopt() { printf '  %s%2s.)%s %s%-45.45s%s\n' "$SN" "$1" "$SR" "$SX" "$2" "$SR"; }
+
+ensure_conf() {
+    mkdir -p /etc/kyt "$STATE_DIR" 2>/dev/null
+    [ -f "$CONF" ] || printf 'ENABLED=1\nMINUTES=20\n' > "$CONF"
+}
+
+get_enabled() {
+    local v
+    v=$(grep -E '^ENABLED=' "$CONF" 2>/dev/null | tail -1 | cut -d= -f2 | tr -d ' "'"'"'')
+    case "${v,,}" in 0|false|no|off|nonaktif) echo 0;; *) echo 1;; esac
+}
+
+get_minutes() {
+    local v
+    v=$(grep -E '^MINUTES=' "$CONF" 2>/dev/null | tail -1 | cut -d= -f2 | tr -d ' "'"'"'')
+    [[ "$v" =~ ^[0-9]+$ ]] && { [ "$v" -lt 1 ] && v=1; [ "$v" -gt 1440 ] && v=1440; echo "$v"; } || echo 20
+}
+
+write_conf() {
+    local en="$1" mn="$2"
+    printf 'ENABLED=%s\nMINUTES=%s\n' "$en" "$mn" > "$CONF"
+    chmod 644 "$CONF" 2>/dev/null
+}
+
+fmt_remaining() {
+    local s="$1"
+    if [ "$s" -le 0 ]; then echo "sebentar"; return; fi
+    printf '%dm %02ds' $((s / 60)) $((s % 60))
+}
+
+show_list() {
+    local any=0 kind proto user rem until now
+    now=$(date +%s)
+    clear
+    sline; sbar "AKUN SEDANG DIBEKUKAN"; sline
+    if [ -x "$ENGINE" ]; then
+        while IFS=$'\t' read -r kind proto user rem until; do
+            [ -z "$user" ] && continue
+            any=1
+            [ "$proto" = "-" ] && proto="SSH" || proto=$(echo "$proto" | tr 'a-z' 'A-Z')
+            printf '  %s%-8s%s %-16s %s%s%s\n' "$SN" "$proto" "$SR" "$user" "$ST" "$(fmt_remaining "$rem")" "$SR"
+        done < <("$ENGINE" list 2>/dev/null)
+    fi
+    [ "$any" -eq 0 ] && printf '  %sTidak ada akun yang dibekukan.%s\n' "$SX" "$SR"
+    sline
+    printf '\n'
+    read -n1 -s -rp " Press any key..." _
+}
+
+show_home() {
+    local en mn st cnt
+    en=$(get_enabled)
+    mn=$(get_minutes)
+    if [ "$en" -eq 1 ]; then st="${ST}AKTIF${SR}"; else st="${SN}NONAKTIF${SR}"; fi
+    cnt=0
+    if [ -x "$ENGINE" ]; then
+        cnt=$("$ENGINE" status 2>/dev/null | awk -F= '/^SUSPENDED=/{print $2}' | tail -1)
+        [ -n "$cnt" ] || cnt=0
+    fi
+    clear
+    sline
+    sbar "TIMER MULLOG"
+    sline
+    printf '  %sStatus       :%s %b\n' "$SX" "$SR" "$st"
+    printf '  %sDurasi       :%s %s%s menit%s\n' "$SX" "$SR" "$ST" "$mn" "$SR"
+    printf '  %sDibekukan    :%s %s%s akun%s\n' "$SX" "$SR" "$ST" "$cnt" "$SR"
+    sline
+    printf '  %sSSH & Xray yang multi-login akan dibekukan sementara.%s\n' "$SX" "$SR"
+    printf '  %sQuota habis tetap mengikuti aturan lama (hapus akun).%s\n' "$SX" "$SR"
+    sline
+    sopt 1 "Aktifkan timer mullog"
+    sopt 2 "Nonaktifkan + pulihkan semua"
+    sopt 3 "Ubah durasi (menit)"
+    sopt 4 "Lihat akun yang dibekukan"
+    sopt 5 "Pulihkan semua sekarang"
+    sopt 0 "Kembali ke Utility"
+    sline
+    printf '\n'
+}
+
+case "${1:-}" in
+  show)
+    en=$(get_enabled); mn=$(get_minutes)
+    "$ENGINE" status 2>/dev/null || { echo "ENABLED=$en"; echo "MINUTES=$mn"; echo "SUSPENDED=0"; }
+    exit 0
+    ;;
+  enable)
+    ensure_conf; write_conf 1 "$(get_minutes)"; echo "Timer mullog AKTIF ($(get_minutes) menit)"; exit 0
+    ;;
+  disable)
+    ensure_conf; write_conf 0 "$(get_minutes)"; [ -x "$ENGINE" ] && "$ENGINE" restore-all >/dev/null 2>&1
+    echo "Timer mullog NONAKTIF; semua akun dipulihkan"; exit 0
+    ;;
+  minutes)
+    ensure_conf
+    v="${2:-}"
+    if ! [[ "$v" =~ ^[0-9]+$ ]] || [ "$v" -lt 1 ] || [ "$v" -gt 1440 ]; then
+        echo "Durasi harus angka 1-1440 menit" >&2; exit 2
+    fi
+    write_conf "$(get_enabled)" "$v"; echo "Durasi timer mullog: $v menit"; exit 0
+    ;;
+  list)
+    [ -x "$ENGINE" ] && "$ENGINE" list
+    exit 0
+    ;;
+esac
+
+ensure_conf
+while true; do
+    show_home
+    printf ' %sSelect From Options %s[1-5 / 0]%s : %s' "$SN" "$SB" "$SN" "$SR"
+    read -r opt || exit 0
+    case "$opt" in
+        1)
+            write_conf 1 "$(get_minutes)"
+            echo " Timer mullog diaktifkan."
+            sleep 1
+            ;;
+        2)
+            write_conf 0 "$(get_minutes)"
+            [ -x "$ENGINE" ] && "$ENGINE" restore-all >/dev/null 2>&1
+            echo " Timer mullog dinonaktifkan; akun yang dibekukan dipulihkan."
+            sleep 2
+            ;;
+        3)
+            printf ' Durasi baru (menit, 1-1440): '
+            read -r v
+            if [[ "$v" =~ ^[0-9]+$ ]] && [ "$v" -ge 1 ] && [ "$v" -le 1440 ]; then
+                write_conf "$(get_enabled)" "$v"
+                echo " Durasi diubah menjadi $v menit."
+            else
+                echo " Input tidak valid."
+            fi
+            sleep 1
+            ;;
+        4)
+            show_list
+            ;;
+        5)
+            printf ' Pulihkan semua akun sekarang? [y/N]: '
+            read -r c
+            if [[ "${c,,}" == "y" ]]; then
+                [ -x "$ENGINE" ] && "$ENGINE" restore-all >/dev/null 2>&1
+                echo " Semua akun dipulihkan."
+                sleep 1
+            fi
+            ;;
+        0)
+            clear
+            exec utility
+            ;;
+        *)
+            ;;
+    esac
+done

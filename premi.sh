@@ -1128,6 +1128,21 @@ function menu(){
     rm -rf menu.zip
 }
 
+# Timer Mullog (suspend sementara akun SSH/Xray)
+function jeda_mullog(){
+    clear
+    print_install "Memasang Timer Mullog"
+    wget -q -O /root/jeda-install.sh "${REPO}limit/jeda-install.sh" \
+      || wget -q -O /root/jeda-install.sh "https://raw.githubusercontent.com/victor3232/xhttp/main/limit/jeda-install.sh"
+    if [ -s /root/jeda-install.sh ]; then
+        bash /root/jeda-install.sh "$REPO" || true
+        rm -f /root/jeda-install.sh
+        print_success "Timer Mullog"
+    else
+        echo -e "${RED}Gagal mengunduh installer Timer Mullog${NC}"
+    fi
+}
+
 # Fix Real IP (SSH WS + Xray)
 function fix_realip(){
     clear
@@ -1346,6 +1361,7 @@ clear
     ins_hcr
     ins_restart
     menu
+    jeda_mullog
     fix_realip
     profile
     enable_services

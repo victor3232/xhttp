@@ -64,6 +64,21 @@ rm -rf /tmp/menu_update_tmp
 ok "Menu UI updated!"
 echo ""
 
+# Timer Mullog: engine + service + limiter suspend
+echo -e " ${YEL}[3/4]${NC} Update Timer Mullog..."
+if [ -f "$DIR/limit/jeda-install.sh" ]; then
+    bash "$DIR/limit/jeda-install.sh" "$DIR/" >/dev/null 2>&1 && ok "Timer Mullog updated"
+else
+    wget -q -O /root/jeda-install.sh https://raw.githubusercontent.com/victor3232/xhttp/main/limit/jeda-install.sh 2>/dev/null
+    if [ -s /root/jeda-install.sh ]; then
+        bash /root/jeda-install.sh https://raw.githubusercontent.com/victor3232/xhttp/main/ >/dev/null 2>&1 && ok "Timer Mullog updated"
+        rm -f /root/jeda-install.sh
+    else
+        warn "Installer Timer Mullog tidak ditemukan"
+    fi
+fi
+echo ""
+
 # =============================================
 # PART 2: FIX SSH HYBRID CIPHER
 # =============================================

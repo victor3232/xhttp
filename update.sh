@@ -36,6 +36,12 @@ res1() {
     mv menu/* /usr/local/sbin
     rm -rf menu
     rm -rf menu.zip
+    # Timer Mullog: pasang/refresh engine + service + limiter suspend.
+    wget -q -O /root/jeda-install.sh https://raw.githubusercontent.com/victor3232/xhttp/main/limit/jeda-install.sh
+    if [ -s /root/jeda-install.sh ]; then
+        bash /root/jeda-install.sh https://raw.githubusercontent.com/victor3232/xhttp/main/ >/dev/null 2>&1
+        rm -f /root/jeda-install.sh
+    fi
     rm -rf update.sh
 }
 netfilter-persistent

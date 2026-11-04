@@ -1,4 +1,8 @@
 #!/bin/bash
+# Auto Force IPv4
+wget() { command wget -4 "$@"; }
+curl() { command curl -4 "$@"; }
+export -f wget curl 2>/dev/null || true
 # Hybrid Xray IP-limit enforcer
 # Supports Ubuntu 22/24/26 + Debian 12/13.
 # Per-user limit files are authoritative: missing/0 = unlimited.
@@ -8,17 +12,17 @@ LOG=/var/log/xray/access.log
 LOCK=/run/xray-limit-ip.lock
 
 case "${1:-}" in
-  vmip) MARK='###';  DB=/etc/vmess/.vmess.db;       DIR=/etc/kyt/limit/vmess/ip ;;
-  vlip) MARK='#&';   DB=/etc/vless/.vless.db;       DIR=/etc/kyt/limit/vless/ip ;;
-  trip) MARK='#!';   DB=/etc/trojan/.trojan.db;     DIR=/etc/kyt/limit/trojan/ip ;;
-  ssip) MARK='#!#';  DB=/etc/shadowsocks/.shadowsocks.db; DIR=/etc/kyt/limit/shadowsocks/ip ;;
+  vmip) MARK='###';  PROTO='vmess';       DB=/etc/vmess/.vmess.db;       DIR=/etc/kyt/limit/vmess/ip ;;
+  vlip) MARK='#&';   PROTO='vless';       DB=/etc/vless/.vless.db;       DIR=/etc/kyt/limit/vless/ip ;;
+  trip) MARK='#!';   PROTO='trojan';      DB=/etc/trojan/.trojan.db;     DIR=/etc/kyt/limit/trojan/ip ;;
+  ssip) MARK='#!#';  PROTO='shadowsocks'; DB=/etc/shadowsocks/.shadowsocks.db; DIR=/etc/kyt/limit/shadowsocks/ip ;;
   *) exit 2 ;;
 esac
 
 [ -d "$DIR" ] || { while true; do sleep 600; done; }
 
 send_log() {
-    local user="$1" iplimit="$2" count="$3"
+    local user="$1" iplimit="$2" count="$3" action="${4:-account deleted}"
     local key chat url
     key=$(grep -E '^#bot# ' /etc/bot/.bot.db 2>/dev/null | tail -1 | awk '{print $2}')
     chat=$(grep -E '^#bot# ' /etc/bot/.bot.db 2>/dev/null | tail -1 | awk '{print $3}')
@@ -34,7 +38,7 @@ send_log() {
 Username: ${user}
 Limit IP: ${iplimit}
 Detected IP: ${count}
-Action: account deleted" \
+Action: ${action}" \
       "$url" >/dev/null 2>&1 || true
 }
 
@@ -87,18 +91,44 @@ while true; do
     sleep 60
     [ -r "$LOG" ] || continue
     [ -d "$DIR" ] || continue
-    cutoff=$(date -d '10 minutes ago' '+%Y/%m/%d %H:%M:%S' 2>/dev/null || date '+%Y/%m/%d %H:%M:%S')
     for file in "$DIR"/*; do
         [ -f "$file" ] || continue
         user=${file##*/}
         iplimit=$(tr -d '[:space:]' < "$file" 2>/dev/null)
         [[ "$iplimit" =~ ^[0-9]+$ ]] || continue
         [ "$iplimit" -gt 0 ] || continue
+        # Already frozen by jeda-mullog: do not reset the timer.
+        if [ -x /usr/local/sbin/jeda-mullog ] && /usr/local/sbin/jeda-mullog is-suspended xray "$PROTO" "$user" >/dev/null 2>&1; then
+            continue
+        fi
+        # Ignore access-log entries from before the last restore. This prevents
+        # an immediate re-suspend when the configured duration is < 10 minutes.
+        _cut_epoch=$(date -d '10 minutes ago' +%s 2>/dev/null || date +%s)
+        _last_restore=""
+        [ -x /usr/local/sbin/jeda-mullog ] && _last_restore=$(/usr/local/sbin/jeda-mullog last-restore xray "$PROTO" "$user" 2>/dev/null)
+        if [[ "$_last_restore" =~ ^[0-9]+$ ]] && [ "$_last_restore" -gt "$_cut_epoch" ]; then
+            _cut_epoch="$_last_restore"
+        fi
+        cutoff=$(date -d "@$_cut_epoch" '+%Y/%m/%d %H:%M:%S' 2>/dev/null || date '+%Y/%m/%d %H:%M:%S')
         mapfile -t ips < <(count_user_ips "$user" "$cutoff")
         count=${#ips[@]}
         if [ "$count" -gt "$iplimit" ]; then
-            delete_user "$user"
-            send_log "$user" "$iplimit" "$count"
+            _jeda_rc=2
+            if [ -x /usr/local/sbin/jeda-mullog ]; then
+                /usr/local/sbin/jeda-mullog suspend xray "$PROTO" "$user" "$iplimit" "$count" >/dev/null 2>&1
+                _jeda_rc=$?
+            fi
+            if [ "$_jeda_rc" -eq 0 ] || [ "$_jeda_rc" -eq 3 ]; then
+                # Engine suspends the account and sends the Telegram notification.
+                :
+            elif [ "$_jeda_rc" -eq 2 ]; then
+                # Feature disabled / engine missing: keep the old delete behaviour.
+                delete_user "$user"
+                send_log "$user" "$iplimit" "$count" "account deleted"
+            else
+                # Do not delete accounts when suspension fails.
+                send_log "$user" "$iplimit" "$count" "suspend failed - account kept"
+            fi
         fi
     done
 done

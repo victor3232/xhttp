@@ -1,7 +1,11 @@
 #!/bin/bash
+# Auto Force IPv4
+wget() { command wget -4 "$@"; }
+curl() { command curl -4 "$@"; }
+export -f wget curl 2>/dev/null || true
 # Hybrid SSH multi-login limiter.
 # Debian 11/12/13 + Ubuntu 22/24/26; sshd, sshd-session and Dropbear.
-# Action: kill sessions only. Accounts are never deleted.
+# Action: temporary suspend (jeda-mullog) or kill sessions if disabled.
 set -u
 
 LOG=/var/log/auth.log
@@ -10,7 +14,7 @@ DIR=/etc/kyt/limit/ssh/ip
 LOCK=/run/ssh-limit.lock
 
 send_log() {
-    local user="$1" limit="$2" count="$3" ips="$4" key chat
+    local user="$1" limit="$2" count="$3" ips="$4" action="${5:-sessions killed}" key chat
     key=$(grep -E '^#bot# ' /etc/bot/.bot.db 2>/dev/null | tail -1 | awk '{print $2}')
     chat=$(grep -E '^#bot# ' /etc/bot/.bot.db 2>/dev/null | tail -1 | awk '{print $3}')
     if [ -z "$key" ] || [ -z "$chat" ]; then
@@ -26,7 +30,7 @@ Username: ${user}
 Limit IP: ${limit}
 Detected IP: ${count}
 IPs: ${ips}
-Action: sessions killed" >/dev/null 2>&1 || true
+Action: ${action}" >/dev/null 2>&1 || true
 }
 
 # Print: pid<TAB>user<TAB>remote_ip for live SSH/Dropbear sockets.
@@ -109,16 +113,31 @@ check_once() {
         user=${file##*/}; limit=$(tr -d '[:space:]' < "$file" 2>/dev/null)
         [[ "$limit" =~ ^[0-9]+$ ]] || continue
         [ "$limit" -gt 0 ] || continue
+        # Already frozen by jeda-mullog: do not reset the timer.
+        if [ -x /usr/local/sbin/jeda-mullog ] && /usr/local/sbin/jeda-mullog is-suspended ssh "$user" >/dev/null 2>&1; then
+            continue
+        fi
         uniq=$(printf '%s\n' "${IPS[$user]:-}" | tr ' ' '\n' | sed '/^$/d' | sort -u)
         count=$(printf '%s\n' "$uniq" | sed '/^$/d' | wc -l)
         [ "$count" -gt "$limit" ] || continue
         exec 9>"$LOCK"; flock -x 9
-        for pid in ${PIDS[$user]:-}; do kill -TERM "$pid" 2>/dev/null || true; done
-        sleep 1
-        for pid in ${PIDS[$user]:-}; do kill -KILL "$pid" 2>/dev/null || true; done
+        _jeda_ok=0
+        if [ -x /usr/local/sbin/jeda-mullog ]; then
+            /usr/local/sbin/jeda-mullog suspend ssh "$user" "$limit" "$count" >/dev/null 2>&1
+            [ "$?" -eq 0 ] && _jeda_ok=1
+        fi
+        if [ "$_jeda_ok" -eq 0 ]; then
+            for pid in ${PIDS[$user]:-}; do kill -TERM "$pid" 2>/dev/null || true; done
+            sleep 1
+            for pid in ${PIDS[$user]:-}; do kill -KILL "$pid" 2>/dev/null || true; done
+        fi
         # Kill only the user's sessions; never userdel and never remove the account.
         flock -u 9
-        send_log "$user" "$limit" "$count" "$(printf '%s' "$uniq" | tr '\n' ',')"
+        if [ "$_jeda_ok" -eq 0 ]; then
+            # Engine disabled/missing: fallback to the old kill-only behaviour.
+            send_log "$user" "$limit" "$count" "$(printf '%s' "$uniq" | tr '\n' ',')" "sessions killed"
+        fi
+        # When the engine suspends the account, it sends the Telegram notification.
     done
 }
 

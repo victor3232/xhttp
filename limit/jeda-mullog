@@ -1,0 +1,711 @@
+#!/usr/bin/env python3
+"""
+Jeda Mullog - temporary suspension for SSH and Xray accounts.
+
+Config : /etc/kyt/jeda-mullog.conf
+State  : /etc/kyt/jeda-mullog/state/*.json
+
+Design:
+- SSH  : lock password, set shell to nologin, kill sessions, restore after N minutes.
+- Xray : remove user block from config + DB, keep quota/IP-limit files, restore after N minutes.
+- Quota is NOT changed. Quota-full accounts still follow the existing delete flow.
+"""
+
+import fcntl
+import html
+import json
+import os
+import pwd
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.parse
+import urllib.request
+
+CONF = "/etc/kyt/jeda-mullog.conf"
+STATE_DIR = "/etc/kyt/jeda-mullog/state"
+RESTORED_DIR = "/etc/kyt/jeda-mullog/restored"
+LOCK_FILE = "/run/jeda-mullog.lock"
+XRAY_CFG = "/etc/xray/config.json"
+NOLOGIN = "/usr/sbin/nologin" if os.path.exists("/usr/sbin/nologin") else "/bin/false"
+
+# proto: (config marker, database, config anchor prefix)
+PROTO = {
+    "vmess": ("###", "/etc/vmess/.vmess.db", "#vmess"),
+    "vless": ("#&", "/etc/vless/.vless.db", "#vless"),
+    "trojan": ("#!", "/etc/trojan/.trojan.db", "#trojan"),
+    "shadowsocks": ("#!#", "/etc/shadowsocks/.shadowsocks.db", "#ss"),
+}
+
+DB_MARK = "###"
+
+
+def log(msg):
+    print(time.strftime("%Y-%m-%d %H:%M:%S"), msg, file=sys.stderr, flush=True)
+
+
+def load_conf():
+    enabled = True
+    minutes = 20
+    notify = True
+    try:
+        with open(CONF, "r", errors="ignore") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, val = line.split("=", 1)
+                key = key.strip().upper()
+                val = val.strip().strip("'\"")
+                if key == "ENABLED":
+                    enabled = val.lower() in ("1", "true", "yes", "on", "aktif")
+                elif key == "MINUTES":
+                    try:
+                        minutes = int(val)
+                    except ValueError:
+                        pass
+                elif key == "NOTIFY":
+                    notify = val.lower() in ("1", "true", "yes", "on", "aktif")
+    except FileNotFoundError:
+        pass
+    minutes = max(1, min(1440, minutes))
+    return enabled, minutes, notify
+
+
+def notifications_enabled(conf_value):
+    if os.environ.get("JEDA_NOTIFY", "1").strip().lower() in ("0", "false", "no", "off", "nonaktif"):
+        return False
+    return bool(conf_value)
+
+
+def bot_credentials():
+    token = chat = None
+    try:
+        with open("/etc/bot/.bot.db", "r", errors="ignore") as fh:
+            for line in fh:
+                if line.startswith("#bot# "):
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        token, chat = parts[1], parts[2]
+                        break
+    except FileNotFoundError:
+        pass
+    if not token or not chat:
+        try:
+            with open("/usr/bin/kyt/var.txt", "r", errors="ignore") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line.startswith("BOT_TOKEN="):
+                        token = line.split("=", 1)[1].strip("'\" ")
+                    elif line.startswith("ADMIN="):
+                        chat = line.split("=", 1)[1].strip("'\" ")
+        except FileNotFoundError:
+            pass
+    return token, chat
+
+
+def send_telegram(text):
+    token, chat = bot_credentials()
+    if not token or not chat:
+        log("notifikasi dilewati: token/chat bot belum ada")
+        return False
+    data = urllib.parse.urlencode({
+        "chat_id": chat,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": "1",
+    }).encode("utf-8")
+    try:
+        req = urllib.request.Request(
+            "https://api.telegram.org/bot%s/sendMessage" % token,
+            data=data,
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=6).read(1)
+        log("notifikasi Telegram terkirim")
+        return True
+    except Exception as exc:
+        log("notifikasi Telegram gagal: %s" % exc)
+        return False
+
+
+def label(kind, proto):
+    if kind == "ssh":
+        return "SSH"
+    if kind == "xray":
+        return (proto or "XRAY").upper()
+    return kind.upper()
+
+
+def notify_suspend(kind, user, proto, limit, count, minutes, until):
+    layanan = html.escape(label(kind, proto))
+    nama = html.escape(str(user))
+    batas = html.escape(str(limit if limit not in (None, "") else "-"))
+    jumlah = html.escape(str(count if count not in (None, "") else "-"))
+    pulih = time.strftime("%H:%M:%S", time.localtime(until))
+    text = (
+        "<code>────────────────────</code>\n"
+        "<b>⚠️ TIMER MULLOG: AKUN DIBEKUKAN</b>\n"
+        "<code>────────────────────</code>\n"
+        "<code>Layanan     : </code><code>%s</code>\n"
+        "<code>Username    : </code><code>%s</code>\n"
+        "<code>Limit IP    : </code><code>%s</code>\n"
+        "<code>Terdeteksi  : </code><code>%s IP</code>\n"
+        "<code>Durasi      : </code><code>%s menit</code>\n"
+        "<code>Pulih pukul : </code><code>%s</code>\n"
+        "<code>────────────────────</code>"
+    ) % (layanan, nama, batas, jumlah, minutes, pulih)
+    send_telegram(text)
+
+
+def notify_restore(kind, user, proto):
+    layanan = html.escape(label(kind, proto))
+    nama = html.escape(str(user))
+    text = (
+        "<code>────────────────────</code>\n"
+        "<b>✅ TIMER MULLOG: AKUN PULIH</b>\n"
+        "<code>────────────────────</code>\n"
+        "<code>Layanan     : </code><code>%s</code>\n"
+        "<code>Username    : </code><code>%s</code>\n"
+        "<code>Status      : </code><code>Aktif kembali</code>\n"
+        "<code>────────────────────</code>"
+    ) % (layanan, nama)
+    send_telegram(text)
+
+
+def safe_name(value):
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", str(value))
+
+
+def state_path(kind, user, proto=None):
+    if kind == "xray":
+        return os.path.join(STATE_DIR, "xray-%s-%s.json" % (safe_name(proto), safe_name(user)))
+    return os.path.join(STATE_DIR, "ssh-%s.json" % safe_name(user))
+
+
+def ensure_dirs():
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    os.makedirs(RESTORED_DIR, mode=0o700, exist_ok=True)
+    os.makedirs(os.path.dirname(CONF), mode=0o755, exist_ok=True)
+
+
+def restored_path(kind, user, proto=None):
+    if kind == "xray":
+        return os.path.join(RESTORED_DIR, "xray-%s-%s" % (safe_name(proto), safe_name(user)))
+    return os.path.join(RESTORED_DIR, "ssh-%s" % safe_name(user))
+
+
+def mark_restored(kind, user, proto=None):
+    try:
+        with open(restored_path(kind, user, proto), "w") as fh:
+            fh.write("%d\n" % int(time.time()))
+    except Exception as exc:
+        log("gagal menulis penanda restore %s: %s" % (user, exc))
+
+
+def last_restore(kind, user, proto=None):
+    try:
+        with open(restored_path(kind, user, proto), "r") as fh:
+            return int(fh.read().strip())
+    except Exception:
+        return 0
+
+
+def atomic_write(path, lines, mode=None):
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".jeda-", dir=directory)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.writelines(lines)
+        if mode is None:
+            try:
+                mode = os.stat(path).st_mode & 0o7777
+            except FileNotFoundError:
+                mode = 0o644
+        os.chmod(tmp, mode)
+        try:
+            st = os.stat(path)
+            os.chown(tmp, st.st_uid, st.st_gid)
+        except Exception:
+            pass
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except Exception:
+            pass
+        raise
+
+
+def write_state(path, obj):
+    data = json.dumps(obj, indent=2, sort_keys=True) + "\n"
+    atomic_write(path, [data], 0o600)
+
+
+def read_state(path):
+    with open(path, "r", errors="ignore") as fh:
+        return json.load(fh)
+
+
+class Lock:
+    def __enter__(self):
+        self.fd = os.open(LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o600)
+        fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *_):
+        try:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+        finally:
+            os.close(self.fd)
+
+
+def run(cmd):
+    try:
+        return subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                              text=True, timeout=30).returncode
+    except Exception as exc:
+        log("command failed %s: %s" % (" ".join(cmd), exc))
+        return 1
+
+
+# ---------------------------------------------------------------------------
+# SSH
+# ---------------------------------------------------------------------------
+
+def ssh_is_locked(user):
+    try:
+        out = subprocess.run(["passwd", "-S", user], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, text=True, timeout=10).stdout
+        parts = out.split()
+        return len(parts) > 1 and parts[1] == "L"
+    except Exception:
+        return False
+
+
+def suspend_ssh(user, limit=None, count=None):
+    enabled, minutes, notify = load_conf()
+    if not enabled:
+        return 2
+    if user == "root":
+        return 4
+    try:
+        pw = pwd.getpwnam(user)
+    except KeyError:
+        return 4
+    if pw.pw_uid < 1000:
+        return 4
+
+    path = state_path("ssh", user)
+    if os.path.exists(path):
+        return 3
+
+    state = {
+        "kind": "ssh",
+        "user": user,
+        "created": time.time(),
+        "until": time.time() + minutes * 60,
+        "shell": pw.pw_shell or "/bin/bash",
+        "was_locked": ssh_is_locked(user),
+        "limit": limit,
+        "count": count,
+    }
+    write_state(path, state)
+
+    # Lock password and block key/public-key logins too.
+    if run(["usermod", "-L", user]) != 0:
+        log("gagal lock password %s" % user)
+    if run(["usermod", "-s", NOLOGIN, user]) != 0:
+        log("gagal set nologin %s" % user)
+
+    # Kill every session and user process; this is a temporary freeze.
+    pkill = shutil.which("pkill") or "/usr/bin/pkill"
+    run([pkill, "-TERM", "-u", user, "-f", "(sshd|dropbear)"])
+    time.sleep(1)
+    run([pkill, "-KILL", "-u", user])
+    log("suspend SSH %s sampai %s (%s menit)" % (
+        user, time.strftime("%H:%M:%S", time.localtime(state["until"])), minutes))
+    if notifications_enabled(notify):
+        notify_suspend("ssh", user, None, limit, count, minutes, state["until"])
+    return 0
+
+
+def restore_ssh(state):
+    user = state.get("user", "")
+    try:
+        pwd.getpwnam(user)
+    except KeyError:
+        return True
+
+    shell = state.get("shell") or "/bin/bash"
+    if not os.path.exists(shell):
+        shell = "/bin/bash"
+    if run(["usermod", "-s", shell, user]) != 0:
+        log("gagal restore shell %s" % user)
+
+    quota_lock = "/etc/limit/ssh/%s.lock" % user
+    if not state.get("was_locked") and not os.path.exists(quota_lock):
+        if run(["usermod", "-U", user]) != 0:
+            log("gagal unlock password %s" % user)
+    log("restore SSH %s" % user)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Xray
+# ---------------------------------------------------------------------------
+
+def xray_find_blocks(lines, mark, user):
+    pattern = re.compile(r"^\s*" + re.escape(mark) + r"\s+" + re.escape(user) + r"(?:\s|$)")
+    result = []
+    for idx, line in enumerate(lines):
+        if not pattern.match(line):
+            continue
+        nxt = idx + 1
+        if nxt >= len(lines) or not lines[nxt].lstrip().startswith("},{"):
+            log("format blok %s tidak dikenal, dilewati" % user)
+            continue
+        anchor = None
+        for back in range(idx - 1, -1, -1):
+            text = lines[back].strip()
+            if re.match(r"^#[A-Za-z]", text):
+                anchor = text
+                break
+        if anchor is None:
+            log("anchor blok %s tidak ditemukan, dilewati" % user)
+            continue
+        result.append((idx, nxt, anchor))
+    return result
+
+
+def xray_prepare_remove(proto, user):
+    mark, db_path, _ = PROTO[proto]
+    try:
+        with open(XRAY_CFG, "r", errors="ignore") as fh:
+            lines = fh.readlines()
+    except FileNotFoundError:
+        return None
+
+    blocks = xray_find_blocks(lines, mark, user)
+    if not blocks:
+        return None
+
+    saved_blocks = []
+    remove_idx = set()
+    for idx, nxt, anchor in blocks:
+        saved_blocks.append({
+            "anchor": anchor,
+            "lines": [lines[idx].rstrip("\n"), lines[nxt].rstrip("\n")],
+        })
+        remove_idx.add(idx)
+        remove_idx.add(nxt)
+
+    db_lines = []
+    try:
+        with open(db_path, "r", errors="ignore") as fh:
+            for line in fh:
+                if re.match(r"^" + re.escape(DB_MARK) + r"\s+" + re.escape(user) + r"(?:\s|$)", line):
+                    db_lines.append(line.rstrip("\n"))
+    except FileNotFoundError:
+        pass
+
+    new_lines = [line for idx, line in enumerate(lines) if idx not in remove_idx]
+    return {
+        "blocks": saved_blocks,
+        "db": db_path,
+        "dblines": db_lines,
+        "new_lines": new_lines,
+        "db_path": db_path,
+        "old_db_lines": db_lines,
+    }
+
+
+def xray_apply_remove(data):
+    atomic_write(XRAY_CFG, data["new_lines"])
+    if data["old_db_lines"]:
+        try:
+            with open(data["db_path"], "r", errors="ignore") as fh:
+                keep = [line for line in fh if line.rstrip("\n") not in data["old_db_lines"]]
+            atomic_write(data["db_path"], keep)
+        except FileNotFoundError:
+            pass
+
+
+def suspend_xray(proto, user, limit=None, count=None):
+    enabled, minutes, notify = load_conf()
+    if not enabled:
+        return 2
+    if proto not in PROTO:
+        return 4
+
+    path = state_path("xray", user, proto)
+    if os.path.exists(path):
+        return 3
+
+    prepared = xray_prepare_remove(proto, user)
+    if not prepared:
+        return 4
+
+    state = {
+        "kind": "xray",
+        "proto": proto,
+        "user": user,
+        "created": time.time(),
+        "until": time.time() + minutes * 60,
+        "blocks": prepared["blocks"],
+        "db": prepared["db"],
+        "dblines": prepared["dblines"],
+        "limit": limit,
+        "count": count,
+    }
+    write_state(path, state)
+    try:
+        xray_apply_remove(prepared)
+    except Exception as exc:
+        log("gagal menerapkan suspend %s/%s: %s" % (proto, user, exc))
+        try:
+            os.unlink(path)
+        except Exception:
+            pass
+        return 4
+
+    run(["systemctl", "restart", "xray"])
+    log("suspend XRAY %s/%s sampai %s (%s menit)" % (
+        proto, user, time.strftime("%H:%M:%S", time.localtime(state["until"])), minutes))
+    if notifications_enabled(notify):
+        notify_suspend("xray", user, proto, limit, count, minutes, state["until"])
+    return 0
+
+
+def xray_restore(state):
+    user = state.get("user", "")
+    try:
+        with open(XRAY_CFG, "r", errors="ignore") as fh:
+            lines = fh.readlines()
+    except FileNotFoundError:
+        return False, False
+
+    changed = False
+    ok = True
+    for block in state.get("blocks", []):
+        anchor = block.get("anchor")
+        marker = block.get("lines", ["", ""])[0]
+        client = block.get("lines", ["", ""])[1]
+        if not anchor or not marker or not client:
+            ok = False
+            continue
+
+        anchor_idx = None
+        for idx, line in enumerate(lines):
+            if line.strip() == anchor:
+                anchor_idx = idx
+                break
+        if anchor_idx is None:
+            log("restore %s: anchor %s tidak ditemukan" % (user, anchor))
+            ok = False
+            continue
+
+        section_end = len(lines)
+        for idx in range(anchor_idx + 1, len(lines)):
+            if re.match(r"^\s*#[A-Za-z]", lines[idx]):
+                section_end = idx
+                break
+
+        if any(lines[idx].strip() == marker.strip() for idx in range(anchor_idx + 1, section_end)):
+            continue
+
+        lines[anchor_idx + 1:anchor_idx + 1] = [marker + "\n", client + "\n"]
+        changed = True
+
+    if changed:
+        atomic_write(XRAY_CFG, lines)
+
+    db_path = state.get("db")
+    if db_path and state.get("dblines"):
+        try:
+            with open(db_path, "r", errors="ignore") as fh:
+                existing = {line.rstrip("\n") for line in fh}
+        except FileNotFoundError:
+            existing = set()
+        todo = [line for line in state["dblines"] if line not in existing]
+        if todo:
+            with open(db_path, "a") as fh:
+                for line in todo:
+                    fh.write(line + "\n")
+
+    if changed:
+        log("restore XRAY %s/%s" % (state.get("proto", ""), user))
+    return changed, ok
+
+
+# ---------------------------------------------------------------------------
+# Scheduler
+# ---------------------------------------------------------------------------
+
+def restore_all(only_due=False):
+    ensure_dirs()
+    now = time.time()
+    _, _, notify = load_conf()
+    xray_changed = False
+    try:
+        names = sorted(os.listdir(STATE_DIR))
+    except FileNotFoundError:
+        return 0
+
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(STATE_DIR, name)
+        try:
+            state = read_state(path)
+        except Exception:
+            continue
+        if only_due and float(state.get("until", 0)) > now:
+            continue
+        try:
+            if state.get("kind") == "ssh":
+                restore_ssh(state)
+                mark_restored("ssh", state.get("user", ""))
+                os.unlink(path)
+                if only_due and notifications_enabled(notify):
+                    notify_restore("ssh", state.get("user", ""), None)
+            elif state.get("kind") == "xray":
+                changed, ok = xray_restore(state)
+                if changed:
+                    xray_changed = True
+                if ok:
+                    mark_restored("xray", state.get("user", ""), state.get("proto"))
+                    os.unlink(path)
+                    if only_due and notifications_enabled(notify):
+                        notify_restore("xray", state.get("user", ""), state.get("proto"))
+                else:
+                    log("state %s disimpan karena restore belum lengkap" % name)
+        except Exception as exc:
+            log("gagal restore %s: %s" % (name, exc))
+
+    if xray_changed:
+        run(["systemctl", "restart", "xray"])
+    return 0
+
+
+def daemon():
+    ensure_dirs()
+    log("timer mullog daemon aktif")
+    while True:
+        try:
+            restore_all(only_due=True)
+        except Exception as exc:
+            log("daemon error: %s" % exc)
+        time.sleep(5)
+
+
+def print_list():
+    ensure_dirs()
+    now = time.time()
+    try:
+        names = sorted(os.listdir(STATE_DIR))
+    except FileNotFoundError:
+        names = []
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(STATE_DIR, name)
+        try:
+            state = read_state(path)
+        except Exception:
+            continue
+        until = float(state.get("until", 0))
+        remaining = max(0, int(until - now))
+        kind = state.get("kind", "-")
+        proto = state.get("proto", "-")
+        user = state.get("user", "-")
+        print("%s\t%s\t%s\t%d\t%d" % (kind, proto, user, remaining, int(until)))
+
+
+def main():
+    ensure_dirs()
+    if len(sys.argv) < 2:
+        print("usage: jeda-mullog {daemon|status|list|restore-all|notify-test|"
+              "suspend ssh USER [LIMIT] [COUNT]|"
+              "suspend xray PROTO USER [LIMIT] [COUNT]|"
+              "is-suspended ssh USER|is-suspended xray PROTO USER|"
+              "last-restore ssh USER|last-restore xray PROTO USER}", file=sys.stderr)
+        return 64
+
+    cmd = sys.argv[1]
+    if cmd == "daemon":
+        daemon()
+        return 0
+    if cmd == "status":
+        enabled, minutes, notify = load_conf()
+        count = 0
+        try:
+            count = len([n for n in os.listdir(STATE_DIR) if n.endswith(".json")])
+        except FileNotFoundError:
+            pass
+        print("ENABLED=%d" % (1 if enabled else 0))
+        print("MINUTES=%d" % minutes)
+        print("NOTIFY=%d" % (1 if notifications_enabled(notify) else 0))
+        print("SUSPENDED=%d" % count)
+        return 0
+    if cmd == "list":
+        print_list()
+        return 0
+    if cmd == "restore-all":
+        return restore_all(only_due=False)
+    if cmd == "notify-test":
+        ok = send_telegram(
+            "<b>✅ TIMER MULLOG AKTIF</b>\n"
+            "<code>Notifikasi Telegram berfungsi.</code>"
+        )
+        return 0 if ok else 1
+    if cmd == "is-suspended":
+        if len(sys.argv) < 4:
+            return 64
+        kind = sys.argv[2]
+        if kind == "ssh":
+            path = state_path("ssh", sys.argv[3])
+        elif kind == "xray" and len(sys.argv) >= 5:
+            path = state_path("xray", sys.argv[4], sys.argv[3])
+        else:
+            return 64
+        return 0 if os.path.exists(path) else 1
+    if cmd == "last-restore":
+        if len(sys.argv) < 4:
+            return 64
+        kind = sys.argv[2]
+        if kind == "ssh":
+            print(last_restore("ssh", sys.argv[3]))
+            return 0
+        if kind == "xray" and len(sys.argv) >= 5:
+            print(last_restore("xray", sys.argv[4], sys.argv[3]))
+            return 0
+        return 64
+    if cmd == "suspend":
+        if len(sys.argv) < 4:
+            return 64
+        kind = sys.argv[2]
+        if kind == "ssh":
+            user = sys.argv[3]
+            limit = sys.argv[4] if len(sys.argv) > 4 else None
+            count = sys.argv[5] if len(sys.argv) > 5 else None
+            with Lock():
+                return suspend_ssh(user, limit, count)
+        if kind == "xray":
+            if len(sys.argv) < 5:
+                return 64
+            proto, user = sys.argv[3], sys.argv[4]
+            limit = sys.argv[5] if len(sys.argv) > 5 else None
+            count = sys.argv[6] if len(sys.argv) > 6 else None
+            with Lock():
+                return suspend_xray(proto, user, limit, count)
+    print("perintah tidak dikenal", file=sys.stderr)
+    return 64
+
+
+if __name__ == "__main__":
+    sys.exit(main())
