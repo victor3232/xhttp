@@ -18,6 +18,25 @@ get_b64() {
     rm -f "$tmp"
 }
 
+# ==== Sumber installer & lisensi (dapat dioverride) ====
+# Installer/aset: KYT_REPO, argumen URL, atau default stabil workers.dev.
+REPO="${KYT_REPO:-https://scvpn.jolang323.workers.dev}"
+case "${1:-}" in
+  http://*|https://*) REPO="$1" ;;
+  *.*) REPO="https://$1" ;;
+esac
+case "$REPO" in http://*|https://*) ;; *) REPO="https://$REPO" ;; esac
+REPO="${REPO%/}"
+export KYT_REPO="$REPO"
+
+# Menu/lisensi selalu ke endpoint stabil, terpisah dari domain installer.
+LICENSE_URL="${KYT_LICENSE_URL:-https://scvpn.jolang323.workers.dev}"
+LICENSE_URL="${LICENSE_URL%/}"
+export KYT_LICENSE_URL="$LICENSE_URL"
+if [ ! -s /etc/kyt-license.conf ]; then
+  printf '%s\n' "$LICENSE_URL" > /etc/kyt-license.conf 2>/dev/null || true
+fi
+
 # FIX: Agar tidak tanya restart service (Ubuntu 22/24)
 if [ -f /etc/needrestart/needrestart.conf ]; then
     sed -i 's/#$nrconf{restart} = '"'"'i'"'"';/$nrconf{restart} = '"'"'a'"'"';/g' /etc/needrestart/needrestart.conf
@@ -187,9 +206,9 @@ clear
 #########################
 # USERNAME
 rm -f /usr/bin/user
-username=$(curl https://raw.githubusercontent.com/victor3232/xhttp/main/izin | grep $MYIP | awk '{print $2}')
+username=$(curl -4 -fsSL --max-time 15 "$LICENSE_URL/izin" | grep "$MYIP" | awk '{print $2}')
 echo "$username" >/usr/bin/user
-expx=$(curl https://raw.githubusercontent.com/victor3232/xhttp/main/izin | grep $MYIP | awk '{print $3}')
+expx=$(curl -4 -fsSL --max-time 15 "$LICENSE_URL/izin" | grep "$MYIP" | awk '{print $3}')
 echo "$expx" >/usr/bin/e
 # DETAIL ORDER
 username=$(cat /usr/bin/user)
@@ -213,7 +232,7 @@ mai="datediff "$Exp" "$DATE""
 Info="(${green}Active${NC})"
 Error="(${RED}ExpiRED${NC})"
 today=`date -d "0 days" +"%Y-%m-%d"`
-Exp1=$(curl https://raw.githubusercontent.com/victor3232/xhttp/main/izin | grep $MYIP | awk '{print $4}')
+Exp1=$(curl -4 -fsSL --max-time 15 "$LICENSE_URL/izin" | grep "$MYIP" | awk '{print $4}')
 if [[ $today < $Exp1 ]]; then
 sts="${Info}"
 else
@@ -221,8 +240,7 @@ sts="${Error}"
 fi
 echo -e "\e[32mloading...\e[0m"
 clear
-# REPO    
-    REPO="https://installer.pteroqhost.com/"
+# REPO sudah diatur di bagian atas (KYT_REPO / argumen / workers.dev)
 
 ####
 start=$(date +%s)

@@ -4,9 +4,7 @@
 # ============================================================
 set -euo pipefail
 
-REPO_CONF="/etc/kyt-repo.conf"
-[ -f "$REPO_CONF" ] && REPO_URL=$(cat "$REPO_CONF" 2>/dev/null)
-REPO="${REPO_URL:-https://installer.pteroqhost.com/}"
+REPO="${KYT_REPO:-https://scvpn.jolang323.workers.dev}"
 [[ "$REPO" != */ ]] && REPO="${REPO}/"
 
 MYIP=$(curl -sS ipv4.icanhazip.com || wget -qO- ipv4.icanhazip.com || curl -sS ifconfig.me)
