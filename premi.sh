@@ -1120,7 +1120,7 @@ print_success "All Packet"
 function menu(){
     clear
     print_install "Memasang Menu Packet"
-    wget ${REPO}limit/menu.zip?v=20261104
+    wget -O menu.zip "${REPO}limit/menu.zip?v=20261104"
     unzip menu.zip
     chmod +x menu/*
     mv menu/* /usr/local/sbin
