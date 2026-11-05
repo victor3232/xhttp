@@ -1,4 +1,8 @@
 #!/bin/bash
+# Auto Force IPv4
+wget() { command wget -4 "$@"; }
+curl() { command curl -4 "$@"; }
+export -f wget curl 2>/dev/null || true
 # ============================================================
 #  restore  -  RESTORE DATA VPN DARI FILE .ZIP
 #
@@ -246,6 +250,7 @@ if [ -d "$AKAR/etc" ]; then
     [ -d "$AKAR/etc/haproxy" ]      && salin "$AKAR/etc/haproxy"      "/etc/haproxy"
     [ -d "$AKAR/etc/nginx" ]        && salin "$AKAR/etc/nginx"        "/etc/nginx"
     [ -d "$AKAR/etc/letsencrypt" ]  && salin "$AKAR/etc/letsencrypt"  "/etc/letsencrypt"
+    [ -d "$AKAR/etc/ssl/kyt-web" ]   && salin "$AKAR/etc/ssl/kyt-web"   "/etc/ssl/kyt-web"
     [ -d "$AKAR/etc/default" ]      && salin "$AKAR/etc/default"      "/etc/default"
     [ -f "$AKAR/etc/kyt.txt" ]      && salin "$AKAR/etc/kyt.txt"      "/etc/kyt.txt"
     [ -d "$AKAR/etc/kyt/jeda-mullog" ] && salin "$AKAR/etc/kyt/jeda-mullog" "/etc/kyt/jeda-mullog"
@@ -255,10 +260,21 @@ if [ -d "$AKAR/etc" ]; then
     [ -f "$AKAR/usr/local/sbin/utility" ] && salin "$AKAR/usr/local/sbin/utility" "/usr/local/sbin/utility"
     [ -f "$AKAR/usr/bin/limit-ip" ] && salin "$AKAR/usr/bin/limit-ip" "/usr/bin/limit-ip"
     [ -f "$AKAR/etc/xray/limit.ssh" ] && salin "$AKAR/etc/xray/limit.ssh" "/etc/xray/limit.ssh"
-    for _unit in jeda-mullog vmip vlip trip limitssh; do
+    for _unit in jeda-mullog vmip vlip trip limitssh kyt-web; do
         [ -f "$AKAR/etc/systemd/system/${_unit}.service" ] && salin "$AKAR/etc/systemd/system/${_unit}.service" "/etc/systemd/system/${_unit}.service"
     done
+    for _f in kyt-web-cert-sync issue-cert.sh kyt-web-wait-dns; do
+        [ -f "$AKAR/usr/local/sbin/$_f" ] && salin "$AKAR/usr/local/sbin/$_f" "/usr/local/sbin/$_f"
+    done
+    [ -f "$AKAR/root/kyt-web-admin.txt" ] && salin "$AKAR/root/kyt-web-admin.txt" "/root/kyt-web-admin.txt"
+    [ -f "$AKAR/etc/kyt-web.conf" ] && salin "$AKAR/etc/kyt-web.conf" "/etc/kyt-web.conf"
+    [ -f "$AKAR/usr/local/sbin/setting-web" ] && salin "$AKAR/usr/local/sbin/setting-web" "/usr/local/sbin/setting-web"
+    if [ -x /usr/local/sbin/kyt-web-cert-sync ]; then
+        mkdir -p /etc/letsencrypt/renewal-hooks/deploy
+        ln -sf /usr/local/sbin/kyt-web-cert-sync /etc/letsencrypt/renewal-hooks/deploy/kyt-web-cert-sync
+    fi
     [ -d "$AKAR/var/www/html" ]     && salin "$AKAR/var/www/html"     "/var/www/html"
+    [ -d "$AKAR/opt/kyt-web" ]       && salin "$AKAR/opt/kyt-web"       "/opt/kyt-web"
     [ -d "$AKAR/var/lib/kyt" ]      && salin "$AKAR/var/lib/kyt"      "/var/lib/kyt"
     [ -d "$AKAR/root/akun" ]        && salin "$AKAR/root/akun"        "/root/akun"
     [ -d "$AKAR/root/udp" ]         && salin "$AKAR/root/udp"         "/root/udp"
@@ -339,7 +355,7 @@ fi
 echo -e " ${CYAN}[5/5]${NC} Me-restart layanan VPN..."
 systemctl daemon-reload >/dev/null 2>&1
 GAGAL_SVC=""
-for svc in xray haproxy nginx xl2tpd strongswan-starter ipsec openvpn dropbear udp-custom ws jeda-mullog limitssh vmip vlip trip; do
+for svc in xray haproxy nginx xl2tpd strongswan-starter ipsec openvpn dropbear udp-custom ws jeda-mullog limitssh vmip vlip trip kyt-web; do
     systemctl list-unit-files "${svc}.service" >/dev/null 2>&1 || [ -f "/etc/init.d/$svc" ] || continue
     if ! systemctl restart "$svc" >/dev/null 2>&1; then
         # xl2tpd di Debian 13 pakai init.d
@@ -350,7 +366,7 @@ for svc in xray haproxy nginx xl2tpd strongswan-starter ipsec openvpn dropbear u
         fi
     fi
 done
-for svc in jeda-mullog limitssh vmip vlip trip; do
+for svc in jeda-mullog limitssh vmip vlip trip kyt-web; do
     systemctl list-unit-files "${svc}.service" >/dev/null 2>&1 && systemctl enable "$svc" >/dev/null 2>&1
 done
 ipsec rereadsecrets >/dev/null 2>&1

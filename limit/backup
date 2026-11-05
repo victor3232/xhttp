@@ -1,4 +1,8 @@
 #!/bin/bash
+# Auto Force IPv4
+wget() { command wget -4 "$@"; }
+curl() { command curl -4 "$@"; }
+export -f wget curl 2>/dev/null || true
 # ============================================================
 #  backup  -  BACKUP DATA VPN KE FILE .ZIP  (tanpa rclone/email)
 #
@@ -91,6 +95,17 @@ BERKAS="
 /etc/systemd/system/vlip.service
 /etc/systemd/system/trip.service
 /etc/systemd/system/limitssh.service
+/etc/nginx/conf.d/vpnfree.conf
+/etc/haproxy/vpnfree.pem
+/etc/systemd/system/kyt-web.service
+/usr/local/sbin/kyt-web-cert-sync
+/usr/local/sbin/issue-cert.sh
+/usr/local/sbin/kyt-web-wait-dns
+/root/kyt-web-admin.txt
+/etc/kyt-web.conf
+/usr/local/sbin/setting-web
+/etc/ssl/kyt-web/vpnfree.crt
+/etc/ssl/kyt-web/vpnfree.key
 "
 
 # ---------- folder yang ikut (rekursif) ----------
@@ -106,6 +121,11 @@ FOLDER="
 /etc/kyt/jeda-mullog
 /usr/bin/kyt/database.db
 /usr/bin/kyt/var.txt
+/opt/kyt-web
+/etc/ssl/kyt-web
+/etc/letsencrypt/live
+/etc/letsencrypt/archive
+/etc/letsencrypt/renewal
 "
 
 echo -e " ${CYAN}[1/4]${NC} Mengumpulkan data akun..."
@@ -144,6 +164,11 @@ for d in $FOLDER; do
         siapkan "$d"
     fi
 done
+
+# Sertifikat Let's Encrypt memakai symlink; ikutkan isinya ke zip.
+while IFS= read -r f; do
+    siapkan "$f"
+done < <(find /etc/letsencrypt/live -type l 2>/dev/null)
 
 if [ "$JUMLAH" = "0" ]; then
     echo -e " ${RED}Tidak ada data yang bisa dibackup.${NC}"

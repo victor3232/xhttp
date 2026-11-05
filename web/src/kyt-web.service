@@ -1,0 +1,18 @@
+[Unit]
+Description=VPNFree - website akun SSH & Xray
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/kyt-web
+ExecStart=/usr/bin/python3 /opt/kyt-web/app.py --host 127.0.0.1 --port 8099
+Restart=always
+RestartSec=3
+TimeoutStopSec=10
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target

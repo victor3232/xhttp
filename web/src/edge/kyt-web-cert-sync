@@ -1,0 +1,23 @@
+#!/bin/bash
+# Sinkronkan sertifikat Let's Encrypt ke HAProxy + nginx.
+set -e
+DOMAIN="${1:-$(awk -F= '$1=="DOMAIN"{sub(/^[^=]*=/,"");print;exit}' /etc/kyt-web.conf 2>/dev/null)}"
+[ -n "$DOMAIN" ] || { echo "DOMAIN kosong" >&2; exit 1; }
+LE="/etc/letsencrypt/live/$DOMAIN"
+CRT="/etc/ssl/kyt-web/vpnfree.crt"
+KEY="/etc/ssl/kyt-web/vpnfree.key"
+PEM="/etc/haproxy/vpnfree.pem"
+
+[ -s "$LE/fullchain.pem" ] || { echo "sertifikat $DOMAIN belum ada" >&2; exit 1; }
+[ -s "$LE/privkey.pem" ] || { echo "private key $DOMAIN belum ada" >&2; exit 1; }
+
+install -d -m 755 /etc/ssl/kyt-web
+install -m 644 "$LE/fullchain.pem" "$CRT"
+install -m 600 "$LE/privkey.pem" "$KEY"
+cat "$CRT" "$KEY" > "$PEM"
+chmod 600 "$PEM"
+
+/usr/sbin/haproxy -c -f /etc/haproxy/haproxy.cfg >/dev/null
+systemctl reload haproxy
+systemctl reload nginx 2>/dev/null || true
+echo "sertifikat $DOMAIN tersinkron"

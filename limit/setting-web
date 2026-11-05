@@ -1,0 +1,173 @@
+#!/bin/bash
+# Setting Website VPNFree — ON/OFF dari menu Utility.
+# ON  : pasang jika belum ada, lalu enable + start service.
+# OFF : disable + stop service. Data /opt/kyt-web dan database TIDAK dihapus.
+wget() { command wget -4 "$@"; }
+curl() { command curl -4 "$@"; }
+export -f wget curl 2>/dev/null || true
+
+CONF="/etc/kyt-web.conf"
+SERVICE="kyt-web"
+APP="/opt/kyt-web/app.py"
+REPO="${KYT_REPO:-https://scvpn.jolang323.workers.dev}"
+ZIP_URL="${REPO%/}/web/web.zip"
+FALLBACK="https://raw.githubusercontent.com/victor3232/xhttp/main/web/web.zip"
+
+RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[0;33m'; NC=$'\033[0m'
+B=$'\033[1m'
+
+conf_get() {
+    awk -F= -v k="$1" '$1==k {sub(/^[^=]*=/,""); print; exit}' "$CONF" 2>/dev/null
+}
+conf_set() {
+    local key="$1" val="$2"
+    touch "$CONF"
+    if grep -qE "^${key}=" "$CONF" 2>/dev/null; then
+        sed -i "s|^${key}=.*|${key}=${val}|" "$CONF"
+    else
+        printf '%s=%s\n' "$key" "$val" >> "$CONF"
+    fi
+}
+ensure_conf() {
+    [ -f "$CONF" ] || : > "$CONF"
+    grep -qE '^ENABLED=' "$CONF" || echo 'ENABLED=0' >> "$CONF"
+    grep -qE '^DOMAIN=' "$CONF" || echo 'DOMAIN=' >> "$CONF"
+    chmod 644 "$CONF" 2>/dev/null
+}
+default_domain() {
+    local base
+    base=$(cat /etc/xray/domain 2>/dev/null | tr -d '\r\n')
+    [ -n "$base" ] && echo "web.$base" || echo ""
+}
+is_installed() { [ -s "$APP" ] && [ -d /opt/kyt-web/static ]; }
+is_active() { systemctl is-active --quiet "$SERVICE"; }
+
+status_line() {
+    ensure_conf
+    local en dom act boot code
+    en=$(conf_get ENABLED); dom=$(conf_get DOMAIN)
+    act=$(systemctl is-active "$SERVICE" 2>/dev/null || true)
+    boot=$(systemctl is-enabled "$SERVICE" 2>/dev/null || true)
+    printf '  Status data   : %s\n' "${en:-0}"
+    printf '  Service       : %s  (boot: %s)\n' "${act:-unknown}" "${boot:-unknown}"
+    printf '  Domain        : %s\n' "${dom:--}"
+    if [ -n "$dom" ]; then
+        code=$(curl -k -sS --max-time 8 -o /dev/null -w '%{http_code}' "https://$dom/healthz" 2>/dev/null || true)
+        printf '  Health HTTPS  : %s\n' "${code:-000}"
+    fi
+    printf '  Aplikasi      : %s\n' "$(is_installed && echo terpasang || echo belum terpasang)"
+}
+
+install_web() {
+    local dom tmp pkg
+    dom=$(conf_get DOMAIN)
+    if [ -z "$dom" ]; then
+        local def
+        def=$(default_domain)
+        read -rp "  Domain website${def:+ [$def]}: " dom
+        [ -z "$dom" ] && dom="$def"
+    fi
+    if [ -z "$dom" ]; then
+        echo -e "  ${RED}Domain wajib diisi.${NC}"
+        return 1
+    fi
+    echo -e "  ${YELLOW}Website belum terpasang. Mengunduh paket web.zip...${NC}"
+    tmp=$(mktemp -d /tmp/kyt-web-install.XXXXXX)
+    if ! curl -fsSL --max-time 120 -o "$tmp/web.zip" "${ZIP_URL}?v=$(date +%s)" 2>/dev/null; then
+        wget -q --timeout=60 -O "$tmp/web.zip" "$FALLBACK" 2>/dev/null || true
+    fi
+    if [ ! -s "$tmp/web.zip" ]; then
+        echo -e "  ${RED}Gagal mengunduh web.zip.${NC}"
+        rm -rf "$tmp"; return 1
+    fi
+    mkdir -p "$tmp/pkg"
+    if ! unzip -oq "$tmp/web.zip" -d "$tmp/pkg" 2>/dev/null; then
+        echo -e "  ${RED}web.zip rusak / gagal diekstrak.${NC}"
+        rm -rf "$tmp"; return 1
+    fi
+    # Dukung dua gaya arsip: file di root atau di dalam folder web/.
+    pkg="$tmp/pkg"
+    if [ ! -f "$pkg/install.sh" ] && [ -f "$pkg/web/install.sh" ]; then
+        pkg="$pkg/web"
+    fi
+    if [ ! -f "$pkg/install.sh" ]; then
+        echo -e "  ${RED}install.sh tidak ditemukan di dalam web.zip.${NC}"
+        rm -rf "$tmp"; return 1
+    fi
+    if ! bash "$pkg/install.sh" "$dom"; then
+        echo -e "  ${RED}Instalasi website gagal.${NC}"
+        rm -rf "$tmp"; return 1
+    fi
+    conf_set DOMAIN "$dom"
+    rm -rf "$tmp"
+}
+
+turn_on() {
+    ensure_conf
+    if ! is_installed; then
+        install_web || return 1
+    fi
+    systemctl daemon-reload >/dev/null 2>&1
+    systemctl enable "$SERVICE" >/dev/null 2>&1
+    systemctl start "$SERVICE" >/dev/null 2>&1
+    sleep 2
+    if is_active; then
+        conf_set ENABLED 1
+        echo -e "  ${GREEN}Website ON.${NC} Service $SERVICE aktif."
+        return 0
+    fi
+    echo -e "  ${RED}Website gagal start. Cek: journalctl -u $SERVICE -n 30${NC}"
+    return 1
+}
+
+turn_off() {
+    ensure_conf
+    systemctl disable --now "$SERVICE" >/dev/null 2>&1
+    conf_set ENABLED 0
+    echo -e "  ${YELLOW}Website OFF.${NC} Service dihentikan; data dan database tetap disimpan."
+}
+
+test_access() {
+    ensure_conf
+    local dom code
+    dom=$(conf_get DOMAIN)
+    if [ -z "$dom" ]; then
+        echo -e "  ${YELLOW}Domain belum diatur.${NC}"; return 1
+    fi
+    code=$(curl -k -sS --max-time 10 -o /dev/null -w '%{http_code}' "https://$dom/healthz" 2>/dev/null || true)
+    echo "  https://$dom  -> HTTP ${code:-000}"
+}
+
+interactive() {
+    while true; do
+        clear
+        echo -e "${B}=========================================================${NC}"
+        echo -e "                 ${B}SETTING WEBSITE${NC}"
+        echo -e "${B}=========================================================${NC}"
+        status_line
+        echo -e "${B}=========================================================${NC}"
+        echo "  1) ON  — install jika perlu, lalu jalankan website"
+        echo "  2) OFF — stop + disable, data tetap aman"
+        echo "  3) Tes akses domain"
+        echo "  0) Kembali"
+        echo -e "${B}=========================================================${NC}"
+        read -rp "  Pilih [0-3]: " p
+        case "$p" in
+            1) turn_on; read -rp "  Enter..." _ ;;
+            2) turn_off; read -rp "  Enter..." _ ;;
+            3) test_access; read -rp "  Enter..." _ ;;
+            0) return 0 ;;
+            *) ;;
+        esac
+    done
+}
+
+ensure_conf
+case "${1:-}" in
+    on|ON|1) turn_on ;;
+    off|OFF|0|2) turn_off ;;
+    status) status_line ;;
+    test) test_access ;;
+    "" ) interactive ;;
+    *) echo "Usage: setting-web [on|off|status|test]"; exit 64 ;;
+esac
