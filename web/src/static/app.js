@@ -535,6 +535,25 @@
     }
   }
 
+  $$(".cf-turnstile").forEach(function (widget) {
+    var status = widget.parentElement ? widget.parentElement.querySelector("[data-turnstile-status]") : null;
+    if (!status) return;
+    var tries = 0;
+    var timer = window.setInterval(function () {
+      var input = widget.querySelector('input[name="cf-turnstile-response"]');
+      if (input && input.value) {
+        status.textContent = "Verifikasi keamanan selesai ✓";
+        status.classList.add("ok");
+        status.classList.remove("bad");
+        window.clearInterval(timer);
+      } else if (++tries > 40) {
+        status.textContent = "Verifikasi belum selesai. Muat ulang halaman atau matikan pemblokir.";
+        status.classList.add("bad");
+        window.clearInterval(timer);
+      }
+    }, 500);
+  });
+
   var logoInput = $("#brand-logo-input");
   if (logoInput) {
     logoInput.addEventListener("change", function () {

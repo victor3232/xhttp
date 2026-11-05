@@ -1158,6 +1158,8 @@ td b { font-family: var(--font-mono); font-size: 10.5px; }
 }
 .turnstile-box .cf-turnstile { display: flex; justify-content: center; }
 .turnstile-box small { display: block; margin-top: 8px; color: var(--muted-2); font-size: 9.5px; }
+.turnstile-status.ok { color: var(--green) !important; font-weight: 700; }
+.turnstile-status.bad { color: var(--red) !important; font-weight: 700; }
 .premium-turnstile { margin: 14px 0 0; }
 .premium-turnstile + .btn-premium { margin-top: 12px; }
 

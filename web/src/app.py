@@ -1754,11 +1754,19 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "strict-origin-when-cross-origin")
         self.send_header("Permissions-Policy", "geolocation=(), microphone=(), camera=()")
+        if content_type.startswith("text/html"):
+            self.send_header("Cache-Control", "no-store")
         self.send_header(
             "Content-Security-Policy",
             "default-src 'self'; base-uri 'self'; frame-ancestors 'none'; "
-            "form-action 'self'; img-src 'self' data:; font-src 'self'; "
-            "style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src 'self'",
+            "form-action 'self'; "
+            "img-src 'self' data: blob: https://challenges.cloudflare.com; "
+            "font-src 'self' https://challenges.cloudflare.com; "
+            "style-src 'self' 'unsafe-inline' https://challenges.cloudflare.com; "
+            "script-src 'self' https://challenges.cloudflare.com; "
+            "connect-src 'self' https://challenges.cloudflare.com; "
+            "frame-src https://challenges.cloudflare.com; "
+            "worker-src 'self' blob:",
         )
         if extra_headers:
             for key, value in extra_headers.items():
@@ -2933,7 +2941,7 @@ def render_free_page(form_token: str, settings: dict[str, str]) -> str:
     ts_widget = (
         '<div class="turnstile-box">'
         f'<div class="cf-turnstile" data-sitekey="{e(ts_site)}" data-theme="light" data-language="id" data-size="flexible"></div>'
-        '<small>Verifikasi keamanan wajib sebelum akun dibuat.</small>'
+        '<small class="turnstile-status" data-turnstile-status>Memuat verifikasi keamanan…</small>'
         '</div>'
         if ts_on
         else ""
@@ -3045,7 +3053,7 @@ def render_premium_page(form_token: str, settings: dict[str, str]) -> str:
     ts_widget = (
         '<div class="turnstile-box premium-turnstile">'
         f'<div class="cf-turnstile" data-sitekey="{e(ts_site)}" data-theme="light" data-language="id" data-size="flexible"></div>'
-        '<small>Verifikasi keamanan wajib sebelum invoice dibuat.</small>'
+        '<small class="turnstile-status" data-turnstile-status>Memuat verifikasi keamanan…</small>'
         '</div>'
         if ts_on
         else ""
