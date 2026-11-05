@@ -39,7 +39,7 @@ default_domain() {
     base=$(cat /etc/xray/domain 2>/dev/null | tr -d '\r\n')
     [ -n "$base" ] && echo "web.$base" || echo ""
 }
-is_installed() { [ -s "$APP" ] && [ -d /opt/kyt-web/static ]; }
+is_installed() { [ -s "$APP" ] && [ -d /opt/kyt-web/static ] && [ -s /etc/systemd/system/kyt-web.service ]; }
 is_active() { systemctl is-active --quiet "$SERVICE"; }
 
 status_line() {
@@ -106,6 +106,17 @@ turn_on() {
     ensure_conf
     if ! is_installed; then
         install_web || return 1
+    fi
+    if [ -z "$(conf_get DOMAIN)" ]; then
+        local def dom
+        def=$(default_domain)
+        read -rp "  Domain website${def:+ [$def]}: " dom
+        [ -z "$dom" ] && dom="$def"
+        if [ -z "$dom" ]; then
+            echo -e "  ${RED}Domain wajib diisi.${NC}"
+            return 1
+        fi
+        conf_set DOMAIN "$dom"
     fi
     systemctl daemon-reload >/dev/null 2>&1
     systemctl enable "$SERVICE" >/dev/null 2>&1
