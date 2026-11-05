@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-VPNFree - website pembuatan akun SSH & Xray untuk VPS KYT.
+HITS SSH - website pembuatan akun SSH & Xray untuk VPS KYT.
 
 Prinsip:
 - Tidak menyentuh akun yang sudah ada. Hanya membuat akun baru berprefix acak,
@@ -20,6 +20,7 @@ import fcntl
 import hashlib
 import hmac
 import html
+import io
 import ipaddress
 import json
 import logging
@@ -38,7 +39,9 @@ import sys
 import threading
 import time
 import traceback
+import urllib.error
 import urllib.parse
+import urllib.request
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
@@ -72,7 +75,7 @@ def read_web_conf() -> dict[str, str]:
 
 _WEB_CONF = read_web_conf()
 PUBLIC_HOST = _WEB_CONF.get("DOMAIN", "vpnfree.stunnelv4.biz.id") or "vpnfree.stunnelv4.biz.id"
-BRAND = "VPNFree"
+BRAND = "HITS SSH"
 FORM_COOKIE = "kyt_form"
 ADMIN_COOKIE = "kyt_admin"
 SESSION_TTL = 8 * 3600
@@ -128,6 +131,10 @@ MIHOMO_STATE = Path("/etc/kyt/jeda-mullog")
 DEFAULTS = {
     "site_name": BRAND,
     "maintenance": "0",
+    "free_enabled": "1",
+    "premium_enabled": "1",
+    "premium_expiry_min": "15",
+    "gopay_base_url": "http://pgku.stunnelv4.biz.id",
     "ssh_enabled": "1",
     "xray_enabled": "1",
     "vmess_enabled": "1",
@@ -154,6 +161,7 @@ INT_SETTINGS = {
     "xray_daily_3": (0, 1000),
     "xray_daily_7": (0, 1000),
     "per_ip_daily": (0, 1000),
+    "premium_expiry_min": (5, 120),
 }
 
 USER_RE = re.compile(r"^[a-z][a-z0-9]{7,14}$")
@@ -294,28 +302,93 @@ def init_db() -> None:
                 detail TEXT NOT NULL DEFAULT '',
                 ip TEXT NOT NULL DEFAULT ''
             );
+            CREATE TABLE IF NOT EXISTS premium_products (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT UNIQUE NOT NULL,
+                protocol TEXT NOT NULL,
+                label TEXT NOT NULL,
+                days INTEGER NOT NULL,
+                price INTEGER NOT NULL,
+                ip_limit INTEGER NOT NULL DEFAULT 2,
+                quota_gb INTEGER NOT NULL DEFAULT 0,
+                active INTEGER NOT NULL DEFAULT 1,
+                sort INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                invoice TEXT UNIQUE NOT NULL,
+                product_code TEXT NOT NULL,
+                protocol TEXT NOT NULL,
+                days INTEGER NOT NULL,
+                price INTEGER NOT NULL,
+                unique_code INTEGER NOT NULL,
+                total INTEGER NOT NULL,
+                ip_limit INTEGER NOT NULL DEFAULT 2,
+                quota_gb INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'PENDING',
+                qr_string TEXT NOT NULL DEFAULT '',
+                buyer_ip TEXT NOT NULL DEFAULT '',
+                user_agent TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                paid_at INTEGER,
+                reference TEXT NOT NULL DEFAULT '',
+                account_username TEXT NOT NULL DEFAULT '',
+                account_output TEXT NOT NULL DEFAULT '',
+                provision_error TEXT NOT NULL DEFAULT '',
+                notified INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status, created_at);
+            CREATE INDEX IF NOT EXISTS idx_orders_total ON orders(total, created_at);
+            CREATE INDEX IF NOT EXISTS idx_orders_reference ON orders(reference);
+            CREATE TABLE IF NOT EXISTS pay_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL DEFAULT ''
+            );
             """
         )
         for k, v in DEFAULTS.items():
             conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k, v))
+        if not conn.execute("SELECT 1 FROM premium_products LIMIT 1").fetchone():
+            labels = {"ssh": "SSH", "vmess": "VMess", "vless": "VLESS", "trojan": "Trojan"}
+            durations = [(3, 1000), (7, 2500), (30, 10000)]
+            order = 0
+            for proto in ("ssh", "vmess", "vless", "trojan"):
+                for days, price in durations:
+                    order += 10
+                    conn.execute(
+                        "INSERT OR IGNORE INTO premium_products"
+                        "(code,protocol,label,days,price,ip_limit,quota_gb,active,sort,updated_at)"
+                        " VALUES(?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            f"{proto}-{days}",
+                            proto,
+                            f"{labels[proto]} {days} Hari",
+                            days,
+                            price,
+                            2,
+                            0,
+                            1,
+                            order,
+                            int(time.time()),
+                        ),
+                    )
         row = conn.execute("SELECT username FROM admin LIMIT 1").fetchone()
         if not row:
-            password = secrets.token_urlsafe(14)
-            username = "admin"
             conn.execute(
                 "INSERT INTO admin(username,password_hash,updated_at) VALUES(?,?,?)",
-                (username, hash_password(password), int(time.time())),
+                ("admin", hash_password(secrets.token_urlsafe(32)), int(time.time())),
             )
             ADMIN_CRED_PATH.write_text(
-                "VPNFree admin\n"
-                f"URL      : https://{PUBLIC_HOST}/admin\n"
-                f"Username : {username}\n"
-                f"Password : {password}\n"
-                "\nGanti password setelah login pertama.\n",
+                "HITS SSH admin\n"
+                f"URL    : https://{PUBLIC_HOST}/admin\n"
+                "Login  : token bot Telegram\n"
+                "Token  : awk '/^#bot# /{print $2}' /etc/bot/.bot.db\n",
                 encoding="utf-8",
             )
             os.chmod(ADMIN_CRED_PATH, 0o600)
-            logger.info("admin awal dibuat; kredensial di %s", ADMIN_CRED_PATH)
+            logger.info("admin awal dibuat; login memakai token bot")
         conn.commit()
     finally:
         conn.close()
@@ -716,6 +789,8 @@ def create_account(service: str, protocol: str, days: int, ip: str, user_agent: 
     quota = quota_state(settings)
     if settings.get("maintenance") == "1":
         raise ValueError("Website sedang dalam perawatan. Silakan coba lagi nanti.")
+    if settings.get("free_enabled", "1") != "1":
+        raise ValueError("Kategori akun gratis sedang ditutup admin.")
     if not settings.get(f"{service}_enabled") == "1":
         raise ValueError(f"Layanan {SERVICES[service]['label']} sedang dinonaktifkan admin.")
     if service == "xray" and settings.get(f"{protocol}_enabled", "1") != "1":
@@ -832,12 +907,650 @@ def delete_account_record(row: sqlite3.Row) -> None:
         conn.close()
 
 
+# ===========================================================================
+# HITS SSH Premium — GoPay/QRIS, invoice, dan provisioning
+# ===========================================================================
+
+BOT_DB_LINE = Path("/etc/bot/.bot.db")
+BOT_KYT_DB = Path("/usr/bin/kyt/database.db")
+GOPAY_TOKEN_FILE = Path("/usr/bin/kyt/gomerch_token.json")
+GOPAY_DEFAULT_BASE = "http://pgku.stunnelv4.biz.id"
+GOPAY_LOCK = threading.Lock()
+_GOPAY_CACHE = {"ts": 0.0, "rows": []}
+_GOPAY_RATE_UNTIL = 0.0
+_GOPAY_REFRESH_AT = 0.0
+
+
+def bot_credentials() -> tuple[str, str]:
+    try:
+        with open(BOT_DB_LINE, "r", errors="ignore") as fh:
+            for line in fh:
+                if line.startswith("#bot# "):
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        return parts[1].strip(), parts[2].strip()
+    except FileNotFoundError:
+        pass
+    return "", ""
+
+
+def admin_login_token() -> str:
+    token, _chat = bot_credentials()
+    if token:
+        return token
+    conf = read_web_conf()
+    return (conf.get("ADMIN_TOKEN") or "").strip()
+
+
+def pay_state_set(key: str, value: str) -> None:
+    conn = db_connect()
+    try:
+        conn.execute(
+            "INSERT INTO pay_state(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, str(value)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def pay_state_get(key: str, default: str = "") -> str:
+    conn = db_connect()
+    try:
+        row = conn.execute("SELECT value FROM pay_state WHERE key=?", (key,)).fetchone()
+        return str(row["value"]) if row else default
+    finally:
+        conn.close()
+
+
+def bot_setting(key: str, default: str = "") -> str:
+    if not BOT_KYT_DB.exists():
+        return default
+    try:
+        conn = sqlite3.connect(f"file:{BOT_KYT_DB}?mode=ro", uri=True, timeout=5)
+        try:
+            row = conn.execute("SELECT v FROM settings WHERE k=?", (key,)).fetchone()
+            return str(row[0]) if row and row[0] is not None else default
+        finally:
+            conn.close()
+    except Exception:
+        return default
+
+
+def telegram_send(text: str) -> bool:
+    token, chat = bot_credentials()
+    if not token or not chat:
+        return False
+    data = urllib.parse.urlencode(
+        {
+            "chat_id": chat,
+            "text": text,
+            "parse_mode": "HTML",
+            "disable_web_page_preview": "1",
+        }
+    ).encode("utf-8")
+    try:
+        req = urllib.request.Request(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data=data,
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=10).read(1)
+        return True
+    except Exception as exc:
+        logger.warning("telegram premium gagal: %s", exc)
+        return False
+
+
+def gopay_config() -> dict:
+    token = refresh = ""
+    try:
+        with open(GOPAY_TOKEN_FILE, "r", errors="ignore") as fh:
+            data = json.load(fh) or {}
+            token = str(data.get("token") or "").strip()
+            refresh = str(data.get("refresh_token") or "").strip()
+    except Exception:
+        pass
+    if not token:
+        token = bot_setting("gomerch_token", "").strip()
+    if not refresh:
+        refresh = bot_setting("gomerch_refresh_token", "").strip()
+    base = (bot_setting("gomerch_base_url", "") or get_settings().get("gopay_base_url", "") or GOPAY_DEFAULT_BASE).rstrip("/")
+    static_qr = bot_setting("gomerch_static_qr", "").strip()
+    return {
+        "base": base,
+        "token": token,
+        "refresh_token": refresh,
+        "static_qr": static_qr,
+        "phone": bot_setting("gomerch_phone", "").strip(),
+    }
+
+
+def gopay_ready() -> tuple[bool, str]:
+    cfg = gopay_config()
+    if not cfg["static_qr"]:
+        return False, "QRIS GoPay belum diatur di bot."
+    if not cfg["token"]:
+        return False, "Token GoPay belum ada. Login GoPay lewat bot."
+    return True, ""
+
+
+def _crc16(data: str) -> str:
+    crc = 0xFFFF
+    for ch in data:
+        crc ^= ord(ch) << 8
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
+            else:
+                crc = (crc << 1) & 0xFFFF
+    return "%04X" % (crc & 0xFFFF)
+
+
+def gopay_build_qris(amount: int) -> str:
+    static_qr = gopay_config()["static_qr"]
+    if not static_qr:
+        return ""
+    body = static_qr[:-4].replace("010211", "010212", 1)
+    parts = body.split("5802ID")
+    amount_str = str(int(amount))
+    amount_field = "54" + "%02d" % len(amount_str) + amount_str
+    payload = parts[0] + amount_field + "5802ID" + parts[1]
+    return payload + _crc16(payload)
+
+
+def gopay_history(force: bool = False) -> list:
+    global _GOPAY_CACHE, _GOPAY_RATE_UNTIL
+    if time.time() < _GOPAY_RATE_UNTIL:
+        return []
+    with GOPAY_LOCK:
+        now = time.time()
+        if not force and _GOPAY_CACHE["rows"] and now - _GOPAY_CACHE["ts"] < 8:
+            return _GOPAY_CACHE["rows"]
+        cfg = gopay_config()
+        if not cfg["token"]:
+            pay_state_set("gopay_error", "Token GoPay kosong")
+            return []
+        url = cfg["base"] + "/api/history?" + urllib.parse.urlencode({"token": cfg["token"]})
+        try:
+            with urllib.request.urlopen(url, timeout=20) as resp:
+                raw = resp.read().decode("utf-8", "replace")
+                data = json.loads(raw)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 429:
+                _GOPAY_RATE_UNTIL = time.time() + 16 * 60
+                pay_state_set("gopay_error", "Rate limit GoPay (429), tunggu 16 menit")
+            elif exc.code in (400, 401):
+                pay_state_set("gopay_error", "Token GoPay expired; refresh lewat bot")
+                pay_state_set("gopay_token_invalid", str(int(time.time())))
+            else:
+                pay_state_set("gopay_error", f"HTTP {exc.code} dari gateway")
+            logger.warning("gopay history HTTP %s", exc.code)
+            return []
+        except Exception as exc:
+            pay_state_set("gopay_error", f"Gagal koneksi gateway: {exc}")
+            logger.warning("gopay history error: %s", exc)
+            return []
+        if not data.get("success"):
+            pay_state_set("gopay_error", "Gateway menolak history GoPay")
+            return []
+        rows = data.get("data") or []
+        _GOPAY_CACHE = {"ts": time.time(), "rows": rows}
+        pay_state_set("gopay_last_check", str(int(time.time())))
+        pay_state_set("gopay_error", "")
+        pay_state_set("gopay_token_invalid", "")
+        pay_state_set("gopay_last_ok", str(int(time.time())))
+        return rows
+
+
+def _parse_tx_time(value) -> float:
+    if value is None:
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value) / (1000.0 if value > 1e11 else 1.0)
+    s = str(value).strip()
+    if not s:
+        return 0.0
+    try:
+        return dt.datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return dt.datetime.strptime(s[:19], fmt).replace(tzinfo=JAKARTA).timestamp()
+        except Exception:
+            pass
+    return 0.0
+
+
+def gopay_match(total: int, created_at: int, used: set[str]) -> str:
+    for tx in gopay_history():
+        if not isinstance(tx, dict):
+            continue
+        status = str(tx.get("status") or "").lower()
+        if not re.search(r"success|settled|completed", status):
+            continue
+        try:
+            nominal = int(tx.get("amount") or 0)
+        except Exception:
+            nominal = 0
+        if nominal != int(total):
+            continue
+        txid = str(tx.get("id") or tx.get("reference_id") or "").strip()
+        if not txid or txid in used:
+            continue
+        tx_ts = _parse_tx_time(tx.get("time") or tx.get("created_at"))
+        if tx_ts and tx_ts < (created_at - 120):
+            continue
+        return txid
+    return ""
+
+
+def gopay_qr_svg(qr_string: str) -> bytes:
+    if not qr_string:
+        return b""
+    try:
+        import qrcode
+        import qrcode.image.svg
+
+        img = qrcode.make(
+            qr_string,
+            image_factory=qrcode.image.svg.SvgPathImage,
+            box_size=10,
+            border=2,
+        )
+        buf = io.BytesIO()
+        img.save(buf)
+        return buf.getvalue()
+    except Exception as exc:
+        logger.warning("qrcode gagal: %s", exc)
+        return b""
+
+
+def premium_products(active_only: bool = False) -> list[sqlite3.Row]:
+    conn = db_connect()
+    try:
+        sql = "SELECT * FROM premium_products"
+        if active_only:
+            sql += " WHERE active=1"
+        sql += " ORDER BY sort, id"
+        return conn.execute(sql).fetchall()
+    finally:
+        conn.close()
+
+
+def premium_product(code: str, active_only: bool = True) -> sqlite3.Row | None:
+    conn = db_connect()
+    try:
+        sql = "SELECT * FROM premium_products WHERE code=?"
+        if active_only:
+            sql += " AND active=1"
+        return conn.execute(sql, (code,)).fetchone()
+    finally:
+        conn.close()
+
+
+def premium_public_data() -> dict:
+    products = []
+    for row in premium_products(active_only=True):
+        products.append(
+            {
+                "code": row["code"],
+                "protocol": row["protocol"],
+                "label": row["label"],
+                "days": row["days"],
+                "price": row["price"],
+                "ip_limit": row["ip_limit"],
+                "quota_gb": row["quota_gb"],
+            }
+        )
+    return {"products": products}
+
+
+def _invoice_code() -> str:
+    alphabet = string.ascii_uppercase + string.digits
+    for _ in range(30):
+        code = "HITS-" + now_jkt().strftime("%y%m%d") + "-" + "".join(secrets.choice(alphabet) for _ in range(8))
+        conn = db_connect()
+        try:
+            if not conn.execute("SELECT 1 FROM orders WHERE invoice=?", (code,)).fetchone():
+                return code
+        finally:
+            conn.close()
+    raise RuntimeError("gagal membuat kode invoice")
+
+
+def _allocate_total(price: int) -> tuple[int, int]:
+    since = int(time.time()) - 7 * 86400
+    conn = db_connect()
+    try:
+        used = {
+            int(r["total"])
+            for r in conn.execute("SELECT total FROM orders WHERE created_at>=?", (since,))
+        }
+    finally:
+        conn.close()
+    bot_amounts: set[int] = set()
+    if BOT_KYT_DB.exists():
+        try:
+            bconn = sqlite3.connect(f"file:{BOT_KYT_DB}?mode=ro", uri=True, timeout=5)
+            try:
+                for r in bconn.execute(
+                    "SELECT amount FROM deposit WHERE status IN ('PENDING','PAID') AND created>=datetime('now','-2 days')"
+                ):
+                    try:
+                        bot_amounts.add(int(r[0]))
+                    except Exception:
+                        pass
+            finally:
+                bconn.close()
+        except Exception:
+            pass
+    for code in range(1, 1000):
+        total = int(price) + code
+        if total not in used and total not in bot_amounts:
+            return code, total
+    raise ValueError("Nomor unik invoice habis sementara. Coba lagi beberapa saat.")
+
+
+def order_by_invoice(invoice: str) -> sqlite3.Row | None:
+    conn = db_connect()
+    try:
+        return conn.execute("SELECT * FROM orders WHERE invoice=?", (invoice,)).fetchone()
+    finally:
+        conn.close()
+
+
+def create_premium_order(product_code: str, ip: str, user_agent: str) -> sqlite3.Row:
+    settings = get_settings()
+    if settings.get("maintenance") == "1":
+        raise ValueError("Website sedang dalam perawatan. Silakan coba lagi nanti.")
+    if settings.get("premium_enabled", "1") != "1":
+        raise ValueError("Kategori Premium sedang ditutup admin.")
+    product = premium_product(product_code, active_only=True)
+    if not product:
+        raise ValueError("Paket premium tidak tersedia.")
+    if product["protocol"] == "ssh" and settings.get("ssh_enabled", "1") != "1":
+        raise ValueError("Protokol SSH sedang ditutup admin.")
+    if product["protocol"] in PROTOCOLS and (
+        settings.get("xray_enabled", "1") != "1"
+        or settings.get(f"{product['protocol']}_enabled", "1") != "1"
+    ):
+        raise ValueError(f"Protokol {PROTOCOLS[product['protocol']]['label']} sedang ditutup admin.")
+    ready, reason = gopay_ready()
+    if not ready:
+        raise ValueError(reason)
+    conn = db_connect()
+    try:
+        active = conn.execute(
+            "SELECT COUNT(*) n FROM orders WHERE buyer_ip=? AND status IN ('PENDING','PAID','PROVISIONING') AND created_at>=?",
+            (ip, int(time.time()) - 3600),
+        ).fetchone()["n"]
+    finally:
+        conn.close()
+    if int(active) >= 3:
+        raise ValueError("Terlalu banyak invoice aktif dari IP Anda. Selesaikan atau tunggu invoice lama kedaluwarsa.")
+
+    unique_code, total = _allocate_total(int(product["price"]))
+    qr = gopay_build_qris(total)
+    if not qr:
+        raise ValueError("Gagal membuat QRIS GoPay. Hubungi admin.")
+    invoice = _invoice_code()
+    now = int(time.time())
+    expires = now + int(settings.get("premium_expiry_min", "15")) * 60
+    conn = db_connect()
+    try:
+        conn.execute(
+            "INSERT INTO orders(invoice,product_code,protocol,days,price,unique_code,total,"
+            "ip_limit,quota_gb,status,qr_string,buyer_ip,user_agent,created_at,expires_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?,'PENDING',?,?,?,?,?)",
+            (
+                invoice,
+                product["code"],
+                product["protocol"],
+                product["days"],
+                product["price"],
+                unique_code,
+                total,
+                product["ip_limit"],
+                product["quota_gb"],
+                qr,
+                ip,
+                user_agent[:300],
+                now,
+                expires,
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    audit("premium_invoice", f"{invoice} {product['code']} total={total} ip={ip}", ip)
+    return order_by_invoice(invoice)
+
+
+def premium_order_notify(row: sqlite3.Row, ok: bool, error: str = "") -> None:
+    label = f"{row['protocol'].upper()} · {row['days']} hari"
+    if ok:
+        text = (
+            "<b>✅ HITS SSH PREMIUM TERJUAL</b>\n"
+            f"Invoice : <code>{e(row['invoice'])}</code>\n"
+            f"Paket   : <code>{e(label)}</code>\n"
+            f"Total   : <code>Rp {int(row['total']):,}</code>\n"
+            f"Akun    : <code>{e(row['account_username'])}</code>\n"
+            "Status  : <code>AKTIF</code>"
+        ).replace(",", ".")
+    else:
+        text = (
+            "<b>⚠️ PEMBAYARAN MASUK, AKUN GAGAL</b>\n"
+            f"Invoice : <code>{e(row['invoice'])}</code>\n"
+            f"Paket   : <code>{e(label)}</code>\n"
+            f"Total   : <code>Rp {int(row['total']):,}</code>\n"
+            f"Error   : <code>{e((error or 'tidak diketahui')[:300])}</code>\n"
+            "Silakan retry dari Admin Dashboard."
+        ).replace(",", ".")
+    telegram_send(text)
+
+
+def provision_premium_order(invoice: str) -> bool:
+    global CREATE_LOCK
+    with CREATE_LOCK:
+        row = order_by_invoice(invoice)
+        if not row:
+            return False
+        if row["status"] == "COMPLETED" and row["account_output"]:
+            return True
+        if not row["reference"] and not row["paid_at"]:
+            logger.warning("provision %s ditolak: belum ada pembayaran", invoice)
+            return False
+        if row["protocol"] in PROTOCOLS:
+            username = make_username("xray", row["protocol"])
+            password = ""
+            ok, output, log = create_xray_account(
+                row["protocol"],
+                username,
+                int(row["days"]),
+                int(row["ip_limit"]),
+                int(row["quota_gb"]),
+            )
+        else:
+            username = make_username("ssh", "")
+            password = make_password()
+            ok, output, log = create_ssh_account(
+                username,
+                password,
+                int(row["days"]),
+                int(row["ip_limit"]),
+                int(row["quota_gb"]),
+            )
+        conn = db_connect()
+        try:
+            if ok:
+                conn.execute(
+                    "UPDATE orders SET status='COMPLETED', account_username=?, account_output=?,"
+                    " provision_error='', notified=1 WHERE invoice=?",
+                    (username, output, invoice),
+                )
+            else:
+                conn.execute(
+                    "UPDATE orders SET status='FAILED', provision_error=?, notified=1 WHERE invoice=?",
+                    ((output or "gagal membuat akun")[:1000], invoice),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        fresh = order_by_invoice(invoice)
+        if fresh:
+            premium_order_notify(fresh, bool(ok), "" if ok else (output or ""))
+            audit("premium_provision", f"{invoice} {username} {'ok' if ok else 'gagal'}", row["buyer_ip"])
+        return bool(ok)
+
+
+def retry_premium_order(invoice: str) -> bool:
+    row = order_by_invoice(invoice)
+    if not row or not (row["reference"] or row["paid_at"]):
+        return False
+    if row["status"] == "COMPLETED":
+        return True
+    conn = db_connect()
+    try:
+        conn.execute("UPDATE orders SET status='PAID', provision_error='' WHERE invoice=?", (invoice,))
+        conn.commit()
+    finally:
+        conn.close()
+    return provision_premium_order(invoice)
+
+
+def _bot_paid_references() -> set[str]:
+    if not BOT_KYT_DB.exists():
+        return set()
+    try:
+        conn = sqlite3.connect(f"file:{BOT_KYT_DB}?mode=ro", uri=True, timeout=5)
+        try:
+            return {str(r[0]) for r in conn.execute("SELECT reference FROM deposit WHERE status='PAID' AND reference IS NOT NULL AND reference!=''")}
+        finally:
+            conn.close()
+    except Exception:
+        return set()
+
+
+def expire_premium_orders() -> int:
+    conn = db_connect()
+    try:
+        cur = conn.execute(
+            "UPDATE orders SET status='EXPIRED' WHERE status='PENDING' AND expires_at<?",
+            (int(time.time()),),
+        )
+        conn.commit()
+        return int(cur.rowcount or 0)
+    finally:
+        conn.close()
+
+
+def poll_premium_orders() -> None:
+    expire_premium_orders()
+    conn = db_connect()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM orders WHERE status IN ('PENDING','EXPIRED','PAID','FAILED')"
+            " AND created_at>=? ORDER BY created_at ASC",
+            (int(time.time()) - 48 * 86400,),
+        ).fetchall()
+        refs = {
+            str(r["reference"])
+            for r in conn.execute(
+                "SELECT reference FROM orders WHERE reference IS NOT NULL AND reference!=''"
+            )
+        }
+    finally:
+        conn.close()
+    pending = [r for r in rows if r["status"] in ("PENDING", "EXPIRED") and not r["reference"]]
+    if not pending:
+        pay_state_set("gopay_pending", "0")
+        return
+    ready, reason = gopay_ready()
+    if not ready:
+        pay_state_set("gopay_error", reason)
+        return
+    history = gopay_history()
+    if not history:
+        pay_state_set("gopay_pending", str(len(pending)))
+        return
+    used = set(refs) | _bot_paid_references()
+    matched = 0
+    for row in pending:
+        txid = gopay_match(int(row["total"]), int(row["created_at"]), used)
+        if not txid:
+            continue
+        used.add(txid)
+        conn = db_connect()
+        try:
+            conn.execute(
+                "UPDATE orders SET status='PAID', reference=?, paid_at=? WHERE invoice=? AND reference=''",
+                (txid, int(time.time()), row["invoice"]),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        audit("premium_paid", f"{row['invoice']} ref={txid} total={row['total']}", row["buyer_ip"])
+        matched += 1
+        logger.info("premium paid %s ref=%s", row["invoice"], txid)
+        provision_premium_order(row["invoice"])
+    pay_state_set("gopay_pending", str(max(0, len(pending) - matched)))
+    pay_state_set("gopay_last_match", str(int(time.time())) if matched else pay_state_get("gopay_last_match"))
+
+
+def payment_daemon() -> None:
+    time.sleep(5)
+    while True:
+        try:
+            poll_premium_orders()
+        except Exception:
+            logger.error("payment daemon: %s", traceback.format_exc())
+        time.sleep(10)
+
+
+def premium_stats() -> dict:
+    conn = db_connect()
+    try:
+        today = int(time.time()) - 86400
+        total_paid = conn.execute("SELECT COUNT(*) n FROM orders WHERE status='COMPLETED'").fetchone()["n"]
+        revenue = conn.execute("SELECT COALESCE(SUM(total),0) s FROM orders WHERE status='COMPLETED'").fetchone()["s"]
+        today_orders = conn.execute("SELECT COUNT(*) n FROM orders WHERE created_at>=?", (today,)).fetchone()["n"]
+        pending = conn.execute("SELECT COUNT(*) n FROM orders WHERE status IN ('PENDING','EXPIRED')").fetchone()["n"]
+        failed = conn.execute("SELECT COUNT(*) n FROM orders WHERE status='FAILED'").fetchone()["n"]
+        return {
+            "total_paid": int(total_paid),
+            "revenue": int(revenue),
+            "today_orders": int(today_orders),
+            "pending": int(pending),
+            "failed": int(failed),
+        }
+    finally:
+        conn.close()
+
+
+def gopay_admin_status() -> dict:
+    cfg = gopay_config()
+    return {
+        "base": cfg["base"],
+        "token": bool(cfg["token"]),
+        "static_qr": bool(cfg["static_qr"]),
+        "pending": pay_state_get("gopay_pending", "0"),
+        "last_check": pay_state_get("gopay_last_check", ""),
+        "last_ok": pay_state_get("gopay_last_ok", ""),
+        "last_match": pay_state_get("gopay_last_match", ""),
+        "error": pay_state_get("gopay_error", ""),
+        "token_invalid": pay_state_get("gopay_token_invalid", ""),
+    }
+
+
 # ---------------------------------------------------------------------------
 # HTTP helpers
 # ---------------------------------------------------------------------------
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "vpnfree"
+    server_version = "hits-ssh"
     sys_version = ""
 
     def log_message(self, fmt, *args):
@@ -1005,15 +1718,25 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/quota":
                 self.json(200, quota_state())
                 return
+            if path == "/cek-invoice":
+                self.check_invoice_page(query, head_only)
+                return
+            if path.startswith("/api/invoice/"):
+                self.api_invoice(path.split("/", 3)[3])
+                return
+            if path.startswith("/invoice/"):
+                self.invoice_page(path.split("/", 2)[2], head_only)
+                return
             if path == "/admin" or path == "/admin/":
                 session = self.admin_session()
                 if not session:
                     self.redirect("/admin/login")
                     return
                 msg = (query.get("msg", [""])[0] or "")[:50]
+                q = (query.get("q", [""])[0] or "")[:80]
                 self.html(
                     200,
-                    render_admin_dashboard(session, get_settings(), msg),
+                    render_admin_dashboard(session, get_settings(), msg, q),
                     extra_headers={"Cache-Control": "no-store", "X-Robots-Tag": "noindex, nofollow"},
                     head_only=head_only,
                 )
@@ -1113,6 +1836,12 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/buat":
                 self.public_create()
                 return
+            if path == "/premium/buy":
+                self.premium_buy()
+                return
+            if path == "/cek-invoice":
+                self.check_invoice_post()
+                return
             if path == "/admin/login":
                 self.admin_login()
                 return
@@ -1128,11 +1857,20 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/admin/delete":
                 self.admin_delete()
                 return
-            if path == "/admin/password":
-                self.admin_password()
-                return
             if path == "/admin/reset-quota":
                 self.admin_reset_quota()
+                return
+            if path == "/admin/premium":
+                self.admin_premium()
+                return
+            if path == "/admin/premium/add":
+                self.admin_premium_add()
+                return
+            if path == "/admin/order/retry":
+                self.admin_order_retry()
+                return
+            if path == "/admin/gopay/test":
+                self.admin_gopay_test()
                 return
             self.html(404, render_not_found())
         except ValueError as exc:
@@ -1185,6 +1923,232 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.redirect(f"/hasil/{account['token']}")
 
+    def premium_buy(self) -> None:
+        body = self.parse_body()
+        token_cookie = self.cookie(FORM_COOKIE)
+        if not token_cookie or not hmac.compare_digest(body.get("_form", ""), token_cookie):
+            self.html(400, render_error("Sesi formulir kedaluwarsa. Muat ulang halaman lalu coba lagi."))
+            return
+        if not rate_ok("premium:" + self.client_ip(), 6, 600):
+            self.html(429, render_error("Terlalu banyak percobaan. Tunggu beberapa menit lalu coba lagi."))
+            return
+        product_code = body.get("product_code", "").strip()[:40]
+        if not re.fullmatch(r"[a-z0-9-]{3,40}", product_code):
+            self.html(400, render_error("Paket premium tidak valid."))
+            return
+        try:
+            order = create_premium_order(product_code, self.client_ip(), self.headers.get("User-Agent", ""))
+        except ValueError as exc:
+            self.html(409, render_error(str(exc), retry=True))
+            return
+        except Exception:
+            logger.error("premium buy: %s", traceback.format_exc())
+            self.html(500, render_error("Gagal membuat invoice. Silakan coba lagi atau hubungi admin.", retry=True))
+            return
+        self.redirect(f"/invoice/{order['invoice']}?new=1")
+
+    def check_invoice_page(self, query: dict, head_only: bool = False) -> None:
+        code = (query.get("code", [""])[0] or "").strip().upper()[:80]
+        if code:
+            if order_by_invoice(code):
+                self.redirect(f"/invoice/{code}")
+                return
+            token, cookie = self.public_form_token()
+            self.html(
+                404,
+                render_check_invoice(token, "Invoice tidak ditemukan.", code),
+                cookies=[cookie] if cookie else None,
+                head_only=head_only,
+            )
+            return
+        token, cookie = self.public_form_token()
+        self.html(
+            200,
+            render_check_invoice(token, "", ""),
+            cookies=[cookie] if cookie else None,
+            head_only=head_only,
+        )
+
+    def check_invoice_post(self) -> None:
+        body = self.parse_body()
+        token_cookie = self.cookie(FORM_COOKIE)
+        if not token_cookie or not hmac.compare_digest(body.get("_form", ""), token_cookie):
+            self.html(400, render_error("Sesi formulir kedaluwarsa. Muat ulang halaman."))
+            return
+        code = body.get("invoice", "").strip().upper()[:80]
+        if not rate_ok("invoice:" + self.client_ip(), 20, 300):
+            self.html(429, render_error("Terlalu banyak percobaan. Tunggu beberapa menit."))
+            return
+        if not re.fullmatch(r"HITS-\d{6}-[A-Z0-9]{8}", code or ""):
+            token, cookie = self.public_form_token()
+            self.html(400, render_check_invoice(token, "Format invoice tidak valid.", code), cookies=[cookie] if cookie else None)
+            return
+        if not order_by_invoice(code):
+            token, cookie = self.public_form_token()
+            self.html(404, render_check_invoice(token, "Invoice tidak ditemukan.", code), cookies=[cookie] if cookie else None)
+            return
+        self.redirect(f"/invoice/{code}")
+
+    def invoice_page(self, suffix: str, head_only: bool = False) -> None:
+        download = suffix.endswith(".txt")
+        qr = suffix.endswith("/qr.svg")
+        if qr:
+            code = suffix[:-7]
+        elif download:
+            code = suffix[:-4]
+        else:
+            code = suffix
+        code = code.strip().upper()
+        if not re.fullmatch(r"HITS-\d{6}-[A-Z0-9]{8}", code or ""):
+            self.html(404, render_not_found(), head_only=head_only)
+            return
+        row = order_by_invoice(code)
+        if not row:
+            self.html(404, render_not_found(), head_only=head_only)
+            return
+        if qr:
+            svg = gopay_qr_svg(row["qr_string"])
+            if not svg:
+                self._send(404, b"QR unavailable", content_type="text/plain")
+                return
+            self._send(200, svg, content_type="image/svg+xml", extra_headers={"Cache-Control": "no-store"}, head_only=head_only)
+            return
+        if download:
+            if row["status"] != "COMPLETED" or not row["account_output"]:
+                self.html(409, render_error("Akun belum siap. Selesaikan pembayaran terlebih dahulu."))
+                return
+            body = (row["account_output"] or "").encode("utf-8")
+            self._send(
+                200,
+                body,
+                content_type="text/plain; charset=utf-8",
+                extra_headers={
+                    "Content-Disposition": f'attachment; filename="{row["invoice"]}.txt"',
+                    "Cache-Control": "no-store",
+                },
+                head_only=head_only,
+            )
+            return
+        self.html(
+            200,
+            render_invoice(row, new=("new=1" in self.path)),
+            extra_headers={"Cache-Control": "no-store", "X-Robots-Tag": "noindex, nofollow"},
+            head_only=head_only,
+        )
+
+    def api_invoice(self, code: str) -> None:
+        code = (code or "").strip().upper()
+        if not re.fullmatch(r"HITS-\d{6}-[A-Z0-9]{8}", code):
+            self.json(404, {"ok": False, "error": "not found"})
+            return
+        row = order_by_invoice(code)
+        if not row:
+            self.json(404, {"ok": False, "error": "not found"})
+            return
+        status = row["status"]
+        payload = {
+            "ok": True,
+            "invoice": row["invoice"],
+            "status": status,
+            "total": row["total"],
+            "expires_at": row["expires_at"],
+            "username": row["account_username"] if status == "COMPLETED" else "",
+            "account": row["account_output"] if status == "COMPLETED" else "",
+            "error": row["provision_error"] if status == "FAILED" else "",
+        }
+        self.json(200, payload)
+
+    def admin_premium(self) -> None:
+        body = self.parse_body()
+        session = self.require_admin(body.get("_csrf", ""))
+        if not session:
+            return
+        conn = db_connect()
+        try:
+            rows = conn.execute("SELECT * FROM premium_products").fetchall()
+            for row in rows:
+                pid = int(row["id"])
+                try:
+                    days = max(1, min(365, int(body.get(f"days_{pid}", row["days"]))))
+                    price = max(1000, min(10000000, int(body.get(f"price_{pid}", row["price"]))))
+                    ip_limit = max(0, min(100, int(body.get(f"ip_{pid}", row["ip_limit"]))))
+                    quota = max(0, min(10000, int(body.get(f"quota_{pid}", row["quota_gb"]))))
+                except ValueError:
+                    continue
+                active = 1 if body.get(f"active_{pid}") == "1" else 0
+                conn.execute(
+                    "UPDATE premium_products SET days=?,price=?,ip_limit=?,quota_gb=?,active=?,updated_at=? WHERE id=?",
+                    (days, price, ip_limit, quota, active, int(time.time()), pid),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        audit("premium_products", "update", self.client_ip())
+        self.redirect("/admin?msg=premium")
+
+    def admin_premium_add(self) -> None:
+        body = self.parse_body()
+        session = self.require_admin(body.get("_csrf", ""))
+        if not session:
+            return
+        protocol = body.get("protocol", "")
+        if protocol not in PROTOCOLS and protocol != "ssh":
+            self.redirect("/admin?msg=premiumfail")
+            return
+        try:
+            days = max(1, min(365, int(body.get("days", "30"))))
+            price = max(1000, min(10000000, int(body.get("price", "10000"))))
+            ip_limit = max(0, min(100, int(body.get("ip_limit", "2"))))
+            quota = max(0, min(10000, int(body.get("quota_gb", "0"))))
+        except ValueError:
+            self.redirect("/admin?msg=premiumfail")
+            return
+        code = f"{protocol}-{days}"
+        conn = db_connect()
+        try:
+            if conn.execute("SELECT 1 FROM premium_products WHERE code=?", (code,)).fetchone():
+                self.redirect("/admin?msg=premiumexists")
+                return
+            label = (body.get("label", "").strip()[:40] or f"{protocol.upper()} {days} Hari")
+            sort = int(time.time())
+            conn.execute(
+                "INSERT INTO premium_products(code,protocol,label,days,price,ip_limit,quota_gb,active,sort,updated_at)"
+                " VALUES(?,?,?,?,?,?,?,1,?,?)",
+                (code, protocol, label, days, price, ip_limit, quota, sort, int(time.time())),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        audit("premium_products", f"add {code}", self.client_ip())
+        self.redirect("/admin?msg=premium")
+
+    def admin_order_retry(self) -> None:
+        body = self.parse_body()
+        session = self.require_admin(body.get("_csrf", ""))
+        if not session:
+            return
+        invoice = body.get("invoice", "").strip().upper()
+        row = order_by_invoice(invoice)
+        if not row:
+            self.redirect("/admin?msg=ordernotfound")
+            return
+        if retry_premium_order(invoice):
+            self.redirect("/admin?msg=retryok")
+        else:
+            self.redirect("/admin?msg=retryfail")
+
+    def admin_gopay_test(self) -> None:
+        body = self.parse_body()
+        session = self.require_admin(body.get("_csrf", ""))
+        if not session:
+            return
+        rows = gopay_history(force=True)
+        if rows:
+            pay_state_set("gopay_error", "")
+            self.redirect("/admin?msg=gopayok")
+        else:
+            self.redirect("/admin?msg=gopayfail")
+
     def admin_login(self) -> None:
         body = self.parse_body()
         ip = self.client_ip()
@@ -1196,20 +2160,19 @@ class Handler(BaseHTTPRequestHandler):
         if not token_cookie or not hmac.compare_digest(body.get("_form", ""), token_cookie):
             self.html(400, render_admin_login("", "Sesi formulir kedaluwarsa. Muat ulang halaman."))
             return
-        username = body.get("username", "").strip()[:64]
-        password = body.get("password", "")[:200]
-        conn = db_connect()
-        try:
-            row = conn.execute("SELECT * FROM admin WHERE username=?", (username,)).fetchone()
-        finally:
-            conn.close()
-        if not row or not verify_password(password, row["password_hash"]):
+        supplied = body.get("token", "").strip()
+        expected = admin_login_token()
+        if not expected:
             time.sleep(0.6)
-            audit("login_failed", username, ip)
-            self.html(401, render_admin_login(token_cookie, "Username atau password salah."))
+            self.html(503, render_admin_login(token_cookie, "Token bot Telegram belum tersedia di VPS ini."))
             return
-        session_token, _csrf = create_session(username, ip)
-        audit("login", username, ip)
+        if not supplied or not hmac.compare_digest(supplied, expected):
+            time.sleep(0.6)
+            audit("login_failed", "token", ip)
+            self.html(401, render_admin_login(token_cookie, "Token admin salah."))
+            return
+        session_token, _csrf = create_session("admin", ip)
+        audit("login", "token", ip)
         self.redirect(
             "/admin",
             cookies=[self.set_cookie(ADMIN_COOKIE, session_token, SESSION_TTL, http_only=True)],
@@ -1230,6 +2193,8 @@ class Handler(BaseHTTPRequestHandler):
             values[key] = str(max(low, min(high, num)))
         values["ssh_enabled"] = "1" if body.get("ssh_enabled") == "1" else "0"
         values["xray_enabled"] = "1" if body.get("xray_enabled") == "1" else "0"
+        values["free_enabled"] = "1" if body.get("free_enabled") == "1" else "0"
+        values["premium_enabled"] = "1" if body.get("premium_enabled") == "1" else "0"
         for proto in PROTOCOLS:
             values[f"{proto}_enabled"] = "1" if body.get(f"{proto}_enabled") == "1" else "0"
         values["maintenance"] = "1" if body.get("maintenance") == "1" else "0"
@@ -1288,7 +2253,7 @@ class Handler(BaseHTTPRequestHandler):
             conn.close()
         try:
             ADMIN_CRED_PATH.write_text(
-                "VPNFree admin\n"
+                "HITS SSH admin\n"
                 f"URL      : https://{PUBLIC_HOST}/admin\n"
                 f"Username : {session['username']}\n"
                 "Password : (sudah diganti lewat dashboard)\n",
@@ -1348,51 +2313,57 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
     nav_extra = ""
     if not admin:
         nav_extra = (
-            '<a href="/#buat">Buat akun</a>'
-            '<a href="/#cara">Cara pakai</a>'
+            '<a href="/#gratis">Gratis</a>'
+            '<a href="/#premium">Premium</a>'
+            '<a href="/cek-invoice">Cek Invoice</a>'
             '<a href="/#faq">FAQ</a>'
         )
     else:
         nav_extra = '<a href="/admin">Dashboard</a><a href="/" target="_blank" rel="noopener">Lihat situs</a>'
     robots = '<meta name="robots" content="noindex,nofollow">' if noindex else ""
+    nav_cta = (
+        '<a class="nav-cta" href="/" target="_blank" rel="noopener">Lihat situs <span aria-hidden="true">↗</span></a>'
+        if admin
+        else '<a class="nav-cta" href="/#premium">Beli premium <span aria-hidden="true">↗</span></a>'
+    )
     return f"""<!doctype html>
 <html lang="id">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{e(title)} — VPNFree</title>
-<meta name="description" content="Buat akun VPN gratis SSH dan Xray dalam hitungan detik. Tanpa email, tanpa login.">
+<title>{e(title)} — HITS SSH</title>
+<meta name="description" content="HITS SSH — akun VPN gratis dan premium SSH, VMess, VLESS, Trojan. Premium tanpa login, bayar QRIS GoPay.">
 <meta name="theme-color" content="#fffaf2">
 {robots}
 <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-<div class="grain" aria-hidden="true"></div>
 <header class="nav">
   <div class="wrap nav-inner">
-    <a class="brand" href="/" aria-label="VPNFree">
+    <a class="brand" href="/" aria-label="HITS SSH">
       <span class="brand-mark">{logomark()}</span>
-      <span class="brand-word">vpn<span>free</span></span>
+      <span class="brand-word">HITS <span>SSH</span></span>
     </a>
     <nav class="nav-links">{nav_extra}</nav>
-    <a class="nav-cta" href="/#buat">Buat akun <span aria-hidden="true">↗</span></a>
+    {nav_cta}
   </div>
 </header>
 {body}
 <footer class="footer">
   <div class="wrap footer-inner">
     <div>
-      <div class="brand footer-brand"><span class="brand-mark">{logomark()}</span><span class="brand-word">vpn<span>free</span></span></div>
-      <p>Akun gratis untuk belajar, bekerja, dan menjelajah dengan aman.</p>
+      <div class="brand footer-brand"><span class="brand-mark">{logomark()}</span><span class="brand-word">HITS <span>SSH</span></span></div>
+      <p>Akun VPN gratis dan premium untuk belajar, bekerja, dan menjelajah dengan aman.</p>
     </div>
     <div class="footer-links">
-      <a href="/#buat">Buat akun</a>
-      <a href="/#cara">Cara pakai</a>
+      <a href="/#gratis">Akun gratis</a>
+      <a href="/#premium">Premium</a>
+      <a href="/cek-invoice">Cek Invoice</a>
       <a href="/#faq">FAQ</a>
       <a href="/admin">Admin</a>
     </div>
-    <div class="footer-note">Dibuat untuk komunitas. Gunakan dengan bijak.</div>
+    <div class="footer-note">HITS SSH · Free &amp; Premium · Gunakan dengan bijak.</div>
   </div>
 </footer>
 <script src="/static/app.js" defer></script>
@@ -1423,9 +2394,12 @@ def render_home(form_token: str, settings: dict[str, str]) -> str:
     ssh3 = quota["services"]["ssh"]["3"]
     xr3 = quota["services"]["xray"]["3"]
     maintenance = settings.get("maintenance") == "1"
-    ssh_on = settings.get("ssh_enabled", "1") == "1"
+    free_on = settings.get("free_enabled", "1") == "1"
+    ssh_global = settings.get("ssh_enabled", "1") == "1"
     proto_on = {p: settings.get(f"{p}_enabled", "1") == "1" for p in PROTOCOLS}
-    xray_on = settings.get("xray_enabled", "1") == "1" and any(proto_on.values())
+    xray_global = settings.get("xray_enabled", "1") == "1" and any(proto_on.values())
+    ssh_on = free_on and ssh_global
+    xray_on = free_on and xray_global
     available = ssh_on or xray_on
     default_service = "ssh" if ssh_on else ("xray" if xray_on else "")
     first_proto = next((p for p in ("vmess", "vless", "trojan") if proto_on[p]), "")
@@ -1435,8 +2409,10 @@ def render_home(form_token: str, settings: dict[str, str]) -> str:
         else ""
     )
     closed_html = ""
-    if not available:
-        closed_html = '<div class="notice notice-error"><strong>Semua layanan ditutup.</strong> Admin sedang menutup pembuatan akun.</div>'
+    if not free_on:
+        closed_html = '<div class="notice notice-error"><strong>Kategori gratis ditutup.</strong> Admin sedang menutup pembuatan akun gratis.</div>'
+    elif not available:
+        closed_html = '<div class="notice notice-error"><strong>Semua layanan gratis ditutup.</strong> Admin sedang menutup pembuatan akun.</div>'
     proto_html = ""
     for proto, meta in PROTOCOLS.items():
         off = not proto_on[proto]
@@ -1448,22 +2424,67 @@ def render_home(form_token: str, settings: dict[str, str]) -> str:
             f'<span>{e(meta["label"])}{" <small>OFF</small>" if off else ""}</span></label>'
         )
     web_config = {
+        "free": free_on,
         "ssh": ssh_on,
         "xray": xray_on,
         "protocols": proto_on,
         "maintenance": maintenance,
     }
     web_config_json = json.dumps(web_config, ensure_ascii=False).replace("</", "<\\/")
+    premium_on = settings.get("premium_enabled", "1") == "1" and not maintenance
+    premium_rows = []
+    if premium_on:
+        for _p in premium_products(active_only=True):
+            if _p["protocol"] == "ssh" and not ssh_global:
+                continue
+            if _p["protocol"] in PROTOCOLS and (not xray_global or not proto_on.get(_p["protocol"], False)):
+                continue
+            premium_rows.append(_p)
+    premium_on = premium_on and bool(premium_rows)
+    premium_data = {
+        "products": [
+            {
+                "code": r["code"],
+                "protocol": r["protocol"],
+                "label": r["label"],
+                "days": r["days"],
+                "price": r["price"],
+                "ip_limit": r["ip_limit"],
+                "quota_gb": r["quota_gb"],
+            }
+            for r in premium_rows
+        ],
+        "expiry_min": int(settings.get("premium_expiry_min", "15")),
+    }
+    premium_json = json.dumps(premium_data, ensure_ascii=False).replace("</", "<\\/")
+    premium_cards = ""
+    proto_labels = {"ssh": "SSH", "vmess": "VMess", "vless": "VLESS", "trojan": "Trojan"}
+    for proto in ("ssh", "vmess", "vless", "trojan"):
+        group = [r for r in premium_rows if r["protocol"] == proto]
+        if not group:
+            continue
+        cheapest = min(int(r["price"]) for r in group)
+        premium_cards += (
+            f'<button class="premium-service" type="button" data-protocol="{proto}">'
+            f'<span class="premium-service-icon">{icon("terminal" if proto == "ssh" else "bolt")}</span>'
+            f'<b>{proto_labels[proto]}</b>'
+            f'<small>mulai Rp {cheapest:,}</small></button>'.replace(",", ".")
+        )
+    premium_notice = ""
+    if maintenance:
+        premium_notice = '<div class="notice notice-warn"><strong>Mode perawatan.</strong> Pembelian premium ditutup sementara.</div>'
+    elif not premium_on or not premium_rows:
+        premium_notice = '<div class="notice notice-warn"><strong>Premium sedang ditutup.</strong> Admin belum membuka paket jualan.</div>'
     body = f"""
 <main>
   <section class="hero wrap">
     <div class="hero-copy">
-      <div class="eyebrow"><span class="dot"></span> GRATIS · TANPA EMAIL · LANGSUNG JADI</div>
+      <div class="eyebrow"><span class="dot"></span> FREE &amp; PREMIUM · TANPA LOGIN</div>
       <h1>Internet bebas,<br><em>akun langsung jadi.</em></h1>
-      <p class="hero-lead">Pilih layanan, tentukan masa aktif, lalu salin konfigurasi. Semua diproses langsung di server VPN — tanpa antre, tanpa akun tambahan.</p>
+      <p class="hero-lead">Buat akun gratis dalam hitungan detik, atau beli akun premium lewat QRIS GoPay. Tanpa registrasi, tanpa email, dan invoice bisa dicek kembali kapan saja.</p>
       <div class="hero-actions">
-        <a class="btn btn-primary" href="#buat">Buat akun sekarang <span aria-hidden="true">↘</span></a>
-        <a class="btn btn-ghost" href="#cara">Lihat cara pakai</a>
+        <a class="btn btn-primary" href="#gratis">Akun gratis <span aria-hidden="true">↘</span></a>
+        <a class="btn btn-ghost" href="#premium">Beli premium</a>
       </div>
       <div class="hero-stats">
         <div><strong>{ssh3['limit'] + quota['services']['ssh']['7']['limit'] + xr3['limit'] + quota['services']['xray']['7']['limit']}</strong><span>slot kuota / hari</span></div>
@@ -1477,8 +2498,8 @@ def render_home(form_token: str, settings: dict[str, str]) -> str:
       <div class="ticket">
         <div class="ticket-top">
           <div class="ticket-logo">{logomark()}</div>
-          <div class="ticket-brand">VPN<span>FREE</span></div>
-          <div class="ticket-chip">GRATIS</div>
+          <div class="ticket-brand">HITS <span>SSH</span></div>
+          <div class="ticket-chip">FREE + PREMIUM</div>
         </div>
         <div class="ticket-tunnel">
           <span class="tunnel t1"></span><span class="tunnel t2"></span><span class="tunnel t3"></span>
@@ -1503,11 +2524,11 @@ def render_home(form_token: str, settings: dict[str, str]) -> str:
     </div>
   </section>
 
-  <section class="section wrap" id="buat">
+  <section class="section wrap free-section" id="gratis">
     <div class="section-head">
       <div>
-        <div class="eyebrow"><span class="dot"></span> BUAT AKUN</div>
-        <h2>Dua langkah, akun siap.</h2>
+        <div class="eyebrow"><span class="dot"></span> KATEGORI GRATIS</div>
+        <h2>Gratis dulu.<br>Langsung jadi.</h2>
       </div>
       <p>Kuota dihitung per layanan dan di-reset otomatis setiap tengah malam WIB.</p>
     </div>
@@ -1582,9 +2603,70 @@ def render_home(form_token: str, settings: dict[str, str]) -> str:
     </div>
   </section>
 
+  <section class="section wrap premium-section" id="premium">
+    <div class="section-head">
+      <div>
+        <div class="eyebrow"><span class="dot"></span> HITS SSH PREMIUM</div>
+        <h2>Beli sekali.<br>Tanpa login.</h2>
+      </div>
+      <p>Pilih paket, bayar QRIS GoPay, lalu simpan invoice. Akun dibuat otomatis setelah pembayaran terdeteksi.</p>
+    </div>
+    {premium_notice}
+    <div class="premium-layout">
+      <div class="premium-picker panel">
+        <div class="premium-step">
+          <span class="mini-label">01 · PILIH LAYANAN</span>
+          <div class="premium-services" id="premium-services">{premium_cards}</div>
+        </div>
+        <div class="premium-step">
+          <span class="mini-label">02 · PILIH MASA AKTIF</span>
+          <div class="premium-durations" id="premium-durations">
+            <p class="premium-hint">Pilih layanan terlebih dahulu.</p>
+          </div>
+        </div>
+        <div class="premium-summary" id="premium-summary" hidden>
+          <div><span>Paket</span><b id="premium-summary-name">—</b></div>
+          <div><span>Harga</span><b id="premium-summary-price">—</b></div>
+          <div><span>Masa aktif</span><b id="premium-summary-days">—</b></div>
+        </div>
+        <form id="premium-form" method="post" action="/premium/buy">
+          <input type="hidden" name="_form" value="{e(form_token)}">
+          <input type="hidden" name="product_code" id="premium-product" value="">
+          <button class="btn btn-primary btn-block btn-premium" type="submit" id="premium-button" disabled>
+            Beli via QRIS <span aria-hidden="true">↗</span>
+          </button>
+        </form>
+        <p class="form-note">Total pembayaran ditambah <b>kode unik Rp1–999</b> agar tidak tertukar dengan pembeli lain. Nominal persis tertera di invoice.</p>
+      </div>
+      <aside class="premium-side">
+        <div class="panel premium-info">
+          <div class="premium-badge">QRIS GOPAY</div>
+          <h3>Bayar dari mana saja.</h3>
+          <p>Scan QRIS dengan GoPay, OVO, DANA, ShopeePay, atau m-banking. Akun dibuat otomatis setelah transaksi terdeteksi.</p>
+          <ul>
+            <li>Tanpa daftar dan tanpa login.</li>
+            <li>Invoice {e(settings.get("premium_expiry_min", "15"))} menit dan bisa dicek ulang.</li>
+            <li>Download detail akun <b>.txt</b> setelah lunas.</li>
+          </ul>
+        </div>
+        <div class="panel check-card">
+          <span class="mini-label">SUDAH BELI?</span>
+          <h3>Cek Invoice</h3>
+          <p>Masukkan kode invoice untuk membuka kembali QR, status pembayaran, dan data akun.</p>
+          <form method="post" action="/cek-invoice" class="stack-form compact">
+            <input type="hidden" name="_form" value="{e(form_token)}">
+            <label>Kode Invoice<input type="text" name="invoice" placeholder="HITS-YYMMDD-XXXXXXXX" autocomplete="off" spellcheck="false" required></label>
+            <button class="btn btn-dark btn-block" type="submit">Buka invoice</button>
+          </form>
+        </div>
+      </aside>
+    </div>
+    <script type="application/json" id="premium-data">{premium_json}</script>
+  </section>
+
   <section class="section wrap features">
     <div class="feature-big panel">
-      <div class="eyebrow"><span class="dot"></span> KENAPA VPNFREE</div>
+      <div class="eyebrow"><span class="dot"></span> KENAPA HITS SSH</div>
       <h2>Dibuat simpel.<br>Dijalankan serius.</h2>
       <p>Kami tidak menyimpan email, tidak meminta nomor telepon, dan tidak memasang iklan. Akun dibuat langsung di server untuk Anda.</p>
       <div class="feature-list">
@@ -1623,7 +2705,7 @@ def render_home(form_token: str, settings: dict[str, str]) -> str:
 <script type="application/json" id="quota-data">{quota_json}</script>
 <script type="application/json" id="web-config">{web_config_json}</script>
 """
-    return page_shell("Akun VPN Gratis SSH & Xray", body)
+    return page_shell("Akun VPN Gratis & Premium", body)
 
 
 def render_result(row: sqlite3.Row) -> str:
@@ -1681,17 +2763,19 @@ def render_admin_login(form_token: str, error: str) -> str:
     body = f"""
 <main class="admin-login wrap">
   <div class="login-card panel">
-    <div class="login-brand"><span class="brand-mark">{logomark()}</span><span class="brand-word">vpn<span>free</span></span></div>
+    <div class="login-brand"><span class="brand-mark">{logomark()}</span><span class="brand-word">HITS <span>SSH</span></span></div>
     <div class="eyebrow"><span class="dot"></span> ADMIN PANEL</div>
-    <h1>Masuk untuk mengatur.</h1>
-    <p>Kelola limit IP, kuota bandwidth, dan jatah akun harian.</p>
+    <h1>Masuk dengan token.</h1>
+    <p>Tempel Token Bot Telegram. Tidak perlu username atau password.</p>
     {err}
     <form method="post" action="/admin/login" class="stack-form">
       <input type="hidden" name="_form" value="{e(form_token)}">
-      <label>Username<input type="text" name="username" autocomplete="username" required autofocus></label>
-      <label>Password<input type="password" name="password" autocomplete="current-password" required></label>
+      <label>Token Bot Telegram
+        <input type="password" name="token" autocomplete="off" spellcheck="false" required autofocus placeholder="123456789:AA...">
+      </label>
       <button class="btn btn-primary btn-block" type="submit">Masuk</button>
     </form>
+    <p class="form-note login-help">Ambil token di VPS:<br><code>awk '/^#bot# /{{print $2}}' /etc/bot/.bot.db</code></p>
     <a class="back-link" href="/">← Kembali ke situs</a>
   </div>
 </main>
@@ -1699,8 +2783,12 @@ def render_admin_login(form_token: str, error: str) -> str:
     return page_shell("Admin", body, admin=True, noindex=True)
 
 
-def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: str) -> str:
+def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: str, q: str = "") -> str:
     quota = quota_state(settings)
+    products = premium_products(active_only=False)
+    pstats = premium_stats()
+    gstat = gopay_admin_status()
+    like = f"%{q}%"
     conn = db_connect()
     try:
         total = conn.execute("SELECT COUNT(*) n FROM accounts WHERE status='active'").fetchone()["n"]
@@ -1709,7 +2797,12 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
             (today_key(),),
         ).fetchone()["n"]
         accounts = conn.execute(
-            "SELECT * FROM accounts WHERE status='active' ORDER BY id DESC LIMIT 80"
+            "SELECT * FROM accounts WHERE status='active' ORDER BY id DESC LIMIT 60"
+        ).fetchall()
+        orders = conn.execute(
+            "SELECT * FROM orders WHERE (?='' OR invoice LIKE ? OR account_username LIKE ? OR buyer_ip LIKE ?)"
+            " ORDER BY id DESC LIMIT 100",
+            (q, like, like, like),
         ).fetchall()
         recent_audit = conn.execute("SELECT * FROM audit ORDER BY id DESC LIMIT 10").fetchall()
     finally:
@@ -1720,10 +2813,15 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
         "deleted": ("ok", "Akun website berhasil dihapus."),
         "notfound": ("error", "Akun tidak ditemukan atau sudah dihapus."),
         "deletefail": ("error", "Akun gagal dihapus. Cek log server."),
-        "passwordshort": ("error", "Password baru minimal 10 karakter."),
-        "passwordmismatch": ("error", "Konfirmasi password tidak sama."),
-        "passwordwrong": ("error", "Password saat ini salah."),
         "quota": ("ok", "Hitungan kuota hari ini di-reset (akun tidak dihapus)."),
+        "premium": ("ok", "Pengaturan paket premium disimpan."),
+        "premiumfail": ("error", "Data paket premium tidak valid."),
+        "premiumexists": ("error", "Paket dengan kode itu sudah ada."),
+        "retryok": ("ok", "Akun premium berhasil dibuat ulang."),
+        "retryfail": ("error", "Retry gagal. Cek error provisioning."),
+        "ordernotfound": ("error", "Invoice tidak ditemukan."),
+        "gopayok": ("ok", "Gateway GoPay merespons dan history berhasil dibaca."),
+        "gopayfail": ("error", "Gagal membaca history GoPay. Cek status gateway/token."),
     }
     notice = ""
     if msg in messages:
@@ -1733,11 +2831,11 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
     quota_rows = ""
     for service in ("ssh", "xray"):
         for days in (3, 7):
-            q = quota["services"][service][str(days)]
-            pct = (q["used"] / q["limit"] * 100) if q["limit"] else 0
+            qq = quota["services"][service][str(days)]
+            pct = (qq["used"] / qq["limit"] * 100) if qq["limit"] else 0
             quota_rows += (
                 f'<div class="quota-item"><span>{e(SERVICES[service]["label"])} · {days} hari</span>'
-                f'<b>{q["used"]} / {q["limit"]}</b><i><u style="width:{min(100, pct):.1f}%"></u></i></div>'
+                f'<b>{qq["used"]} / {qq["limit"]}</b><i><u style="width:{min(100, pct):.1f}%"></u></i></div>'
             )
 
     account_rows = ""
@@ -1761,51 +2859,113 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
           </td>
         </tr>"""
     if not account_rows:
-        account_rows = '<tr><td colspan="6" class="empty">Belum ada akun yang dibuat lewat website.</td></tr>'
+        account_rows = '<tr><td colspan="6" class="empty">Belum ada akun free yang dibuat lewat website.</td></tr>'
+
+    product_rows = ""
+    for row in products:
+        pid = int(row["id"])
+        proto = "SSH" if row["protocol"] == "ssh" else PROTOCOLS.get(row["protocol"], {}).get("label", row["protocol"])
+        product_rows += f"""
+        <tr>
+          <td><b>{e(proto)}</b><small>{e(row['code'])}</small></td>
+          <td><input class="mini-input" type="number" name="days_{pid}" min="1" max="365" value="{int(row['days'])}"></td>
+          <td><input class="mini-input" type="number" name="price_{pid}" min="1000" max="10000000" value="{int(row['price'])}"></td>
+          <td><input class="mini-input" type="number" name="ip_{pid}" min="0" max="100" value="{int(row['ip_limit'])}"></td>
+          <td><input class="mini-input" type="number" name="quota_{pid}" min="0" max="10000" value="{int(row['quota_gb'])}"></td>
+          <td class="center"><input type="checkbox" name="active_{pid}" value="1" {'checked' if row['active'] else ''}></td>
+        </tr>"""
+    if not product_rows:
+        product_rows = '<tr><td colspan="6" class="empty">Belum ada paket premium.</td></tr>'
+
+    order_rows = ""
+    for row in orders:
+        status_map = {
+            "PENDING": ("badge-warn", "Pending"),
+            "PAID": ("badge-warn", "Paid"),
+            "PROVISIONING": ("badge-warn", "Proses"),
+            "COMPLETED": ("badge-ok", "Sukses"),
+            "FAILED": ("badge-bad", "Gagal akun"),
+            "EXPIRED": ("badge-muted", "Expired"),
+        }
+        cls, txt = status_map.get(row["status"], ("badge-muted", row["status"]))
+        action = ""
+        if row["status"] in ("PAID", "FAILED"):
+            action = f"""
+            <form method="post" action="/admin/order/retry" class="inline-form" data-confirm="Coba buat akun untuk invoice {e(row['invoice'])}?">
+              <input type="hidden" name="_csrf" value="{e(session['csrf'])}">
+              <input type="hidden" name="invoice" value="{e(row['invoice'])}">
+              <button class="btn btn-tiny btn-dark" type="submit">Retry</button>
+            </form>"""
+        if row["status"] == "COMPLETED":
+            action = f'<a class="btn btn-tiny btn-ghost" href="/invoice/{e(row["invoice"])}.txt" download>TXT</a>'
+        order_rows += f"""
+        <tr>
+          <td><a class="invoice-link" href="/invoice/{e(row['invoice'])}" target="_blank" rel="noopener"><b>{e(row['invoice'])}</b></a><small>{e(row['buyer_ip'])}</small></td>
+          <td>{e(row['protocol'].upper())}<small>{row['days']} hari</small></td>
+          <td><b>{rupiah(row['total'])}</b><small>+{rupiah(row['unique_code'])}</small></td>
+          <td>{e(fmt_ts(row['created_at'], '%d %b %H:%M'))}</td>
+          <td><span class="badge {cls}">{e(txt)}</span></td>
+          <td>{e(row['account_username'] or '-')}<small>{e((row['provision_error'] or '')[:42])}</small></td>
+          <td>{action}</td>
+        </tr>"""
+    if not order_rows:
+        order_rows = '<tr><td colspan="7" class="empty">Belum ada transaksi premium.</td></tr>'
 
     audit_rows = "".join(
         f"<li><span>{e(fmt_ts(a['at'], '%d %b %H:%M'))}</span><b>{e(a['action'])}</b><small>{e(a['detail'])}</small></li>"
         for a in recent_audit
     ) or "<li class='empty'>Belum ada aktivitas.</li>"
 
+    gopay_ok = gstat["token"] and gstat["static_qr"]
+    gopay_badge = '<span class="badge badge-ok">Siap</span>' if gopay_ok else '<span class="badge badge-bad">Belum siap</span>'
+    gopay_error = gstat["error"]
+    gopay_error_html = f'<div class="notice notice-error compact-notice">{e(gopay_error)}</div>' if gopay_error else ""
+    last_check = fmt_ts(int(gstat["last_check"]), "%d %b %H:%M:%S") if str(gstat["last_check"]).isdigit() else "-"
+    last_match = fmt_ts(int(gstat["last_match"]), "%d %b %H:%M:%S") if str(gstat["last_match"]).isdigit() else "-"
+    token_warn = ""
+    if gstat["token_invalid"]:
+        token_warn = '<div class="notice notice-warn compact-notice">Token GoPay expired. Buka bot Telegram → Store Admin → GoPay → Login OTP, lalu klik Test GoPay.</div>'
+
     body = f"""
 <main class="admin-main wrap">
   <div class="admin-head">
-    <div><div class="eyebrow"><span class="dot"></span> ADMIN DASHBOARD</div><h1>Kendali penuh.</h1><p>Semua perubahan langsung dipakai untuk pembuatan akun berikutnya.</p></div>
+    <div><div class="eyebrow"><span class="dot"></span> HITS SSH ADMIN</div><h1>Kendali penuh.</h1><p>Free, premium, invoice, dan pembayaran GoPay dalam satu dashboard.</p></div>
     <div class="admin-head-actions">
+      <a class="btn btn-ghost" href="/" target="_blank" rel="noopener">Lihat situs</a>
       <form method="post" action="/admin/logout"><button class="btn btn-ghost" type="submit">Keluar</button></form>
     </div>
   </div>
   {notice}
-  <div class="admin-stats">
-    <div class="stat-card"><span>Total akun website</span><strong>{total}</strong><small>akun aktif</small></div>
-    <div class="stat-card accent"><span>Dibuat hari ini</span><strong>{today}</strong><small>{e(today_key())}</small></div>
-    <div class="stat-card"><span>Reset kuota</span><strong>00.00</strong><small>otomatis WIB</small></div>
+  <div class="admin-stats four">
+    <div class="stat-card"><span>Akun free aktif</span><strong>{total}</strong><small>{today} dibuat hari ini</small></div>
+    <div class="stat-card"><span>Invoice premium</span><strong>{pstats['total_paid']}</strong><small>{pstats['pending']} pending · {pstats['failed']} gagal akun</small></div>
+    <div class="stat-card accent"><span>Pendapatan premium</span><strong>{rupiah(pstats['revenue'])}</strong><small>transaksi sukses</small></div>
+    <div class="stat-card"><span>GoPay gateway</span><strong>{'ON' if gopay_ok else 'OFF'}</strong><small>{e(gstat['base'])}</small></div>
   </div>
 
   <div class="admin-grid">
     <section class="panel admin-panel">
-      <div class="panel-head"><div><span class="mini-label">PENGATURAN</span><h2>Limit & kuota akun</h2></div></div>
+      <div class="panel-head"><div><span class="mini-label">KATEGORI FREE</span><h2>Limit & kuota gratis</h2></div></div>
       <form method="post" action="/admin/settings" class="settings-form">
         <input type="hidden" name="_csrf" value="{e(session['csrf'])}">
         <div class="settings-grid">
           <fieldset>
-            <legend>{icon('terminal')} SSH</legend>
+            <legend>{icon('terminal')} SSH Free</legend>
             <label>Limit IP per akun<input type="number" name="ssh_ip_limit" min="0" max="100" value="{e(settings['ssh_ip_limit'])}"><small>0 = tanpa batas</small></label>
             <label>Kuota bandwidth (GB)<input type="number" name="ssh_quota_gb" min="0" max="10000" value="{e(settings['ssh_quota_gb'])}"><small>0 = tanpa batas</small></label>
             <label>Kuota 3 hari / hari<input type="number" name="ssh_daily_3" min="0" max="1000" value="{e(settings['ssh_daily_3'])}"></label>
             <label>Kuota 7 hari / hari<input type="number" name="ssh_daily_7" min="0" max="1000" value="{e(settings['ssh_daily_7'])}"></label>
-            <label class="switch"><input type="checkbox" name="ssh_enabled" value="1" {'checked' if settings['ssh_enabled'] == '1' else ''}><span>Aktifkan layanan SSH</span></label>
+            <label class="switch"><input type="checkbox" name="ssh_enabled" value="1" {'checked' if settings['ssh_enabled'] == '1' else ''}><span>Aktifkan SSH free</span></label>
           </fieldset>
           <fieldset>
-            <legend>{icon('bolt')} Xray</legend>
+            <legend>{icon('bolt')} Xray Free</legend>
             <label>Limit IP per akun<input type="number" name="xray_ip_limit" min="0" max="100" value="{e(settings['xray_ip_limit'])}"><small>0 = tanpa batas</small></label>
             <label>Kuota bandwidth (GB)<input type="number" name="xray_quota_gb" min="0" max="10000" value="{e(settings['xray_quota_gb'])}"><small>0 = tanpa batas</small></label>
             <label>Kuota 3 hari / hari<input type="number" name="xray_daily_3" min="0" max="1000" value="{e(settings['xray_daily_3'])}"></label>
             <label>Kuota 7 hari / hari<input type="number" name="xray_daily_7" min="0" max="1000" value="{e(settings['xray_daily_7'])}"></label>
-            <label class="switch"><input type="checkbox" name="xray_enabled" value="1" {'checked' if settings['xray_enabled'] == '1' else ''}><span>Aktifkan layanan Xray</span></label>
+            <label class="switch"><input type="checkbox" name="xray_enabled" value="1" {'checked' if settings['xray_enabled'] == '1' else ''}><span>Aktifkan Xray free</span></label>
             <div class="protocol-switches">
-              <span class="mini-label">Protokol yang dibuka</span>
+              <span class="mini-label">Protokol yang dibuka (free &amp; premium)</span>
               <label class="switch"><input type="checkbox" name="vmess_enabled" value="1" {'checked' if settings['vmess_enabled'] == '1' else ''}><span>VMess</span></label>
               <label class="switch"><input type="checkbox" name="vless_enabled" value="1" {'checked' if settings['vless_enabled'] == '1' else ''}><span>VLESS</span></label>
               <label class="switch"><input type="checkbox" name="trojan_enabled" value="1" {'checked' if settings['trojan_enabled'] == '1' else ''}><span>Trojan</span></label>
@@ -1813,16 +2973,21 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
           </fieldset>
         </div>
         <div class="settings-grid two">
-          <label>Batas akun per IP / layanan / hari<input type="number" name="per_ip_daily" min="0" max="1000" value="{e(settings['per_ip_daily'])}"><small>0 = tanpa batas per IP</small></label>
+          <label>Batas free per IP / layanan / hari<input type="number" name="per_ip_daily" min="0" max="1000" value="{e(settings['per_ip_daily'])}"><small>0 = tanpa batas per IP</small></label>
         </div>
-        <label class="switch maintenance"><input type="checkbox" name="maintenance" value="1" {'checked' if settings['maintenance'] == '1' else ''}><span>Mode perawatan (tutup pembuatan akun)</span></label>
+        <label class="switch"><input type="checkbox" name="free_enabled" value="1" {'checked' if settings['free_enabled'] == '1' else ''}><span>Buka kategori akun gratis</span></label>
+        <label class="switch"><input type="checkbox" name="premium_enabled" value="1" {'checked' if settings['premium_enabled'] == '1' else ''}><span>Buka kategori premium</span></label>
+        <div class="settings-grid two">
+          <label>Invoice premium berlaku (menit)<input type="number" name="premium_expiry_min" min="5" max="120" value="{e(settings['premium_expiry_min'])}"></label>
+        </div>
+        <label class="switch maintenance"><input type="checkbox" name="maintenance" value="1" {'checked' if settings['maintenance'] == '1' else ''}><span>Mode perawatan (tutup seluruh pembuatan akun &amp; pembelian)</span></label>
         <div class="form-actions"><button class="btn btn-primary" type="submit">Simpan pengaturan</button></div>
       </form>
     </section>
 
     <aside class="admin-side">
       <section class="panel admin-panel">
-        <div class="panel-head"><div><span class="mini-label">HARI INI</span><h2>Pemakaian kuota</h2></div></div>
+        <div class="panel-head"><div><span class="mini-label">HARI INI</span><h2>Kuota free</h2></div></div>
         <div class="quota-strip vertical">{quota_rows}</div>
         <form method="post" action="/admin/reset-quota" class="inline-form" data-confirm="Reset hitungan kuota hari ini? Akun tidak dihapus, hanya hitungannya dikosongkan.">
           <input type="hidden" name="_csrf" value="{e(session['csrf'])}">
@@ -1830,20 +2995,70 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
         </form>
       </section>
       <section class="panel admin-panel">
-        <div class="panel-head"><div><span class="mini-label">KEAMANAN</span><h2>Ganti password</h2></div></div>
-        <form method="post" action="/admin/password" class="stack-form compact">
+        <div class="panel-head"><div><span class="mini-label">GOPAY</span><h2>Status gateway</h2></div>{gopay_badge}</div>
+        {token_warn}
+        {gopay_error_html}
+        <div class="kv-list">
+          <div><span>Base URL</span><b>{e(gstat['base'])}</b></div>
+          <div><span>Token GoPay</span><b>{'Ada' if gstat['token'] else 'Tidak ada'}</b></div>
+          <div><span>QRIS statis</span><b>{'Ada' if gstat['static_qr'] else 'Tidak ada'}</b></div>
+          <div><span>Cek terakhir</span><b>{e(last_check)}</b></div>
+          <div><span>Match terakhir</span><b>{e(last_match)}</b></div>
+          <div><span>Invoice pending</span><b>{e(gstat['pending'])}</b></div>
+        </div>
+        <form method="post" action="/admin/gopay/test" class="inline-form" data-confirm="Tes koneksi ke gateway GoPay sekarang?">
           <input type="hidden" name="_csrf" value="{e(session['csrf'])}">
-          <label>Password saat ini<input type="password" name="current" autocomplete="current-password" required></label>
-          <label>Password baru<input type="password" name="new" autocomplete="new-password" minlength="10" required></label>
-          <label>Ulangi password baru<input type="password" name="confirm" autocomplete="new-password" minlength="10" required></label>
-          <button class="btn btn-dark btn-block" type="submit">Perbarui password</button>
+          <button class="btn btn-small btn-ghost" type="submit">Test GoPay</button>
         </form>
+        <p class="panel-hint">Token diambil dari bot. Jika expired, refresh lewat bot Store Admin → GoPay.</p>
       </section>
     </aside>
   </div>
 
+  <section class="panel admin-panel">
+    <div class="panel-head"><div><span class="mini-label">PREMIUM</span><h2>Paket jualan</h2></div><span class="panel-hint">Harga tidak termasuk kode unik Rp1–999.</span></div>
+    <form method="post" action="/admin/premium" class="premium-table-form">
+      <input type="hidden" name="_csrf" value="{e(session['csrf'])}">
+      <div class="table-wrap">
+        <table class="premium-table">
+          <thead><tr><th>Layanan</th><th>Hari</th><th>Harga</th><th>Limit IP</th><th>Kuota GB</th><th>Aktif</th></tr></thead>
+          <tbody>{product_rows}</tbody>
+        </table>
+      </div>
+      <div class="form-actions"><button class="btn btn-primary btn-small" type="submit">Simpan paket premium</button></div>
+    </form>
+    <details class="add-product">
+      <summary>+ Tambah paket premium</summary>
+      <form method="post" action="/admin/premium/add" class="settings-grid add-product-form">
+        <input type="hidden" name="_csrf" value="{e(session['csrf'])}">
+        <label>Layanan<select name="protocol"><option value="ssh">SSH</option><option value="vmess">VMess</option><option value="vless">VLESS</option><option value="trojan">Trojan</option></select></label>
+        <label>Label<input type="text" name="label" placeholder="SSH 30 Hari" maxlength="40"></label>
+        <label>Hari<input type="number" name="days" min="1" max="365" value="30"></label>
+        <label>Harga (Rp)<input type="number" name="price" min="1000" max="10000000" value="10000"></label>
+        <label>Limit IP<input type="number" name="ip_limit" min="0" max="100" value="2"></label>
+        <label>Kuota GB<input type="number" name="quota_gb" min="0" max="10000" value="0"></label>
+        <div class="form-actions"><button class="btn btn-dark btn-small" type="submit">Tambah paket</button></div>
+      </form>
+    </details>
+  </section>
+
   <section class="panel admin-panel accounts-panel">
-    <div class="panel-head"><div><span class="mini-label">AKUN WEBSITE</span><h2>80 akun terbaru</h2></div><span class="panel-hint">Hanya akun buatan website yang bisa dihapus di sini.</span></div>
+    <div class="panel-head"><div><span class="mini-label">RIWAYAT PREMIUM</span><h2>Transaksi &amp; invoice</h2></div></div>
+    <form method="get" action="/admin" class="admin-search">
+      <input type="text" name="q" value="{e(q)}" placeholder="Cari invoice, username, atau IP...">
+      <button class="btn btn-small btn-ghost" type="submit">Cari</button>
+      {'' if not q else '<a class="btn btn-small btn-ghost" href="/admin">Reset</a>'}
+    </form>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Invoice</th><th>Paket</th><th>Total</th><th>Dibuat</th><th>Status</th><th>Akun</th><th></th></tr></thead>
+        <tbody>{order_rows}</tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="panel admin-panel accounts-panel">
+    <div class="panel-head"><div><span class="mini-label">AKUN FREE</span><h2>Akun website terbaru</h2></div><span class="panel-hint">Hanya akun free buatan website.</span></div>
     <div class="table-wrap">
       <table>
         <thead><tr><th>Akun</th><th>IP</th><th>Dibuat</th><th>Berakhir</th><th>Status</th><th></th></tr></thead>
@@ -1859,6 +3074,130 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
 </main>
 """
     return page_shell("Admin Dashboard", body, admin=True, noindex=True)
+
+
+def render_check_invoice(form_token: str, error: str = "", code: str = "") -> str:
+    err = f'<div class="notice notice-error">{e(error)}</div>' if error else ""
+    body = f"""
+<main class="invoice-page wrap">
+  <div class="section-head">
+    <div><div class="eyebrow"><span class="dot"></span> CEK INVOICE</div><h2>Buka lagi<br>pesanan Anda.</h2></div>
+    <p>Masukkan kode invoice yang tampil setelah pembelian. Tidak perlu login.</p>
+  </div>
+  <div class="panel check-page-card">
+    {err}
+    <form method="post" action="/cek-invoice" class="stack-form">
+      <input type="hidden" name="_form" value="{e(form_token)}">
+      <label>Kode Invoice
+        <input type="text" name="invoice" value="{e(code)}" placeholder="HITS-YYMMDD-XXXXXXXX" autocomplete="off" spellcheck="false" required autofocus>
+      </label>
+      <button class="btn btn-primary" type="submit">Buka invoice</button>
+    </form>
+    <p class="form-note">Kode invoice bersifat privat. Jangan bagikan ke orang lain.</p>
+  </div>
+  <p class="check-back"><a href="/">&larr; Kembali ke HITS SSH</a></p>
+</main>
+"""
+    return page_shell("Cek Invoice", body, noindex=True)
+
+
+def rupiah(value) -> str:
+    return "Rp " + format(int(value), ",d").replace(",", ".")
+
+
+def render_invoice(row: sqlite3.Row, new: bool = False) -> str:
+    status = row["status"]
+    label = f"{row['protocol'].upper()} · {row['days']} hari"
+    status_text = {
+        "PENDING": "Menunggu pembayaran",
+        "PAID": "Pembayaran diterima",
+        "PROVISIONING": "Menyiapkan akun",
+        "COMPLETED": "Selesai",
+        "FAILED": "Pembayaran diterima, akun gagal dibuat",
+        "EXPIRED": "Invoice kedaluwarsa",
+    }.get(status, status)
+    status_class = "ok" if status == "COMPLETED" else ("warn" if status in ("PENDING", "PAID", "PROVISIONING") else "bad")
+    total = int(row["total"])
+    unique = int(row["unique_code"])
+    price = int(row["price"])
+    expires = fmt_ts(row["expires_at"], "%d %b %Y · %H:%M WIB")
+    paid = fmt_ts(row["paid_at"], "%d %b %Y · %H:%M WIB") if row["paid_at"] else "-"
+    qr_img = f'<img class="qr-img" src="/invoice/{e(row["invoice"])}/qr.svg" alt="QRIS GoPay" width="260" height="260">'
+    pending_block = f"""
+    <div class="invoice-pay">
+      <div class="qr-box">{qr_img}<span>Scan dengan aplikasi bank / e-wallet</span></div>
+      <div class="pay-detail">
+        <span class="mini-label">TOTAL PEMBAYARAN</span>
+        <div class="pay-total">{rupiah(total)}</div>
+        <div class="pay-breakdown">{rupiah(price)} + kode unik {rupiah(unique)}</div>
+        <div class="pay-expiry">Bayar sebelum <b>{e(expires)}</b></div>
+        <div class="pay-countdown" id="invoice-countdown" data-expires="{int(row['expires_at'])}">--:--</div>
+        <div class="notice notice-warn invoice-warning"><b>WAJIB SALIN KODE INVOICE.</b> Simpan kode ini untuk mengecek ulang pesanan.</div>
+        <div class="invoice-code-line"><code>{e(row['invoice'])}</code><button type="button" class="btn btn-small btn-ghost" data-copy="{e(row['invoice'])}">Salin invoice</button></div>
+        <div class="pay-status" id="invoice-live-status">Status: <b>{e(status_text)}</b></div>
+      </div>
+    </div>"""
+    completed_block = f"""
+    <div class="invoice-done">
+      <div class="success-mark">✓</div>
+      <div><div class="eyebrow"><span class="dot"></span> PEMBAYARAN BERHASIL</div><h2>Akun sudah aktif.</h2><p>Invoice <b>{e(row['invoice'])}</b> · {e(label)} · dibayar {e(paid)}.</p></div>
+      <div class="invoice-actions">
+        <button type="button" class="btn btn-small btn-ghost" id="copy-invoice-account">Salin akun</button>
+        <a class="btn btn-small btn-dark" href="/invoice/{e(row['invoice'])}.txt" download>Unduh .txt</a>
+      </div>
+    </div>
+    <pre class="account-output invoice-output" id="invoice-account">{e(row['account_output'])}</pre>"""
+    failed_block = f"""
+    <div class="invoice-failed">
+      <div class="error-code">!</div>
+      <div><div class="eyebrow"><span class="dot"></span> PEMBAYARAN DITERIMA</div><h2>Akun belum berhasil dibuat.</h2><p>Simpan invoice ini dan hubungi admin. Pembayaran Anda sudah tercatat.</p><div class="invoice-code-line"><code>{e(row['invoice'])}</code><button type="button" class="btn btn-small btn-ghost" data-copy="{e(row['invoice'])}">Salin invoice</button></div></div>
+    </div>"""
+    expired_block = f"""
+    <div class="invoice-expired">
+      <div class="error-code">⌛</div>
+      <div><div class="eyebrow"><span class="dot"></span> INVOICE KEDALUWARSA</div><h2>Waktu pembayaran habis.</h2><p>Invoice ini sudah lewat batas. Silakan buat pesanan baru, atau cek kembali beberapa saat jika Anda sudah terlanjur membayar.</p></div>
+    </div>"""
+    content = pending_block if status in ("PENDING", "PAID", "PROVISIONING") else (completed_block if status == "COMPLETED" else (failed_block if status == "FAILED" else expired_block))
+    modal = ""
+    if new and status in ("PENDING", "PAID", "PROVISIONING"):
+        modal = f"""
+<dialog class="invoice-dialog" id="invoice-dialog">
+  <div class="dialog-icon">{icon('shield')}</div>
+  <h2>Salin kode invoice sekarang.</h2>
+  <p>Kode ini satu-satunya cara membuka kembali pesanan tanpa login. Jangan tutup halaman sebelum menyimpannya.</p>
+  <div class="dialog-code"><code>{e(row['invoice'])}</code><button type="button" class="btn btn-small btn-dark" data-copy="{e(row['invoice'])}">Salin</button></div>
+  <div class="dialog-warning">Saya sudah menyalin kode invoice</div>
+  <button type="button" class="btn btn-primary btn-block" id="invoice-dialog-close">Saya sudah menyimpan</button>
+</dialog>"""
+    data = json.dumps(
+        {"invoice": row["invoice"], "status": status, "expires_at": int(row["expires_at"])},
+        ensure_ascii=False,
+    ).replace("</", "<\\/")
+    body = f"""
+<main class="invoice-page wrap">
+  <div class="invoice-head">
+    <div class="eyebrow"><span class="dot"></span> INVOICE PREMIUM</div>
+    <h1>{e(row['invoice'])}</h1>
+    <div class="invoice-meta">
+      <span class="badge badge-{status_class}">{e(status_text)}</span>
+      <span>{e(label)}</span>
+      <span>Dibuat {e(fmt_ts(row['created_at'], '%d %b %Y · %H:%M WIB'))}</span>
+    </div>
+  </div>
+  <div class="invoice-shell panel">
+    {content}
+    <div class="invoice-foot">
+      <span>Invoice <b>{e(row['invoice'])}</b></span>
+      <span>Total <b>{rupiah(total)}</b></span>
+      <a href="/cek-invoice">Cek invoice lain</a>
+      <a href="/#premium">Beli paket lain</a>
+    </div>
+  </div>
+</main>
+{modal}
+<script type="application/json" id="invoice-data">{data}</script>
+"""
+    return page_shell("Invoice " + row["invoice"], body, noindex=True)
 
 
 def render_error(message: str, retry: bool = False) -> str:
@@ -1916,6 +3255,8 @@ def main() -> int:
             print(ADMIN_CRED_PATH.read_text(encoding="utf-8"))
         return 0
 
+    threading.Thread(target=payment_daemon, name="gopay-poller", daemon=True).start()
+
     if not Path(SSH_SCRIPT).exists():
         logger.warning("script %s tidak ditemukan", SSH_SCRIPT)
     for cfg in PROTOCOLS.values():
@@ -1923,7 +3264,7 @@ def main() -> int:
             logger.warning("script %s tidak ditemukan", cfg["script"])
 
     httpd = Server((args.host, args.port), Handler)
-    logger.info("VPNFree listening on %s:%s", args.host, args.port)
+    logger.info("HITS SSH listening on %s:%s", args.host, args.port)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

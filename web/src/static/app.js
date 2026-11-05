@@ -1,4 +1,4 @@
-/* VPNFree interactions */
+/* HITS SSH interactions */
 (function () {
   "use strict";
 
@@ -13,11 +13,13 @@
 
   var quota = readJson("quota-data");
   var webcfg = readJson("web-config") || {
+    free: true,
     ssh: true,
     xray: true,
     protocols: { vmess: true, vless: true, trojan: true },
     maintenance: false
   };
+  var premium = readJson("premium-data") || { products: [] };
   var form = $("#create-form");
 
   function selected(serviceName) {
@@ -41,6 +43,7 @@
   }
 
   function serviceAvailable(service) {
+    if (webcfg.free === false) return false;
     if (service === "ssh") return webcfg.ssh !== false;
     if (service === "xray") return webcfg.xray !== false;
     return false;
@@ -199,6 +202,97 @@
     updateUI();
   }
 
+  function premiumRp(value) {
+    return "Rp " + Number(value).toLocaleString("id-ID");
+  }
+
+  var premiumForm = $("#premium-form");
+  var premiumProductInput = $("#premium-product");
+  var premiumButton = $("#premium-button");
+  var premiumSummary = $("#premium-summary");
+  var premiumState = { protocol: "", code: "" };
+
+  function premiumItems(protocol) {
+    return (premium.products || []).filter(function (p) { return p.protocol === protocol; });
+  }
+
+  function choosePremiumProduct(product) {
+    if (!product) {
+      premiumState.code = "";
+      if (premiumProductInput) premiumProductInput.value = "";
+      if (premiumButton) premiumButton.disabled = true;
+      if (premiumSummary) premiumSummary.hidden = true;
+      return;
+    }
+    premiumState.code = product.code;
+    if (premiumProductInput) premiumProductInput.value = product.code;
+    if (premiumButton) premiumButton.disabled = false;
+    if (premiumSummary) premiumSummary.hidden = false;
+    var name = $("#premium-summary-name");
+    var price = $("#premium-summary-price");
+    var days = $("#premium-summary-days");
+    if (name) name.textContent = product.label;
+    if (price) price.textContent = premiumRp(product.price) + " + kode unik";
+    if (days) days.textContent = product.days + " hari";
+  }
+
+  function renderPremiumDurations(protocol) {
+    var box = $("#premium-durations");
+    if (!box) return;
+    var items = premiumItems(protocol);
+    box.innerHTML = "";
+    if (!items.length) {
+      box.innerHTML = '<p class="premium-hint">Belum ada paket untuk layanan ini.</p>';
+      choosePremiumProduct(null);
+      return;
+    }
+    items.forEach(function (item) {
+      var button = document.createElement("button");
+      button.type = "button";
+      button.className = "premium-duration";
+      button.setAttribute("data-code", item.code);
+      button.innerHTML = '<b>' + item.days + ' hari</b><span>' + premiumRp(item.price) + '</span>';
+      button.addEventListener("click", function () {
+        $$(".premium-duration").forEach(function (node) { node.classList.remove("selected"); });
+        button.classList.add("selected");
+        choosePremiumProduct(item);
+      });
+      box.appendChild(button);
+    });
+    var first = box.querySelector(".premium-duration");
+    if (first) first.click();
+  }
+
+  function selectPremiumProtocol(protocol) {
+    premiumState.protocol = protocol;
+    $$(".premium-service").forEach(function (node) {
+      node.classList.toggle("selected", node.getAttribute("data-protocol") === protocol);
+    });
+    renderPremiumDurations(protocol);
+  }
+
+  $$(".premium-service").forEach(function (button) {
+    button.addEventListener("click", function () {
+      selectPremiumProtocol(button.getAttribute("data-protocol"));
+    });
+  });
+
+  if (premiumForm) {
+    premiumForm.addEventListener("submit", function (event) {
+      if (!premiumState.code) {
+        event.preventDefault();
+        return;
+      }
+      if (premiumButton) {
+        premiumButton.disabled = true;
+        premiumButton.innerHTML = '<span class="spinner"></span> Membuat invoice…';
+      }
+    });
+  }
+
+  var firstPremium = $(".premium-service");
+  if (firstPremium) firstPremium.click();
+
   var countdown = $("#reset-countdown");
   if (countdown && quota && quota.reset_at) {
     var resetAt = Number(quota.reset_at) * 1000;
@@ -270,6 +364,72 @@
     });
   }
 
+  document.addEventListener("click", function (event) {
+    var button = event.target.closest ? event.target.closest("[data-copy]") : null;
+    if (!button) return;
+    var text = button.getAttribute("data-copy") || "";
+    copyText(text).then(function (ok) {
+      var old = button.textContent;
+      button.textContent = ok ? "Tersalin ✓" : "Gagal salin";
+      window.setTimeout(function () { button.textContent = old; }, 1800);
+    });
+  });
+
+  var copyInvoiceAccount = $("#copy-invoice-account");
+  if (copyInvoiceAccount) {
+    copyInvoiceAccount.addEventListener("click", function () {
+      var output = $("#invoice-account");
+      if (!output) return;
+      copyText(output.textContent || "").then(function (ok) {
+        copyInvoiceAccount.textContent = ok ? "Tersalin ✓" : "Gagal salin";
+        window.setTimeout(function () { copyInvoiceAccount.textContent = "Salin akun"; }, 1800);
+      });
+    });
+  }
+
+  var invoiceData = readJson("invoice-data");
+  if (invoiceData && invoiceData.invoice) {
+    var invoiceDialog = $("#invoice-dialog");
+    if (invoiceDialog && typeof invoiceDialog.showModal === "function") {
+      invoiceDialog.showModal();
+    }
+    var dialogClose = $("#invoice-dialog-close");
+    if (dialogClose && invoiceDialog) {
+      dialogClose.addEventListener("click", function () { invoiceDialog.close(); });
+    }
+
+    var invoiceCountdown = $("#invoice-countdown");
+    if (invoiceCountdown) {
+      var expires = Number(invoiceCountdown.getAttribute("data-expires")) * 1000;
+      var updateInvoiceCountdown = function () {
+        var diff = Math.max(0, expires - Date.now());
+        var total = Math.floor(diff / 1000);
+        var m = Math.floor(total / 60);
+        var s = total % 60;
+        invoiceCountdown.textContent = diff > 0 ? ("Sisa " + String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0")) : "Waktu habis";
+      };
+      updateInvoiceCountdown();
+      window.setInterval(updateInvoiceCountdown, 1000);
+    }
+
+    var pollInvoice = function () {
+      fetch("/api/invoice/" + encodeURIComponent(invoiceData.invoice), { cache: "no-store" })
+        .then(function (r) { return r.json(); })
+        .then(function (data) {
+          if (!data || !data.ok) return;
+          if (data.status !== invoiceData.status) {
+            window.clearInterval(invoicePollTimer);
+            window.location.reload();
+          }
+        })
+        .catch(function () {});
+    };
+    var invoicePollTimer = null;
+    if (["PENDING", "PAID", "PROVISIONING", "EXPIRED"].indexOf(invoiceData.status) >= 0) {
+      invoicePollTimer = window.setInterval(pollInvoice, 5000);
+    }
+  }
+
   $$("form[data-confirm]").forEach(function (formNode) {
     formNode.addEventListener("submit", function (event) {
       var message = formNode.getAttribute("data-confirm") || "Lanjutkan?";
@@ -283,7 +443,7 @@
       var target = document.querySelector(link.getAttribute("href"));
       if (target) {
         event.preventDefault();
-        target.scrollIntoView({ behavior: "smooth", block: "start" });
+        target.scrollIntoView({ block: "start" });
       }
     });
   });

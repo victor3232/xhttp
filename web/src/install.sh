@@ -34,6 +34,11 @@ if ! command -v certbot >/dev/null 2>&1; then
     DEBIAN_FRONTEND=noninteractive apt-get update -qq
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq certbot >/dev/null
 fi
+if ! python3 -c 'import qrcode' >/dev/null 2>&1; then
+    echo "Memasang generator QRIS..."
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-qrcode >/dev/null
+fi
 if [ ! -x /usr/sbin/haproxy ]; then
     echo "HAProxy tidak ditemukan. Pastikan script VPN utama sudah terpasang." >&2
     exit 1
