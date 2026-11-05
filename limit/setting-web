@@ -51,6 +51,40 @@ dns_ips() {
 valid_domain() {
     [[ "$1" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$ ]]
 }
+turnstile_active() {
+    [ "$(conf_get TURNSTILE_ENABLED)" = "1" ] && [ -n "$(conf_get TURNSTILE_SITE_KEY)" ] && [ -n "$(conf_get TURNSTILE_SECRET_KEY)" ]
+}
+turnstile_summary() {
+    if turnstile_active; then
+        local site
+        site=$(conf_get TURNSTILE_SITE_KEY)
+        printf 'AKTIF (site: %s...)' "${site:0:14}"
+    else
+        printf 'nonaktif'
+    fi
+}
+turnstile_test_secret() {
+    local secret resp
+    secret=$(conf_get TURNSTILE_SECRET_KEY)
+    if [ -z "$secret" ]; then
+        echo -e "  ${YELLOW}Secret belum diatur.${NC}"; return 1
+    fi
+    echo "  Menguji secret ke Cloudflare..."
+    resp=$(curl -4 -sS --max-time 25 -X POST \
+        --data-urlencode "secret=$secret" \
+        --data-urlencode "response=dummy-token-for-validation" \
+        https://challenges.cloudflare.com/turnstile/v0/siteverify 2>/dev/null || true)
+    if echo "$resp" | grep -q '"success":true'; then
+        echo -e "  ${GREEN}Secret valid (test key selalu lolos).${NC}"
+    elif echo "$resp" | grep -q 'invalid-input-response'; then
+        echo -e "  ${GREEN}Secret valid.${NC} Token dummy ditolak seperti seharusnya."
+    elif echo "$resp" | grep -q 'invalid-input-secret'; then
+        echo -e "  ${RED}Secret TIDAK VALID.${NC} Periksa Secret Key di Cloudflare."
+    else
+        echo -e "  ${YELLOW}Tidak bisa memastikan otomatis.${NC}"
+        echo "  Respons: ${resp:-kosong}"
+    fi
+}
 rollback_domain() {
     local backup="$1" old="$2"
     echo -e "  ${YELLOW}Mengembalikan konfigurasi domain lama...${NC}"
@@ -78,6 +112,7 @@ status_line() {
     printf '  Service       : %s  (boot: %s)\n' "${act:-unknown}" "${boot:-unknown}"
     printf '  Domain        : %s\n' "${dom:--}"
     printf '  IP VPS        : %s\n' "$(server_ip)"
+    printf '  Turnstile     : %s\n' "$(turnstile_summary)"
     if [ -n "$dom" ]; then
         printf '  DNS resolve   : %s\n' "$(dns_ips "$dom" | tr '\n' ' ' | sed 's/ $//')"
         code=$(curl -k -sS --max-time 8 -o /dev/null -w '%{http_code}' "https://$dom/healthz" 2>/dev/null || true)
@@ -175,6 +210,104 @@ test_access() {
     fi
     code=$(curl -k -sS --max-time 10 -o /dev/null -w '%{http_code}' "https://$dom/healthz" 2>/dev/null || true)
     echo "  https://$dom  -> HTTP ${code:-000}"
+}
+
+turnstile_setup() {
+    ensure_conf
+    local site="${1:-}" secret="${2:-}" resp answer code dom
+    clear
+    echo -e "${B}=========================================================${NC}"
+    echo -e "           ${B}CLOUDFLARE TURNSTILE${NC}"
+    echo -e "${B}=========================================================${NC}"
+    echo "  Status saat ini : $(turnstile_summary)"
+    echo "  Site Key   = dipasang di widget website."
+    echo "  Secret Key = disimpan di server, jangan dibagikan."
+    echo -e "${B}=========================================================${NC}"
+    if [ -z "$site" ]; then
+        read -rp "  Site Key   : " site
+    fi
+    if [ -z "$secret" ]; then
+        read -rp "  Secret Key : " secret
+    fi
+    site=$(printf '%s' "$site" | tr -d '[:space:]')
+    secret=$(printf '%s' "$secret" | tr -d '[:space:]')
+    if [ -z "$site" ] || [ -z "$secret" ]; then
+        echo -e "  ${RED}Site Key dan Secret Key wajib diisi.${NC}"; return 1
+    fi
+    if ! [[ "$site" =~ ^0x4[A-Za-z0-9_-]{10,}$ ]]; then
+        echo -e "  ${RED}Format Site Key tidak valid.${NC}"; return 1
+    fi
+    if ! [[ "$secret" =~ ^0x4[A-Za-z0-9_-]{10,}$ ]]; then
+        echo -e "  ${RED}Format Secret Key tidak valid.${NC}"; return 1
+    fi
+
+    echo "  Memvalidasi Secret Key ke Cloudflare..."
+    resp=$(curl -4 -sS --max-time 25 -X POST \
+        --data-urlencode "secret=$secret" \
+        --data-urlencode "response=dummy-token-for-validation" \
+        https://challenges.cloudflare.com/turnstile/v0/siteverify 2>/dev/null || true)
+    if echo "$resp" | grep -q 'invalid-input-secret'; then
+        echo -e "  ${RED}Secret Key ditolak Cloudflare.${NC}"
+        echo "  Pastikan Anda memasukkan Secret Key, bukan Site Key."
+        return 1
+    elif echo "$resp" | grep -q 'invalid-input-response'; then
+        echo -e "  ${GREEN}Secret Key valid.${NC}"
+    elif echo "$resp" | grep -q '"success":true'; then
+        echo -e "  ${GREEN}Secret Key valid (test key).${NC}"
+    else
+        echo -e "  ${YELLOW}Tidak bisa memvalidasi otomatis (jaringan/gateway).${NC}"
+        echo "  Respons: ${resp:-kosong}"
+        read -rp "  Simpan tetap? [y/N]: " answer
+        case "$answer" in y|Y|ya|YA) ;; *) echo -e "  ${YELLOW}Dibatalkan.${NC}"; return 1 ;; esac
+    fi
+
+    conf_set TURNSTILE_ENABLED 1
+    conf_set TURNSTILE_SITE_KEY "$site"
+    conf_set TURNSTILE_SECRET_KEY "$secret"
+    echo "  Menyimpan dan me-restart website..."
+    systemctl restart "$SERVICE" >/dev/null 2>&1
+    sleep 2
+    dom=$(conf_get DOMAIN)
+    code=$(curl -k -sS --max-time 12 -o /dev/null -w '%{http_code}' "https://$dom/healthz" 2>/dev/null || true)
+    if [ "$code" = "200" ]; then
+        echo -e "  ${GREEN}Turnstile aktif.${NC} Website: https://$dom"
+    else
+        echo -e "  ${YELLOW}Kunci tersimpan, tetapi health HTTPS = ${code:-000}.${NC}"
+        echo "  Cek: systemctl status $SERVICE --no-pager"
+    fi
+}
+
+turnstile_disable() {
+    ensure_conf
+    conf_set TURNSTILE_ENABLED 0
+    systemctl restart "$SERVICE" >/dev/null 2>&1
+    echo -e "  ${YELLOW}Turnstile dinonaktifkan.${NC}"
+}
+
+turnstile_menu() {
+    while true; do
+        clear
+        echo -e "${B}=========================================================${NC}"
+        echo -e "           ${B}CLOUDFLARE TURNSTILE${NC}"
+        echo -e "${B}=========================================================${NC}"
+        echo "  Status        : $(turnstile_summary)"
+        echo "  Site Key      : $(conf_get TURNSTILE_SITE_KEY)"
+        echo "  Secret Key    : $(if [ -n "$(conf_get TURNSTILE_SECRET_KEY)" ]; then echo 'tersimpan (disamarkan)'; else echo '-'; fi)"
+        echo -e "${B}=========================================================${NC}"
+        echo "  1) Pasang / ubah Site Key & Secret Key"
+        echo "  2) Nonaktifkan Turnstile"
+        echo "  3) Tes Secret Key"
+        echo "  0) Kembali"
+        echo -e "${B}=========================================================${NC}"
+        read -rp "  Pilih [0-3]: " answer
+        case "$answer" in
+            1) turnstile_setup; read -rp "  Enter..." _ ;;
+            2) turnstile_disable; read -rp "  Enter..." _ ;;
+            3) turnstile_test_secret; read -rp "  Enter..." _ ;;
+            0) return 0 ;;
+            *) ;;
+        esac
+    done
 }
 
 change_domain() {
@@ -297,14 +430,16 @@ interactive() {
         echo "  2) OFF — stop + disable, data tetap aman"
         echo "  3) Tes akses domain"
         echo "  4) Ganti domain / subdomain (wajib pointing DNS)"
+        echo "  5) Cloudflare Turnstile (site key & secret)"
         echo "  0) Kembali"
         echo -e "${B}=========================================================${NC}"
-        read -rp "  Pilih [0-4]: " p
+        read -rp "  Pilih [0-5]: " p
         case "$p" in
             1) turn_on; read -rp "  Enter..." _ ;;
             2) turn_off; read -rp "  Enter..." _ ;;
             3) test_access; read -rp "  Enter..." _ ;;
             4) change_domain; read -rp "  Enter..." _ ;;
+            5) turnstile_menu ;;
             0) return 0 ;;
             *) ;;
         esac
@@ -318,6 +453,8 @@ case "${1:-}" in
     status) status_line ;;
     test) test_access ;;
     domain|DOMAIN|4) change_domain ;;
+    turnstile|TURNSTILE|5) turnstile_menu ;;
+    turnstile-set) shift; turnstile_setup "${1:-}" "${2:-}" ;;
     "" ) interactive ;;
-    *) echo "Usage: setting-web [on|off|status|test|domain]"; exit 64 ;;
+    *) echo "Usage: setting-web [on|off|status|test|domain|turnstile|turnstile-set SITE SECRET]"; exit 64 ;;
 esac

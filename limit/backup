@@ -101,6 +101,8 @@ BERKAS="
 /usr/local/sbin/kyt-web-cert-sync
 /usr/local/sbin/issue-cert.sh
 /usr/local/sbin/kyt-web-wait-dns
+/usr/local/sbin/kyt-web-configure-edge
+/usr/local/sbin/vpnfree.conf.tpl
 /root/kyt-web-admin.txt
 /etc/kyt-web.conf
 /usr/local/sbin/setting-web
@@ -226,6 +228,9 @@ cek_isi "etc/xray/config.json"       "konfigurasi Xray"
 cek_isi "etc/xray/xray.key"          "sertifikat TLS Xray"
 cek_isi "etc/haproxy/hap.pem"        "sertifikat haproxy"
 cek_isi "usr/bin/kyt/database.db"    "database bot (saldo/pesanan)"
+cek_isi "etc/kyt-web.conf"           "konfigurasi website + Turnstile"
+cek_isi "opt/kyt-web/app.py"         "aplikasi website"
+cek_isi "usr/local/sbin/kyt-web-configure-edge" "pengatur domain website"
 
 # ---------- kirim ke Telegram ----------
 KEY=""

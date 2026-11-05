@@ -49,24 +49,15 @@ kytline 50
 echo ""
 
 # ---------- cari file zip ----------
-echo -e " ${CYAN}File .zip yang tersedia:${NC}"
+echo -e " ${CYAN}File .zip yang tersedia (terbaru di atas):${NC}"
 echo ""
-i=0
-DAFTAR=""
-for f in /root/*.zip /root/backup/*.zip; do
-    [ -f "$f" ] || continue
-    i=$((i + 1))
-    UK=$(stat -c%s "$f" 2>/dev/null || echo 0)
-    if [ "$UK" -lt 1048576 ]; then
-        T="$((UK / 1024)) KB"
-    else
-        T=$(awk "BEGIN{printf \"%.2f MB\", $UK/1048576}")
-    fi
-    printf "   [%d] %-42s %s\n" "$i" "$(basename "$f")" "$T"
-    DAFTAR="$DAFTAR$f\n"
-done
+CANDIDATES=()
+while IFS= read -r f; do
+    [ -f "$f" ] && CANDIDATES+=("$f")
+done < <(find /root /root/backup -maxdepth 1 -type f -name '*.zip' -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2-)
+i=${#CANDIDATES[@]}
 
-if [ "$i" = "0" ]; then
+if [ "$i" -eq 0 ]; then
     echo -e "   ${YELLOW}(tidak ada file .zip di /root atau /root/backup)${NC}"
     echo ""
     kytline 50
@@ -82,10 +73,21 @@ if [ "$i" = "0" ]; then
     read -rp " Pilih [T] File ID / Enter untuk kembali: " PILIH
     if [[ -z "$PILIH" ]]; then menu-backup; exit 0; fi
 else
-echo ""
-echo -e " ${CYAN}[T]${NC} Restore dari Telegram File ID"
-echo ""
-read -rp " Pilih nomor file / [T] File ID: " PILIH
+    for idx in "${!CANDIDATES[@]}"; do
+        f="${CANDIDATES[$idx]}"
+        n=$((idx + 1))
+        UK=$(stat -c%s "$f" 2>/dev/null || echo 0)
+        if [ "$UK" -lt 1048576 ]; then
+            T="$((UK / 1024)) KB"
+        else
+            T=$(awk "BEGIN{printf \"%.2f MB\", $UK/1048576}")
+        fi
+        printf "   [%d] %-42s %8s  %s\n" "$n" "$(basename "$f")" "$T" "$(date -r "$f" '+%d-%m %H:%M' 2>/dev/null)"
+    done
+    echo ""
+    echo -e " ${CYAN}[T]${NC} Restore dari Telegram File ID"
+    echo ""
+    read -rp " Pilih nomor file / [T] File ID: " PILIH
 fi
 
 if [[ "$PILIH" == "t" || "$PILIH" == "T" ]]; then
@@ -127,8 +129,10 @@ fi
 
 if [ -f "$PILIH" ]; then
     ZIP="$PILIH"
+elif [[ "$PILIH" =~ ^[0-9]+$ ]]; then
+    ZIP="${CANDIDATES[$((PILIH - 1))]:-}"
 else
-    ZIP=$(echo -e "$DAFTAR" | sed -n "${PILIH}p")
+    ZIP=""
 fi
 
 if [ -z "$ZIP" ] || [ ! -f "$ZIP" ]; then
@@ -139,7 +143,14 @@ if [ -z "$ZIP" ] || [ ! -f "$ZIP" ]; then
 fi
 
 echo ""
-echo -e " ${CYAN}File dipilih:${NC} $(basename "$ZIP")"
+echo -e " ${CYAN}File dipilih:${NC} $ZIP"
+echo -e " ${YELLOW}Ketik RESTORE untuk melanjutkan.${NC}"
+read -rp " Konfirmasi: " KONFIRMASI
+if [ "$KONFIRMASI" != "RESTORE" ]; then
+    echo -e " ${YELLOW}Restore dibatalkan. Tidak ada data yang diubah.${NC}"
+    menu-backup
+    exit 0
+fi
 
 # ---------- 1. periksa zip ----------
 echo -e " ${CYAN}[1/5]${NC} Memeriksa keutuhan zip..."
@@ -263,7 +274,7 @@ if [ -d "$AKAR/etc" ]; then
     for _unit in jeda-mullog vmip vlip trip limitssh kyt-web; do
         [ -f "$AKAR/etc/systemd/system/${_unit}.service" ] && salin "$AKAR/etc/systemd/system/${_unit}.service" "/etc/systemd/system/${_unit}.service"
     done
-    for _f in kyt-web-cert-sync issue-cert.sh kyt-web-wait-dns; do
+    for _f in kyt-web-cert-sync issue-cert.sh kyt-web-wait-dns kyt-web-configure-edge vpnfree.conf.tpl; do
         [ -f "$AKAR/usr/local/sbin/$_f" ] && salin "$AKAR/usr/local/sbin/$_f" "/usr/local/sbin/$_f"
     done
     [ -f "$AKAR/root/kyt-web-admin.txt" ] && salin "$AKAR/root/kyt-web-admin.txt" "/root/kyt-web-admin.txt"
@@ -318,9 +329,10 @@ done
 for f in /etc/ipsec.secrets /etc/ppp/chap-secrets /etc/xray/xray.key /etc/haproxy/hap.pem; do
     [ -f "$f" ] && chmod 600 "$f" 2>/dev/null
 done
-for f in /usr/local/sbin/jeda-mullog /usr/local/sbin/setting-jeda /usr/local/sbin/utility /usr/bin/limit-ip /etc/xray/limit.ssh; do
+for f in /usr/local/sbin/jeda-mullog /usr/local/sbin/setting-jeda /usr/local/sbin/utility /usr/local/sbin/kyt-web-configure-edge /usr/local/sbin/setting-web /usr/bin/limit-ip /etc/xray/limit.ssh; do
     [ -f "$f" ] && chmod 755 "$f" 2>/dev/null
 done
+[ -f /usr/local/sbin/vpnfree.conf.tpl ] && chmod 644 /usr/local/sbin/vpnfree.conf.tpl 2>/dev/null
 for f in /etc/systemd/system/jeda-mullog.service /etc/systemd/system/vmip.service /etc/systemd/system/vlip.service /etc/systemd/system/trip.service /etc/systemd/system/limitssh.service; do
     [ -f "$f" ] && chmod 644 "$f" 2>/dev/null
 done

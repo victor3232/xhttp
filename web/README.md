@@ -62,16 +62,15 @@ Saat ON pertama, `setting-web` meminta domain dengan default
 - Cek invoice, download detail akun `.txt`, dan riwayat transaksi admin.
 - Login admin memakai token bot Telegram.
 
-## Halaman publik
+## Cloudflare Turnstile
 
-- `/` — Beranda dan ringkasan kategori.
-- `/gratis` — pembuatan akun SSH/Xray gratis.
-- `/premium` — pembelian akun premium QRIS GoPay.
-- `/cek-invoice` — cek invoice dan riwayat lokal perangkat.
-- `/kontak` — kontak/bantuan, link diatur dari Admin Dashboard.
+- Diatur dari Utility → `26 SETTING WEBSITE` → `5 Cloudflare Turnstile`.
+- Site Key dipakai widget; Secret Key diverifikasi server-side.
+- Wajib aktif untuk pembuatan akun gratis dan pembuatan invoice premium.
+- Kunci disimpan di `/etc/kyt-web.conf` dan ikut backup/restore.
 
-## Ganti subdomain
+## Backup & restore
 
-Buka Utility → `26 SETTING WEBSITE` → `4 Ganti domain / subdomain`.
-Wajib membuat DNS A record ke IP VPS dan mengetik `POINTING` sebelum proses.
-Script akan memverifikasi HTTP, menerbitkan SSL, dan rollback otomatis jika gagal.
+- Backup menyertakan `/opt/kyt-web`, `/etc/kyt-web.conf`, bot token, GoPay token,
+  sertifikat, konfigurasi Nginx/HAProxy, dan script pengatur domain.
+- Restore menampilkan arsip terbaru di atas dan meminta konfirmasi `RESTORE`.

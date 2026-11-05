@@ -75,6 +75,38 @@ def read_web_conf() -> dict[str, str]:
 
 _WEB_CONF = read_web_conf()
 PUBLIC_HOST = _WEB_CONF.get("DOMAIN", "vpnfree.stunnelv4.biz.id") or "vpnfree.stunnelv4.biz.id"
+TURNSTILE_VERIFY_URL = "https://challenges.cloudflare.com/turnstile/v0/siteverify"
+
+
+def turnstile_config() -> tuple[str, str, bool]:
+    conf = read_web_conf()
+    site = (conf.get("TURNSTILE_SITE_KEY") or "").strip()
+    secret = (conf.get("TURNSTILE_SECRET_KEY") or "").strip()
+    enabled = (conf.get("TURNSTILE_ENABLED") or "0").strip() == "1" and bool(site) and bool(secret)
+    return site, secret, enabled
+
+
+def verify_turnstile(token: str, ip: str) -> tuple[bool, str]:
+    _site, secret, enabled = turnstile_config()
+    if not enabled:
+        return True, ""
+    token = (token or "").strip()
+    if not token:
+        return False, "Selesaikan verifikasi keamanan Turnstile terlebih dahulu."
+    payload = urllib.parse.urlencode(
+        {"secret": secret, "response": token, "remoteip": ip}
+    ).encode("utf-8")
+    try:
+        req = urllib.request.Request(TURNSTILE_VERIFY_URL, data=payload, method="POST")
+        with urllib.request.urlopen(req, timeout=12) as resp:
+            result = json.loads(resp.read().decode("utf-8", "replace"))
+    except Exception as exc:
+        logger.warning("turnstile verify error: %s", exc)
+        return False, "Verifikasi keamanan sedang tidak tersedia. Coba lagi beberapa saat."
+    if result.get("success") is True:
+        return True, ""
+    logger.warning("turnstile rejected: %s", result.get("error-codes") or [])
+    return False, "Verifikasi keamanan tidak valid. Muat ulang halaman lalu coba lagi."
 BRAND = "HITS SSH"
 FORM_COOKIE = "kyt_form"
 ADMIN_COOKIE = "kyt_admin"
@@ -1920,6 +1952,10 @@ class Handler(BaseHTTPRequestHandler):
                 render_error("Terlalu banyak percobaan. Tunggu beberapa menit lalu coba lagi."),
             )
             return
+        ts_ok, ts_msg = verify_turnstile(body.get("cf-turnstile-response", ""), self.client_ip())
+        if not ts_ok:
+            self.html(400, render_error(ts_msg, retry=True))
+            return
         try:
             account = create_account(
                 service,
@@ -1945,6 +1981,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         if not rate_ok("premium:" + self.client_ip(), 6, 600):
             self.html(429, render_error("Terlalu banyak percobaan. Tunggu beberapa menit lalu coba lagi."))
+            return
+        ts_ok, ts_msg = verify_turnstile(body.get("cf-turnstile-response", ""), self.client_ip())
+        if not ts_ok:
+            self.html(400, render_error(ts_msg, retry=True))
             return
         product_code = body.get("product_code", "").strip()[:40]
         if not re.fullmatch(r"[a-z0-9-]{3,40}", product_code):
@@ -2334,8 +2374,13 @@ def favicon_svg() -> str:
     return ""
 
 
-def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False, active: str = "") -> str:
+def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False, active: str = "", turnstile: bool = False) -> str:
     robots = '<meta name="robots" content="noindex,nofollow">' if noindex else ""
+    turnstile_script = (
+        '<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>'
+        if turnstile
+        else ""
+    )
     if admin:
         header = f"""
 <header class="nav nav-admin">
@@ -2412,13 +2457,14 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
 <meta name="theme-color" content="#fffaf2">
 {robots}
 <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="/static/style.css?v=20261105hits2">
+<link rel="stylesheet" href="/static/style.css?v=20261105hits3">
+{turnstile_script}
 </head>
 <body>
 {header}
 {body}
 {footer}
-<script src="/static/app.js?v=20261105hits2" defer></script>
+<script src="/static/app.js?v=20261105hits3" defer></script>
 </body>
 </html>"""
 
@@ -2709,6 +2755,15 @@ def render_home(form_token: str, settings: dict[str, str]) -> str:
 def render_free_page(form_token: str, settings: dict[str, str]) -> str:
     fc = _free_context(settings)
     quota = fc["quota"]
+    ts_site, _ts_secret, ts_on = turnstile_config()
+    ts_widget = (
+        '<div class="turnstile-box">'
+        f'<div class="cf-turnstile" data-sitekey="{e(ts_site)}" data-theme="light" data-language="id" data-size="flexible"></div>'
+        '<small>Verifikasi keamanan wajib sebelum akun dibuat.</small>'
+        '</div>'
+        if ts_on
+        else ""
+    )
     quota_json = json.dumps(quota, ensure_ascii=False).replace("</", "<\\/")
     web_config_json = json.dumps(fc["web_config"], ensure_ascii=False).replace("</", "<\\/")
     chips = (
@@ -2776,6 +2831,7 @@ def render_free_page(form_token: str, settings: dict[str, str]) -> str:
         </fieldset>
       </div>
 
+      {ts_widget}
       <div class="creator-bottom">
         <div class="quota-readout" id="quota-readout" aria-live="polite">
           <div class="quota-ring" id="quota-ring"><span id="quota-remaining">—</span></div>
@@ -2804,12 +2860,21 @@ def render_free_page(form_token: str, settings: dict[str, str]) -> str:
 <script type="application/json" id="quota-data">{quota_json}</script>
 <script type="application/json" id="web-config">{web_config_json}</script>
 """
-    return page_shell("Buat Akun Gratis", body, active="free")
+    return page_shell("Buat Akun Gratis", body, active="free", turnstile=ts_on)
 
 
 def render_premium_page(form_token: str, settings: dict[str, str]) -> str:
     pc = _premium_context(settings)
     premium_json = json.dumps(pc["data"], ensure_ascii=False).replace("</", "<\\/")
+    ts_site, _ts_secret, ts_on = turnstile_config()
+    ts_widget = (
+        '<div class="turnstile-box premium-turnstile">'
+        f'<div class="cf-turnstile" data-sitekey="{e(ts_site)}" data-theme="light" data-language="id" data-size="flexible"></div>'
+        '<small>Verifikasi keamanan wajib sebelum invoice dibuat.</small>'
+        '</div>'
+        if ts_on
+        else ""
+    )
     chips = (
         f'<span class="page-chip">Mulai {rupiah(pc["cheapest"])}</span>'
         f'<span class="page-chip">Invoice {e(settings.get("premium_expiry_min", "15"))} menit</span>'
@@ -2846,6 +2911,7 @@ def render_premium_page(form_token: str, settings: dict[str, str]) -> str:
         <form id="premium-form" method="post" action="/premium/buy">
           <input type="hidden" name="_form" value="{e(form_token)}">
           <input type="hidden" name="product_code" id="premium-product" value="">
+          {ts_widget}
           <button class="btn btn-primary btn-block btn-premium" type="submit" id="premium-button" disabled>
             Beli via QRIS <span aria-hidden="true">↗</span>
           </button>
@@ -2890,7 +2956,7 @@ def render_premium_page(form_token: str, settings: dict[str, str]) -> str:
   </section>
 </main>
 """
-    return page_shell("Beli Akun Premium", body, active="premium")
+    return page_shell("Beli Akun Premium", body, active="premium", turnstile=ts_on)
 
 
 def normalize_contact_url(value: str) -> str:
