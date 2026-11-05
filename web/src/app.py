@@ -134,7 +134,7 @@ DEFAULTS = {
     "free_enabled": "1",
     "premium_enabled": "1",
     "premium_expiry_min": "15",
-    "gopay_base_url": "http://pgku.stunnelv4.biz.id",
+    "gopay_base_url": "https://pgku.stunnelv4.biz.id",
     "ssh_enabled": "1",
     "xray_enabled": "1",
     "vmess_enabled": "1",
@@ -914,7 +914,7 @@ def delete_account_record(row: sqlite3.Row) -> None:
 BOT_DB_LINE = Path("/etc/bot/.bot.db")
 BOT_KYT_DB = Path("/usr/bin/kyt/database.db")
 GOPAY_TOKEN_FILE = Path("/usr/bin/kyt/gomerch_token.json")
-GOPAY_DEFAULT_BASE = "http://pgku.stunnelv4.biz.id"
+GOPAY_DEFAULT_BASE = "https://pgku.stunnelv4.biz.id"
 GOPAY_LOCK = threading.Lock()
 _GOPAY_CACHE = {"ts": 0.0, "rows": []}
 _GOPAY_RATE_UNTIL = 0.0
