@@ -161,6 +161,20 @@ XRAY_CONFIG = Path("/etc/xray/config.json")
 HTML_DIR = Path("/var/www/html")
 MIHOMO_STATE = Path("/etc/kyt/jeda-mullog")
 
+UI_THEME_COLORS = {
+    "cream": "#fffaf2",
+    "midnight": "#070b14",
+    "ocean": "#06121f",
+    "forest": "#07120d",
+    "royal": "#12071f",
+}
+UI_THEMES = {
+    "cream": ("Cream", "Hangat, bersih, nyaman untuk penggunaan lama."),
+    "midnight": ("Midnight", "Navy gelap dengan aksen cyan neon."),
+    "ocean": ("Ocean", "Biru laut dalam dengan aksen sky blue."),
+    "forest": ("Forest", "Hijau gelap dengan aksen lime segar."),
+    "royal": ("Royal", "Ungu gelap dengan aksen pink neon."),
+}
 DEFAULT_META = "HITS SSH — akun VPN gratis dan premium SSH, VMess, VLESS, Trojan. Premium tanpa login, bayar QRIS GoPay."
 DEFAULT_HERO_TITLE = "Internet bebas,"
 DEFAULT_HERO_TITLE_ACCENT = "akun langsung jadi."
@@ -176,6 +190,7 @@ DEFAULTS = {
     "hero_lead": DEFAULT_HERO_LEAD,
     "brand_logo": "",
     "brand_logo_version": "",
+    "ui_theme": "cream",
     "maintenance": "0",
     "free_enabled": "1",
     "premium_enabled": "1",
@@ -475,9 +490,13 @@ def branding() -> dict[str, str]:
         settings = {}
     name = (settings.get("brand_name") or BRAND).strip()[:40] or BRAND
     accent = (settings.get("brand_accent") or "").strip()[:20]
+    theme = (settings.get("ui_theme") or "cream").strip()
+    if theme not in UI_THEMES:
+        theme = "cream"
     return {
         "name": name,
         "accent": accent,
+        "theme": theme,
         "meta": (settings.get("meta_description") or DEFAULT_META).strip()[:300],
         "hero_title": (settings.get("hero_title") or DEFAULT_HERO_TITLE).strip()[:100],
         "hero_title_accent": (settings.get("hero_title_accent") or DEFAULT_HERO_TITLE_ACCENT).strip()[:100],
@@ -2056,6 +2075,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/admin/branding":
                 self.admin_branding()
                 return
+            if path == "/admin/theme":
+                self.admin_theme()
+                return
             self.html(404, render_not_found())
         except ValueError as exc:
             self.html(400, render_error(str(exc)))
@@ -2435,6 +2457,19 @@ class Handler(BaseHTTPRequestHandler):
         audit("branding", f"{values['brand_name']} logo={logo_error or values.get('brand_logo', 'keep')}", self.client_ip())
         self.redirect("/admin?msg=brandingfail" if logo_error else "/admin?msg=branding")
 
+    def admin_theme(self) -> None:
+        body = self.parse_body()
+        session = self.require_admin(body.get("_csrf", ""))
+        if not session:
+            return
+        theme = body.get("ui_theme", "cream").strip()
+        if theme not in UI_THEMES:
+            self.redirect("/admin?msg=themefail")
+            return
+        set_settings({"ui_theme": theme})
+        audit("theme", theme, self.client_ip())
+        self.redirect("/admin?msg=theme")
+
     def admin_delete(self) -> None:
         body = self.parse_body()
         session = self.require_admin(body.get("_csrf", ""))
@@ -2623,23 +2658,23 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
   </div>
 </footer>"""
     return f"""<!doctype html>
-<html lang="id">
+<html lang="id" class="theme-{e(b["theme"])}">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{e(title)} — {e(brand_name)}</title>
 <meta name="description" content="{e(b['meta'])}">
-<meta name="theme-color" content="#fffaf2">
+<meta name="theme-color" content="{UI_THEME_COLORS.get(b['theme'], '#fffaf2')}">
 {robots}
 {favicon}
-<link rel="stylesheet" href="/static/style.css?v=20261105hits6">
+<link rel="stylesheet" href="/static/style.css?v=20261105hits8">
 {turnstile_script}
 </head>
 <body>
 {header}
 {body}
 {footer}
-<script src="/static/app.js?v=20261105hits6" defer></script>
+<script src="/static/app.js?v=20261105hits8" defer></script>
 </body>
 </html>"""
 
@@ -3332,6 +3367,8 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
         "gopayfail": ("error", "Gagal membaca history GoPay. Cek status gateway/token."),
         "branding": ("ok", "Branding disimpan. Perubahan langsung dipakai di semua halaman."),
         "brandingfail": ("error", "Logo gagal diproses. Periksa format, ukuran minimal 128×128, dan ukuran file."),
+        "theme": ("ok", "Tema UI diterapkan ke website dan dashboard."),
+        "themefail": ("error", "Tema tidak dikenal. Pilih salah satu tema yang tersedia."),
     }
     notice = ""
     if msg in messages:
@@ -3439,6 +3476,16 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
     logo_path = brand_logo_path("logo")
     logo_preview_src = f"/branding/logo?v={e(b['logo_version'])}" if logo_path else "/static/favicon.svg"
     logo_label = "Logo kustom aktif" if logo_path else "Belum ada logo kustom"
+    current_theme = b["theme"]
+    theme_cards = ""
+    for theme_key, (theme_label, theme_desc) in UI_THEMES.items():
+        theme_cards += (
+            f'<label class="theme-option{" selected" if current_theme == theme_key else ""}">'
+            f'<input type="radio" name="ui_theme" value="{theme_key}"'
+            f'{" checked" if current_theme == theme_key else ""}>'
+            f'<span class="theme-swatch theme-{theme_key}"><i></i><i></i><i></i></span>'
+            f'<b>{e(theme_label)}</b><small>{e(theme_desc)}</small></label>'
+        )
 
     body = f"""
 <main class="admin-main wrap">
@@ -3503,6 +3550,16 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
         <p>{e(settings.get('hero_title', DEFAULT_HERO_TITLE))} <em>{e(settings.get('hero_title_accent', DEFAULT_HERO_TITLE_ACCENT))}</em></p>
       </div>
       <div class="form-actions"><button class="btn btn-primary btn-small" type="submit">Simpan branding</button></div>
+    </form>
+  </section>
+
+  <section class="panel admin-panel theme-panel">
+    <div class="panel-head"><div><span class="mini-label">TEMA UI</span><h2>Warna website &amp; dashboard</h2></div><span class="badge badge-ok">{e(UI_THEMES[current_theme][0])} aktif</span></div>
+    <form method="post" action="/admin/theme" class="theme-form">
+      <input type="hidden" name="_csrf" value="{e(session['csrf'])}">
+      <div class="theme-grid">{theme_cards}</div>
+      <p class="panel-hint">Warna font otomatis menyesuaikan: tema terang memakai teks gelap, tema gelap memakai teks terang.</p>
+      <div class="form-actions"><button class="btn btn-primary btn-small" type="submit">Terapkan tema</button></div>
     </form>
   </section>
 
