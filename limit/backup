@@ -231,6 +231,9 @@ cek_isi "usr/bin/kyt/database.db"    "database bot (saldo/pesanan)"
 cek_isi "etc/kyt-web.conf"           "konfigurasi website + Turnstile"
 cek_isi "opt/kyt-web/app.py"         "aplikasi website"
 cek_isi "usr/local/sbin/kyt-web-configure-edge" "pengatur domain website"
+cek_isi "opt/kyt-web/data/web.db"     "database website (branding, tema, server)"
+cek_isi "opt/kyt-web/data/branding/"  "logo branding kustom"
+cek_isi "usr/local/sbin/setting-web"  "setting website (domain, Turnstile, server)"
 
 # ---------- kirim ke Telegram ----------
 KEY=""
