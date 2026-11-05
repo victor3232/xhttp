@@ -2632,14 +2632,14 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
 <meta name="theme-color" content="#fffaf2">
 {robots}
 {favicon}
-<link rel="stylesheet" href="/static/style.css?v=20261105hits5">
+<link rel="stylesheet" href="/static/style.css?v=20261105hits6">
 {turnstile_script}
 </head>
 <body>
 {header}
 {body}
 {footer}
-<script src="/static/app.js?v=20261105hits5" defer></script>
+<script src="/static/app.js?v=20261105hits6" defer></script>
 </body>
 </html>"""
 

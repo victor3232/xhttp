@@ -347,17 +347,38 @@
     window.setInterval(tick, 1000);
   }
 
+  function selectTextNode(node) {
+    if (!node) return;
+    try {
+      var range = document.createRange();
+      range.selectNodeContents(node);
+      var selection = window.getSelection();
+      selection.removeAllRanges();
+      selection.addRange(range);
+    } catch (e) {}
+  }
+
   function fallbackCopy(text) {
     var area = document.createElement("textarea");
     area.value = text;
     area.setAttribute("readonly", "");
     area.style.position = "fixed";
+    area.style.top = "0";
+    area.style.left = "0";
+    area.style.width = "1px";
+    area.style.height = "1px";
     area.style.opacity = "0";
-    document.body.appendChild(area);
+    area.style.pointerEvents = "none";
+    // Dialog berada di top layer; textarea harus ikut di dalam dialog
+    // agar select()/execCommand tidak diblokir focus trap.
+    var host = document.querySelector("dialog[open]") || document.body;
+    host.appendChild(area);
+    area.focus();
     area.select();
+    area.setSelectionRange(0, text.length);
     var ok = false;
     try { ok = document.execCommand("copy"); } catch (e) { ok = false; }
-    document.body.removeChild(area);
+    host.removeChild(area);
     return ok;
   }
 
@@ -404,11 +425,18 @@
     var button = event.target.closest ? event.target.closest("[data-copy]") : null;
     if (!button) return;
     var text = button.getAttribute("data-copy") || "";
+    var codeNode = button.parentElement ? button.parentElement.querySelector("code") : null;
     copyText(text).then(function (ok) {
       var old = button.textContent;
-      button.textContent = ok ? "Tersalin ✓" : "Gagal salin";
-      window.setTimeout(function () { button.textContent = old; }, 1800);
+      button.textContent = ok ? "Tersalin ✓" : "Kode dipilih — salin manual";
+      if (!ok) selectTextNode(codeNode);
+      window.setTimeout(function () { button.textContent = old; }, ok ? 1800 : 5000);
     });
+  });
+
+  document.addEventListener("click", function (event) {
+    var code = event.target.closest ? event.target.closest(".dialog-code code, .invoice-code-line code") : null;
+    if (code) selectTextNode(code);
   });
 
   var copyInvoiceAccount = $("#copy-invoice-account");
