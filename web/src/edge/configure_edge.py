@@ -47,7 +47,16 @@ HAPROXY_PEM.write_bytes(CERT.read_bytes() + b"\n" + KEY.read_bytes())
 os.chmod(HAPROXY_PEM, 0o600)
 
 # ---------- nginx server ----------
-template = (ROOT / "vpnfree.conf.tpl").read_text()
+template_path = ROOT / "vpnfree.conf.tpl"
+if not template_path.exists():
+    template_path = Path("/usr/local/sbin/vpnfree.conf.tpl")
+if template_path.exists():
+    template = template_path.read_text()
+else:
+    if not NGINX_CONF.exists():
+        raise SystemExit("template vpnfree.conf.tpl tidak ditemukan")
+    template = NGINX_CONF.read_text()
+    template = re.sub(r"(?m)^(\s*server_name\s+).*$", r"\1__DOMAIN__;", template)
 NGINX_CONF.write_text(template.replace("__DOMAIN__", DOMAIN))
 if NGINX_MAIN.exists():
     shutil.copy2(NGINX_MAIN, f"/root/nginx.conf.backup-kytweb-{stamp}")
@@ -76,20 +85,17 @@ if "crt /etc/haproxy/vpnfree.pem" not in text:
 
 # ACL: update domain kalau sudah ada, atau sisipkan baru.
 if "acl is_vpnfree_http" in text:
-    text = re.sub(r"(?m)^    acl is_vpnfree_http .*$", f"    acl is_vpnfree_http req.hdr(host) -i {DOMAIN}", text)
-    text = re.sub(r"(?m)^    acl is_vpnfree_ssl .*$", f"    acl is_vpnfree_ssl ssl_fc_sni -i {DOMAIN}", text)
-    if "acl is_vpnfree_ssl req.ssl_sni" not in text:
-        text = text.replace(
-            f"    acl is_vpnfree_ssl ssl_fc_sni -i {DOMAIN}\n",
-            f"    acl is_vpnfree_ssl ssl_fc_sni -i {DOMAIN}\n    acl is_vpnfree_ssl req.ssl_sni -i {DOMAIN}\n",
-            1,
-        )
-    if "acl is_tls ssl_fc" not in text:
-        text = text.replace(
-            f"    acl is_vpnfree_ssl req.ssl_sni -i {DOMAIN}\n",
-            f"    acl is_vpnfree_ssl req.ssl_sni -i {DOMAIN}\n    acl is_tls ssl_fc\n",
-            1,
-        )
+    text = re.sub(r"(?m)^\s*acl is_vpnfree_http .*$\n?", f"    acl is_vpnfree_http req.hdr(host) -i {DOMAIN}\n", text)
+    text = re.sub(r"(?m)^\s*acl is_vpnfree_ssl .*$\n?", "", text)
+    text = re.sub(r"(?m)^\s*acl is_tls ssl_fc\s*$\n?", "", text)
+    anchor = f"    acl is_vpnfree_http req.hdr(host) -i {DOMAIN}\n"
+    block = (
+        anchor
+        + f"    acl is_vpnfree_ssl ssl_fc_sni -i {DOMAIN}\n"
+        + f"    acl is_vpnfree_ssl req.ssl_sni -i {DOMAIN}\n"
+        + "    acl is_tls ssl_fc\n"
+    )
+    text = text.replace(anchor, block, 1)
 else:
     anchor = "    acl up-to ssl_fc_alpn -i h2\n"
     if anchor not in text:
@@ -98,8 +104,8 @@ else:
         anchor
         + f"    acl is_vpnfree_http req.hdr(host) -i {DOMAIN}\n"
         + f"    acl is_vpnfree_ssl ssl_fc_sni -i {DOMAIN}\n"
-        + "    acl is_tls ssl_fc\n"
         + f"    acl is_vpnfree_ssl req.ssl_sni -i {DOMAIN}\n"
+        + "    acl is_tls ssl_fc\n"
     )
     text = text.replace(anchor, block, 1)
 

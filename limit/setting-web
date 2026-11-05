@@ -39,6 +39,32 @@ default_domain() {
     base=$(cat /etc/xray/domain 2>/dev/null | tr -d '\r\n')
     [ -n "$base" ] && echo "web.$base" || echo ""
 }
+server_ip() {
+    local ip
+    ip=$(curl -4 -sS --max-time 6 https://api.ipify.org 2>/dev/null | tr -d '[:space:]')
+    [ -z "$ip" ] && ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+    printf '%s' "$ip"
+}
+dns_ips() {
+    getent ahostsv4 "$1" 2>/dev/null | awk '{print $1}' | sort -u
+}
+valid_domain() {
+    [[ "$1" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,}$ ]]
+}
+rollback_domain() {
+    local backup="$1" old="$2"
+    echo -e "  ${YELLOW}Mengembalikan konfigurasi domain lama...${NC}"
+    [ -f "$backup/kyt-web.conf" ] && cp -a "$backup/kyt-web.conf" "$CONF"
+    [ -f "$backup/haproxy.cfg" ] && cp -a "$backup/haproxy.cfg" /etc/haproxy/haproxy.cfg
+    [ -f "$backup/vpnfree.conf" ] && cp -a "$backup/vpnfree.conf" /etc/nginx/conf.d/vpnfree.conf
+    [ -f "$backup/vpnfree.crt" ] && cp -a "$backup/vpnfree.crt" /etc/ssl/kyt-web/vpnfree.crt
+    [ -f "$backup/vpnfree.key" ] && cp -a "$backup/vpnfree.key" /etc/ssl/kyt-web/vpnfree.key
+    [ -f "$backup/vpnfree.pem" ] && cp -a "$backup/vpnfree.pem" /etc/haproxy/vpnfree.pem
+    /usr/sbin/haproxy -c -f /etc/haproxy/haproxy.cfg >/dev/null 2>&1 && systemctl reload haproxy >/dev/null 2>&1
+    nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1
+    systemctl restart "$SERVICE" >/dev/null 2>&1
+    echo -e "  ${GREEN}Rollback selesai.${NC} Domain kembali ke: ${old:-domain lama}"
+}
 is_installed() { [ -s "$APP" ] && [ -d /opt/kyt-web/static ] && [ -s /etc/systemd/system/kyt-web.service ]; }
 is_active() { systemctl is-active --quiet "$SERVICE"; }
 
@@ -51,7 +77,9 @@ status_line() {
     printf '  Status data   : %s\n' "${en:-0}"
     printf '  Service       : %s  (boot: %s)\n' "${act:-unknown}" "${boot:-unknown}"
     printf '  Domain        : %s\n' "${dom:--}"
+    printf '  IP VPS        : %s\n' "$(server_ip)"
     if [ -n "$dom" ]; then
+        printf '  DNS resolve   : %s\n' "$(dns_ips "$dom" | tr '\n' ' ' | sed 's/ $//')"
         code=$(curl -k -sS --max-time 8 -o /dev/null -w '%{http_code}' "https://$dom/healthz" 2>/dev/null || true)
         printf '  Health HTTPS  : %s\n' "${code:-000}"
     fi
@@ -149,6 +177,114 @@ test_access() {
     echo "  https://$dom  -> HTTP ${code:-000}"
 }
 
+change_domain() {
+    ensure_conf
+    local old dom ip resolved answer stamp backup challenge code
+    old=$(conf_get DOMAIN)
+    ip=$(server_ip)
+    clear
+    echo -e "${B}=========================================================${NC}"
+    echo -e "              ${B}GANTI DOMAIN / SUBDOMAIN${NC}"
+    echo -e "${B}=========================================================${NC}"
+    echo "  Domain aktif : ${old:--}"
+    echo "  IP VPS       : ${ip:--}"
+    echo -e "${B}=========================================================${NC}"
+    echo -e "  ${RED}WAJIB POINTING DNS TERLEBIH DAHULU.${NC}"
+    echo "  Sebelum lanjut, buat DNS A record:"
+    echo -e "      ${B}<domain-baru>  ->  ${ip}${NC}"
+    echo "  Tunggu propagasi 1-10 menit. Jika memakai Cloudflare,"
+    echo "  origin harus VPS ini dan mode SSL minimal Full."
+    echo "  Jika DNS belum mengarah, proses akan dibatalkan otomatis."
+    echo -e "${B}=========================================================${NC}"
+    read -rp "  Domain/subdomain baru (contoh: hits.domain.com): " dom
+    dom=$(printf '%s' "$dom" | tr 'A-Z' 'a-z' | tr -d '[:space:]')
+    if [ -z "$dom" ]; then
+        echo -e "  ${YELLOW}Dibatalkan.${NC}"; return 1
+    fi
+    if ! valid_domain "$dom"; then
+        echo -e "  ${RED}Format domain tidak valid:${NC} $dom"
+        return 1
+    fi
+    if [ "$dom" = "$old" ]; then
+        echo -e "  ${YELLOW}Domain sama dengan yang aktif.${NC}"; return 1
+    fi
+    read -rp "  Ketik POINTING jika DNS sudah diarahkan: " answer
+    if [ "$answer" != "POINTING" ]; then
+        echo -e "  ${YELLOW}Dibatalkan. Tidak ada perubahan.${NC}"; return 1
+    fi
+
+    resolved=$(dns_ips "$dom" | tr '\n' ' ' | sed 's/ $//')
+    if [ -z "$resolved" ]; then
+        echo -e "  ${RED}DNS $dom belum resolve.${NC}"
+        echo "  Buat A record ke $ip lalu coba lagi."
+        return 1
+    fi
+    echo "  Resolve DNS  : $resolved"
+    if ! dns_ips "$dom" | grep -qx "$ip"; then
+        echo -e "  ${YELLOW}Peringatan: IP resolve bukan $ip.${NC}"
+        echo "  Ini normal jika memakai Cloudflare/proxy. Pastikan origin tetap VPS ini."
+        read -rp "  Lanjutkan? [y/N]: " answer
+        case "$answer" in
+            y|Y|ya|YA) ;;
+            *) echo -e "  ${YELLOW}Dibatalkan.${NC}"; return 1 ;;
+        esac
+    fi
+
+    stamp=$(date +%Y%m%d-%H%M%S)
+    backup="/root/kyt-web-domain-backup-$stamp"
+    mkdir -p "$backup"
+    cp -a "$CONF" "$backup/kyt-web.conf" 2>/dev/null || true
+    cp -a /etc/haproxy/haproxy.cfg "$backup/haproxy.cfg" 2>/dev/null || true
+    cp -a /etc/nginx/conf.d/vpnfree.conf "$backup/vpnfree.conf" 2>/dev/null || true
+    cp -a /etc/ssl/kyt-web/vpnfree.crt "$backup/vpnfree.crt" 2>/dev/null || true
+    cp -a /etc/ssl/kyt-web/vpnfree.key "$backup/vpnfree.key" 2>/dev/null || true
+    cp -a /etc/haproxy/vpnfree.pem "$backup/vpnfree.pem" 2>/dev/null || true
+
+    echo "  Menerapkan domain sementara..."
+    conf_set DOMAIN "$dom"
+    if ! python3 /usr/local/sbin/kyt-web-configure-edge "$dom"; then
+        echo -e "  ${RED}Gagal memasang edge untuk $dom.${NC}"
+        rollback_domain "$backup" "$old"
+        return 1
+    fi
+
+    mkdir -p /var/www/letsencrypt/.well-known/acme-challenge
+    printf 'kyt-domain-check' > /var/www/letsencrypt/.well-known/acme-challenge/kyt-domain-check
+    challenge=$(curl -4 -fsSL --max-time 25 "http://$dom/.well-known/acme-challenge/kyt-domain-check" 2>/dev/null | tr -d '\r\n')
+    rm -f /var/www/letsencrypt/.well-known/acme-challenge/kyt-domain-check
+    if [ "$challenge" != "kyt-domain-check" ]; then
+        echo -e "  ${RED}Verifikasi HTTP gagal.${NC}"
+        echo "  Domain belum mengarah ke VPS ini, atau port 80 terblokir."
+        echo "  Jika memakai Cloudflare, matikan sementara Always Use HTTPS / proxy."
+        rollback_domain "$backup" "$old"
+        return 1
+    fi
+
+    echo "  DNS + HTTP OK. Menerbitkan sertifikat Let's Encrypt..."
+    if ! /usr/local/sbin/issue-cert.sh "$dom"; then
+        echo -e "  ${RED}Sertifikat gagal diterbitkan.${NC}"
+        rollback_domain "$backup" "$old"
+        return 1
+    fi
+
+    systemctl restart "$SERVICE" >/dev/null 2>&1
+    sleep 2
+    code=$(curl -k -sS --max-time 12 -o /dev/null -w '%{http_code}' "https://$dom/healthz" 2>/dev/null || true)
+    if [ "$code" != "200" ]; then
+        echo -e "  ${RED}Health HTTPS gagal (${code:-000}).${NC}"
+        rollback_domain "$backup" "$old"
+        return 1
+    fi
+
+    printf "HITS SSH admin\nURL    : https://%s/admin\nLogin  : token bot Telegram\nToken  : awk '/^#bot# /{print \$2}' /etc/bot/.bot.db\n" "$dom" > /root/kyt-web-admin.txt
+    chmod 600 /root/kyt-web-admin.txt 2>/dev/null || true
+    echo -e "  ${GREEN}Domain berhasil diganti.${NC}"
+    echo "  Website baru : https://$dom"
+    echo "  Admin baru   : https://$dom/admin"
+    echo "  Backup       : $backup"
+    return 0
+}
+
 interactive() {
     while true; do
         clear
@@ -160,13 +296,15 @@ interactive() {
         echo "  1) ON  — install jika perlu, lalu jalankan website"
         echo "  2) OFF — stop + disable, data tetap aman"
         echo "  3) Tes akses domain"
+        echo "  4) Ganti domain / subdomain (wajib pointing DNS)"
         echo "  0) Kembali"
         echo -e "${B}=========================================================${NC}"
-        read -rp "  Pilih [0-3]: " p
+        read -rp "  Pilih [0-4]: " p
         case "$p" in
             1) turn_on; read -rp "  Enter..." _ ;;
             2) turn_off; read -rp "  Enter..." _ ;;
             3) test_access; read -rp "  Enter..." _ ;;
+            4) change_domain; read -rp "  Enter..." _ ;;
             0) return 0 ;;
             *) ;;
         esac
@@ -179,6 +317,7 @@ case "${1:-}" in
     off|OFF|0|2) turn_off ;;
     status) status_line ;;
     test) test_access ;;
+    domain|DOMAIN|4) change_domain ;;
     "" ) interactive ;;
-    *) echo "Usage: setting-web [on|off|status|test]"; exit 64 ;;
+    *) echo "Usage: setting-web [on|off|status|test|domain]"; exit 64 ;;
 esac

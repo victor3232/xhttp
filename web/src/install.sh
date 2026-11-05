@@ -53,6 +53,7 @@ find "$APP_DIR/static" -type f -exec chmod 644 {} +
 install -m 644 "$ROOT/kyt-web.service" /etc/systemd/system/kyt-web.service
 
 install -m 755 "$ROOT/edge/configure_edge.py" /usr/local/sbin/kyt-web-configure-edge
+install -m 644 "$ROOT/edge/vpnfree.conf.tpl" /usr/local/sbin/vpnfree.conf.tpl
 install -m 755 "$ROOT/edge/kyt-web-cert-sync" /usr/local/sbin/kyt-web-cert-sync
 install -m 755 "$ROOT/edge/issue-cert.sh" /usr/local/sbin/issue-cert.sh
 mkdir -p /etc/letsencrypt/renewal-hooks/deploy

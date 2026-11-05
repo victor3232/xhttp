@@ -135,6 +135,9 @@ DEFAULTS = {
     "premium_enabled": "1",
     "premium_expiry_min": "15",
     "gopay_base_url": "https://pgku.stunnelv4.biz.id",
+    "contact_telegram": "",
+    "contact_group": "",
+    "contact_note": "",
     "ssh_enabled": "1",
     "xray_enabled": "1",
     "vmess_enabled": "1",
@@ -1709,6 +1712,17 @@ class Handler(BaseHTTPRequestHandler):
                 token, cookie = self.public_form_token()
                 self.html(200, render_home(token, get_settings()), cookies=[cookie] if cookie else None, head_only=head_only)
                 return
+            if path == "/gratis" or path == "/gratis/":
+                token, cookie = self.public_form_token()
+                self.html(200, render_free_page(token, get_settings()), cookies=[cookie] if cookie else None, head_only=head_only)
+                return
+            if path == "/premium" or path == "/premium/":
+                token, cookie = self.public_form_token()
+                self.html(200, render_premium_page(token, get_settings()), cookies=[cookie] if cookie else None, head_only=head_only)
+                return
+            if path == "/kontak" or path == "/kontak/":
+                self.html(200, render_contact_page(get_settings()), head_only=head_only)
+                return
             if path == "/hasil" or path == "/hasil/":
                 self.html(404, render_not_found(), head_only=head_only)
                 return
@@ -2206,6 +2220,9 @@ class Handler(BaseHTTPRequestHandler):
         for proto in PROTOCOLS:
             values[f"{proto}_enabled"] = "1" if body.get(f"{proto}_enabled") == "1" else "0"
         values["maintenance"] = "1" if body.get("maintenance") == "1" else "0"
+        values["contact_telegram"] = normalize_contact_url(body.get("contact_telegram", ""))
+        values["contact_group"] = normalize_contact_url(body.get("contact_group", ""))
+        values["contact_note"] = body.get("contact_note", "").strip()[:300]
         set_settings(values)
         audit("settings", json.dumps(values, sort_keys=True), self.client_ip())
         self.redirect("/admin?msg=settings")
@@ -2317,23 +2334,74 @@ def favicon_svg() -> str:
     return ""
 
 
-def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False) -> str:
-    nav_extra = ""
-    if not admin:
-        nav_extra = (
-            '<a href="/#gratis">Gratis</a>'
-            '<a href="/#premium">Premium</a>'
-            '<a href="/cek-invoice">Cek Invoice</a>'
-            '<a href="/#faq">FAQ</a>'
-        )
-    else:
-        nav_extra = '<a href="/admin">Dashboard</a><a href="/" target="_blank" rel="noopener">Lihat situs</a>'
+def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False, active: str = "") -> str:
     robots = '<meta name="robots" content="noindex,nofollow">' if noindex else ""
-    nav_cta = (
-        '<a class="nav-cta" href="/" target="_blank" rel="noopener">Lihat situs <span aria-hidden="true">↗</span></a>'
-        if admin
-        else '<a class="nav-cta" href="/#premium">Beli premium <span aria-hidden="true">↗</span></a>'
-    )
+    if admin:
+        header = f"""
+<header class="nav nav-admin">
+  <div class="wrap nav-inner">
+    <a class="brand" href="/" aria-label="HITS SSH">
+      <span class="brand-mark">{logomark()}</span>
+      <span class="brand-word">HITS <span>SSH</span></span>
+    </a>
+    <nav class="nav-links nav-links-inline" aria-label="Menu admin">
+      <a href="/admin" class="active">Dashboard</a>
+      <a href="/" target="_blank" rel="noopener">Lihat situs</a>
+    </nav>
+    <a class="nav-cta" href="/" target="_blank" rel="noopener">Lihat situs <span aria-hidden="true">↗</span></a>
+  </div>
+</header>"""
+    else:
+        items = [
+            ("home", "/", "Beranda"),
+            ("premium", "/premium", "Beli Akun"),
+            ("free", "/gratis", "Buat Akun Gratis"),
+            ("invoice", "/cek-invoice", "Cek Invoice"),
+            ("contact", "/kontak", "Kontak / Bantuan"),
+        ]
+        menu_parts = []
+        for key, href, label in items:
+            cls = "nav-link" + (" active" if active == key else "")
+            aria = ' aria-current="page"' if active == key else ""
+            menu_parts.append(f'<a href="{href}" class="{cls}"{aria}>{label}</a>')
+        menu = "".join(menu_parts)
+        header = f"""
+<header class="nav nav-public">
+  <div class="wrap nav-inner">
+    <a class="brand" href="/" aria-label="HITS SSH">
+      <span class="brand-mark">{logomark()}</span>
+      <span class="brand-word">HITS <span>SSH</span></span>
+    </a>
+    <button class="nav-toggle" id="nav-toggle" type="button" aria-label="Buka menu" aria-expanded="false" aria-controls="site-menu">
+      <span></span><span></span><span></span>
+    </button>
+    <nav class="nav-links" id="site-menu" aria-label="Menu utama">
+      <div class="nav-drawer-head"><span class="mini-label">MENU HITS SSH</span></div>
+      {menu}
+      <a class="nav-drawer-cta" href="/premium">Beli akun premium <span aria-hidden="true">↗</span></a>
+      <div class="nav-drawer-foot"><a href="/admin">Admin</a><span>Free &amp; Premium</span></div>
+    </nav>
+  </div>
+</header>
+<div class="nav-scrim" id="nav-scrim" hidden></div>"""
+    footer = f"""
+<footer class="footer">
+  <div class="wrap footer-inner">
+    <div>
+      <div class="brand footer-brand"><span class="brand-mark">{logomark()}</span><span class="brand-word">HITS <span>SSH</span></span></div>
+      <p>Akun VPN gratis dan premium untuk belajar, bekerja, dan menjelajah dengan aman.</p>
+    </div>
+    <div class="footer-links">
+      <a href="/">Beranda</a>
+      <a href="/gratis">Akun gratis</a>
+      <a href="/premium">Premium</a>
+      <a href="/cek-invoice">Cek Invoice</a>
+      <a href="/kontak">Kontak</a>
+      <a href="/admin">Admin</a>
+    </div>
+    <div class="footer-note">HITS SSH · Free &amp; Premium · Gunakan dengan bijak.</div>
+  </div>
+</footer>"""
     return f"""<!doctype html>
 <html lang="id">
 <head>
@@ -2344,37 +2412,13 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
 <meta name="theme-color" content="#fffaf2">
 {robots}
 <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="/static/style.css?v=20261105hits1">
+<link rel="stylesheet" href="/static/style.css?v=20261105hits2">
 </head>
 <body>
-<header class="nav">
-  <div class="wrap nav-inner">
-    <a class="brand" href="/" aria-label="HITS SSH">
-      <span class="brand-mark">{logomark()}</span>
-      <span class="brand-word">HITS <span>SSH</span></span>
-    </a>
-    <nav class="nav-links">{nav_extra}</nav>
-    {nav_cta}
-  </div>
-</header>
+{header}
 {body}
-<footer class="footer">
-  <div class="wrap footer-inner">
-    <div>
-      <div class="brand footer-brand"><span class="brand-mark">{logomark()}</span><span class="brand-word">HITS <span>SSH</span></span></div>
-      <p>Akun VPN gratis dan premium untuk belajar, bekerja, dan menjelajah dengan aman.</p>
-    </div>
-    <div class="footer-links">
-      <a href="/#gratis">Akun gratis</a>
-      <a href="/#premium">Premium</a>
-      <a href="/cek-invoice">Cek Invoice</a>
-      <a href="/#faq">FAQ</a>
-      <a href="/admin">Admin</a>
-    </div>
-    <div class="footer-note">HITS SSH · Free &amp; Premium · Gunakan dengan bijak.</div>
-  </div>
-</footer>
-<script src="/static/app.js?v=20261105hits1" defer></script>
+{footer}
+<script src="/static/app.js?v=20261105hits2" defer></script>
 </body>
 </html>"""
 
@@ -2396,11 +2440,8 @@ def icon(name: str) -> str:
     return icons.get(name, "")
 
 
-def render_home(form_token: str, settings: dict[str, str]) -> str:
+def _free_context(settings: dict[str, str]) -> dict:
     quota = quota_state(settings)
-    quota_json = json.dumps(quota, ensure_ascii=False).replace("</", "<\\/")
-    ssh3 = quota["services"]["ssh"]["3"]
-    xr3 = quota["services"]["xray"]["3"]
     maintenance = settings.get("maintenance") == "1"
     free_on = settings.get("free_enabled", "1") == "1"
     ssh_global = settings.get("ssh_enabled", "1") == "1"
@@ -2411,16 +2452,7 @@ def render_home(form_token: str, settings: dict[str, str]) -> str:
     available = ssh_on or xray_on
     default_service = "ssh" if ssh_on else ("xray" if xray_on else "")
     first_proto = next((p for p in ("vmess", "vless", "trojan") if proto_on[p]), "")
-    maintenance_html = (
-        '<div class="notice notice-warn"><strong>Mode perawatan.</strong> Pembuatan akun sementara ditutup.</div>'
-        if maintenance
-        else ""
-    )
-    closed_html = ""
-    if not free_on:
-        closed_html = '<div class="notice notice-error"><strong>Kategori gratis ditutup.</strong> Admin sedang menutup pembuatan akun gratis.</div>'
-    elif not available:
-        closed_html = '<div class="notice notice-error"><strong>Semua layanan gratis ditutup.</strong> Admin sedang menutup pembuatan akun.</div>'
+
     proto_html = ""
     for proto, meta in PROTOCOLS.items():
         off = not proto_on[proto]
@@ -2431,58 +2463,138 @@ def render_home(form_token: str, settings: dict[str, str]) -> str:
             f'<input type="radio" name="protocol" value="{proto}" {checked} {disabled}>'
             f'<span>{e(meta["label"])}{" <small>OFF</small>" if off else ""}</span></label>'
         )
-    web_config = {
-        "free": free_on,
-        "ssh": ssh_on,
-        "xray": xray_on,
-        "protocols": proto_on,
+
+    maintenance_html = (
+        '<div class="notice notice-warn"><strong>Mode perawatan.</strong> Pembuatan akun sementara ditutup.</div>'
+        if maintenance
+        else ""
+    )
+    closed_html = ""
+    if not free_on:
+        closed_html = '<div class="notice notice-error"><strong>Kategori gratis ditutup.</strong> Admin sedang menutup pembuatan akun gratis.</div>'
+    elif not available:
+        closed_html = '<div class="notice notice-error"><strong>Semua layanan gratis ditutup.</strong> Admin sedang menutup pembuatan akun.</div>'
+
+    return {
+        "quota": quota,
         "maintenance": maintenance,
+        "free_on": free_on,
+        "ssh_on": ssh_on,
+        "xray_on": xray_on,
+        "available": available,
+        "default_service": default_service,
+        "proto_html": proto_html,
+        "maintenance_html": maintenance_html,
+        "closed_html": closed_html,
+        "proto_on": proto_on,
+        "web_config": {
+            "free": free_on,
+            "ssh": ssh_on,
+            "xray": xray_on,
+            "protocols": proto_on,
+            "maintenance": maintenance,
+        },
     }
-    web_config_json = json.dumps(web_config, ensure_ascii=False).replace("</", "<\\/")
+
+
+def _premium_context(settings: dict[str, str]) -> dict:
+    maintenance = settings.get("maintenance") == "1"
+    free_on = settings.get("free_enabled", "1") == "1"
+    ssh_global = settings.get("ssh_enabled", "1") == "1"
+    proto_on = {p: settings.get(f"{p}_enabled", "1") == "1" for p in PROTOCOLS}
+    xray_global = settings.get("xray_enabled", "1") == "1" and any(proto_on.values())
     premium_on = settings.get("premium_enabled", "1") == "1" and not maintenance
-    premium_rows = []
+    rows = []
     if premium_on:
-        for _p in premium_products(active_only=True):
-            if _p["protocol"] == "ssh" and not ssh_global:
+        for row in premium_products(active_only=True):
+            if row["protocol"] == "ssh" and not ssh_global:
                 continue
-            if _p["protocol"] in PROTOCOLS and (not xray_global or not proto_on.get(_p["protocol"], False)):
+            if row["protocol"] in PROTOCOLS and (
+                not xray_global or not proto_on.get(row["protocol"], False)
+            ):
                 continue
-            premium_rows.append(_p)
-    premium_on = premium_on and bool(premium_rows)
-    premium_data = {
+            rows.append(row)
+    premium_on = premium_on and bool(rows)
+
+    data = {
         "products": [
             {
-                "code": r["code"],
-                "protocol": r["protocol"],
-                "label": r["label"],
-                "days": r["days"],
-                "price": r["price"],
-                "ip_limit": r["ip_limit"],
-                "quota_gb": r["quota_gb"],
+                "code": row["code"],
+                "protocol": row["protocol"],
+                "label": row["label"],
+                "days": row["days"],
+                "price": row["price"],
+                "ip_limit": row["ip_limit"],
+                "quota_gb": row["quota_gb"],
             }
-            for r in premium_rows
+            for row in rows
         ],
         "expiry_min": int(settings.get("premium_expiry_min", "15")),
     }
-    premium_json = json.dumps(premium_data, ensure_ascii=False).replace("</", "<\\/")
-    premium_cards = ""
-    proto_labels = {"ssh": "SSH", "vmess": "VMess", "vless": "VLESS", "trojan": "Trojan"}
+
+    cards = ""
+    labels = {"ssh": "SSH", "vmess": "VMess", "vless": "VLESS", "trojan": "Trojan"}
     for proto in ("ssh", "vmess", "vless", "trojan"):
-        group = [r for r in premium_rows if r["protocol"] == proto]
+        group = [row for row in rows if row["protocol"] == proto]
         if not group:
             continue
-        cheapest = min(int(r["price"]) for r in group)
-        premium_cards += (
+        cheapest = min(int(row["price"]) for row in group)
+        cards += (
             f'<button class="premium-service" type="button" data-protocol="{proto}">'
             f'<span class="premium-service-icon">{icon("terminal" if proto == "ssh" else "bolt")}</span>'
-            f'<b>{proto_labels[proto]}</b>'
-            f'<small>mulai Rp {cheapest:,}</small></button>'.replace(",", ".")
+            f'<b>{labels[proto]}</b>'
+            f'<small>mulai {rupiah(cheapest)}</small></button>'
         )
-    premium_notice = ""
+
+    notice = ""
     if maintenance:
-        premium_notice = '<div class="notice notice-warn"><strong>Mode perawatan.</strong> Pembelian premium ditutup sementara.</div>'
-    elif not premium_on or not premium_rows:
-        premium_notice = '<div class="notice notice-warn"><strong>Premium sedang ditutup.</strong> Admin belum membuka paket jualan.</div>'
+        notice = '<div class="notice notice-warn"><strong>Mode perawatan.</strong> Pembelian premium ditutup sementara.</div>'
+    elif not premium_on or not rows:
+        notice = '<div class="notice notice-warn"><strong>Premium sedang ditutup.</strong> Admin belum membuka paket jualan.</div>'
+
+    cheapest_all = min((int(row["price"]) for row in rows), default=0)
+    return {
+        "premium_on": premium_on,
+        "rows": rows,
+        "data": data,
+        "cards": cards,
+        "notice": notice,
+        "maintenance": maintenance,
+        "free_on": free_on,
+        "ssh_global": ssh_global,
+        "xray_global": xray_global,
+        "proto_on": proto_on,
+        "cheapest": cheapest_all,
+    }
+
+
+def _page_hero(eyebrow: str, title_html: str, lead: str, chips: str = "") -> str:
+    chip_html = f'<div class="page-hero-chips">{chips}</div>' if chips else ""
+    return f"""
+  <section class="page-hero wrap">
+    <div class="page-hero-copy">
+      <div class="eyebrow"><span class="dot"></span> {eyebrow}</div>
+      <h1>{title_html}</h1>
+      <p class="page-hero-lead">{lead}</p>
+      {chip_html}
+    </div>
+    <a class="page-hero-back" href="/">← Beranda</a>
+  </section>"""
+
+
+def render_home(form_token: str, settings: dict[str, str]) -> str:
+    fc = _free_context(settings)
+    pc = _premium_context(settings)
+    quota = fc["quota"]
+    total_slots = (
+        quota["services"]["ssh"]["3"]["limit"]
+        + quota["services"]["ssh"]["7"]["limit"]
+        + quota["services"]["xray"]["3"]["limit"]
+        + quota["services"]["xray"]["7"]["limit"]
+    )
+    premium_price = rupiah(pc["cheapest"]) if pc["cheapest"] else "—"
+    free_note = "" if fc["free_on"] else '<div class="notice notice-error"><strong>Kategori gratis sedang ditutup.</strong></div>'
+    premium_note = "" if pc["premium_on"] else '<div class="notice notice-warn"><strong>Premium sedang ditutup.</strong></div>'
     body = f"""
 <main>
   <section class="hero wrap">
@@ -2491,12 +2603,12 @@ def render_home(form_token: str, settings: dict[str, str]) -> str:
       <h1>Internet bebas,<br><em>akun langsung jadi.</em></h1>
       <p class="hero-lead">Buat akun gratis dalam hitungan detik, atau beli akun premium lewat QRIS GoPay. Tanpa registrasi, tanpa email, dan invoice bisa dicek kembali kapan saja.</p>
       <div class="hero-actions">
-        <a class="btn btn-primary" href="#gratis">Akun gratis <span aria-hidden="true">↘</span></a>
-        <a class="btn btn-ghost" href="#premium">Beli premium</a>
+        <a class="btn btn-primary" href="/gratis">Buat akun gratis <span aria-hidden="true">↘</span></a>
+        <a class="btn btn-ghost" href="/premium">Beli akun premium</a>
       </div>
       <div class="hero-stats">
-        <div><strong>{ssh3['limit'] + quota['services']['ssh']['7']['limit'] + xr3['limit'] + quota['services']['xray']['7']['limit']}</strong><span>slot kuota / hari</span></div>
-        <div><strong>3–7</strong><span>hari masa aktif</span></div>
+        <div><strong>{total_slots}</strong><span>slot gratis / hari</span></div>
+        <div><strong>{premium_price}</strong><span>mulai premium</span></div>
         <div><strong>00.00</strong><span>reset otomatis WIB</span></div>
       </div>
     </div>
@@ -2515,8 +2627,8 @@ def render_home(form_token: str, settings: dict[str, str]) -> str:
         </div>
         <div class="ticket-rows">
           <div><span>LAYANAN</span><b>SSH / XRAY</b></div>
-          <div><span>MASA AKTIF</span><b>3 — 7 HARI</b></div>
-          <div><span>KUOTA</span><b>TERBATAS / HARI</b></div>
+          <div><span>MASA AKTIF</span><b>3 — 30 HARI</b></div>
+          <div><span>PEMBAYARAN</span><b>QRIS GOPAY</b></div>
         </div>
         <div class="ticket-barcode"></div>
       </div>
@@ -2532,39 +2644,113 @@ def render_home(form_token: str, settings: dict[str, str]) -> str:
     </div>
   </section>
 
-  <section class="section wrap free-section" id="gratis">
+  <section class="section wrap category-section" id="layanan">
     <div class="section-head">
       <div>
-        <div class="eyebrow"><span class="dot"></span> KATEGORI GRATIS</div>
-        <h2>Gratis dulu.<br>Langsung jadi.</h2>
+        <div class="eyebrow"><span class="dot"></span> PILIH KEBUTUHAN</div>
+        <h2>Dua kategori.<br>Satu tempat.</h2>
       </div>
-      <p>Kuota dihitung per layanan dan di-reset otomatis setiap tengah malam WIB.</p>
+      <p>Gratis untuk coba-coba, premium untuk masa aktif lebih panjang. Keduanya tanpa akun website dan tanpa email.</p>
     </div>
-    {maintenance_html}
-    {closed_html}
+    {free_note}
+    {premium_note}
+    <div class="category-grid">
+      <article class="category-card free-card">
+        <div class="category-top"><span class="category-tag">GRATIS</span><span class="category-price">Rp 0</span></div>
+        <h3>Akun gratis</h3>
+        <p>Cocok untuk uji coba, tugas, dan pemakaian singkat. Kuota dibuat adil per layanan.</p>
+        <ul>
+          <li>SSH, VMess, VLESS, Trojan</li>
+          <li>Masa aktif 3 atau 7 hari</li>
+          <li>Kuota harian, reset 00.00 WIB</li>
+          <li>Limit IP diatur admin</li>
+        </ul>
+        <a class="btn btn-primary btn-block" href="/gratis">Buat akun gratis <span aria-hidden="true">↗</span></a>
+      </article>
+      <article class="category-card premium-card">
+        <div class="category-top"><span class="category-tag">PREMIUM</span><span class="category-price">{premium_price}</span></div>
+        <h3>Akun premium</h3>
+        <p>Masa aktif lebih panjang, limit IP dan kuota per paket, tanpa kuota pembelian harian.</p>
+        <ul>
+          <li>Multi-durasi 3 / 7 / 30 hari</li>
+          <li>SSH, VMess, VLESS, Trojan</li>
+          <li>Bayar QRIS GoPay</li>
+          <li>Invoice bisa dicek ulang</li>
+        </ul>
+        <a class="btn btn-dark btn-block" href="/premium">Beli akun premium <span aria-hidden="true">↗</span></a>
+      </article>
+    </div>
+  </section>
+
+  <section class="section wrap steps" id="cara">
+    <div class="section-head"><div><div class="eyebrow"><span class="dot"></span> CARA PAKAI</div><h2>Tiga langkah, langsung terhubung.</h2></div></div>
+    <div class="step-grid">
+      <article><span class="step-num">01</span><h3>Pilih layanan</h3><p>Buat akun gratis, atau pilih paket premium sesuai masa aktif.</p></article>
+      <article><span class="step-num">02</span><h3>Simpan data</h3><p>Gratis: salin output. Premium: simpan invoice lalu unduh file .txt.</p></article>
+      <article><span class="step-num">03</span><h3>Impor ke aplikasi</h3><p>Masukkan host, port, dan kredensial ke aplikasi tunnel pilihan Anda.</p></article>
+    </div>
+  </section>
+
+  <section class="section wrap faq" id="faq">
+    <div class="section-head"><div><div class="eyebrow"><span class="dot"></span> FAQ</div><h2>Pertanyaan yang sering muncul.</h2></div></div>
+    <div class="faq-list">
+      <details><summary>Apakah akun gratis benar-benar gratis?</summary><p>Ya. Tidak ada pembayaran, email, atau pendaftaran. Kuota harian dibatasi agar layanan tetap tersedia untuk semua orang.</p></details>
+      <details><summary>Apa bedanya akun gratis dan premium?</summary><p>Akun gratis memakai kuota harian dan masa aktif 3–7 hari. Premium berbayar, tanpa kuota pembelian harian, dengan masa aktif dan limit yang diatur per paket.</p></details>
+      <details><summary>Bagaimana kalau saya lupa invoice premium?</summary><p>Buka halaman Cek Invoice, lalu masukkan kode invoice yang tampil setelah pembelian. Tidak perlu login.</p></details>
+      <details><summary>Apakah akun bisa dipakai di beberapa perangkat?</summary><p>Bisa, selama jumlah IP yang login tidak melebihi batas paket. Pelanggaran limit IP dapat menyebabkan akun dibekukan sementara.</p></details>
+      <details><summary>Butuh bantuan lain?</summary><p>Buka halaman <a href="/kontak">Kontak / Bantuan</a>. Admin dapat mengatur link Telegram atau grup komunitas dari dashboard.</p></details>
+    </div>
+  </section>
+</main>
+"""
+    return page_shell("Beranda", body, active="home")
+
+
+def render_free_page(form_token: str, settings: dict[str, str]) -> str:
+    fc = _free_context(settings)
+    quota = fc["quota"]
+    quota_json = json.dumps(quota, ensure_ascii=False).replace("</", "<\\/")
+    web_config_json = json.dumps(fc["web_config"], ensure_ascii=False).replace("</", "<\\/")
+    chips = (
+        f'<span class="page-chip">{quota["services"]["ssh"]["3"]["limit"] + quota["services"]["ssh"]["7"]["limit"] + quota["services"]["xray"]["3"]["limit"] + quota["services"]["xray"]["7"]["limit"]} slot / hari</span>'
+        '<span class="page-chip">Reset 00.00 WIB</span>'
+        f'<span class="page-chip">Batas {e(settings.get("per_ip_daily", "2"))} akun / IP</span>'
+    )
+    hero = _page_hero(
+        "KATEGORI GRATIS",
+        "Akun gratis,<br><em>langsung jadi.</em>",
+        "Pilih layanan dan masa aktif. Akun dibuat langsung di server, tanpa email dan tanpa login website.",
+        chips,
+    )
+    body = f"""
+<main>
+{hero}
+  <section class="section wrap free-section page-section" id="gratis">
+    {fc['maintenance_html']}
+    {fc['closed_html']}
     <form class="creator panel" method="post" action="/buat" id="create-form" novalidate>
       <input type="hidden" name="_form" value="{e(form_token)}">
       <div class="creator-grid">
         <fieldset class="field-group">
           <legend><span>01</span> Pilih layanan</legend>
           <div class="service-grid">
-            <label class="service-card {'selected' if default_service == 'ssh' else ''}{' is-off' if not ssh_on else ''}" data-service-card="ssh" data-enabled="{1 if ssh_on else 0}">
-              <input type="radio" name="service" value="ssh" {'checked' if default_service == 'ssh' else ''} {'disabled' if not ssh_on else ''}>
+            <label class="service-card {'selected' if fc['default_service'] == 'ssh' else ''}{' is-off' if not fc['ssh_on'] else ''}" data-service-card="ssh" data-enabled="{1 if fc['ssh_on'] else 0}">
+              <input type="radio" name="service" value="ssh" {'checked' if fc['default_service'] == 'ssh' else ''} {'disabled' if not fc['ssh_on'] else ''}>
               <span class="service-icon">{icon('terminal')}</span>
-              <span class="service-copy"><b>SSH</b><small>{'OpenSSH · Dropbear · WS · SSL' if ssh_on else 'Dinonaktifkan admin'}</small></span>
+              <span class="service-copy"><b>SSH</b><small>{'OpenSSH · Dropbear · WS · SSL' if fc['ssh_on'] else 'Dinonaktifkan admin'}</small></span>
               <span class="checkmark" aria-hidden="true">✓</span>
             </label>
-            <label class="service-card {'selected' if default_service == 'xray' else ''}{' is-off' if not xray_on else ''}" data-service-card="xray" data-enabled="{1 if xray_on else 0}">
-              <input type="radio" name="service" value="xray" {'checked' if default_service == 'xray' else ''} {'disabled' if not xray_on else ''}>
+            <label class="service-card {'selected' if fc['default_service'] == 'xray' else ''}{' is-off' if not fc['xray_on'] else ''}" data-service-card="xray" data-enabled="{1 if fc['xray_on'] else 0}">
+              <input type="radio" name="service" value="xray" {'checked' if fc['default_service'] == 'xray' else ''} {'disabled' if not fc['xray_on'] else ''}>
               <span class="service-icon">{icon('bolt')}</span>
-              <span class="service-copy"><b>Xray</b><small>{'Pilih VMess, VLESS, atau Trojan' if xray_on else 'Dinonaktifkan admin'}</small></span>
+              <span class="service-copy"><b>Xray</b><small>{'Pilih VMess, VLESS, atau Trojan' if fc['xray_on'] else 'Dinonaktifkan admin'}</small></span>
               <span class="checkmark" aria-hidden="true">✓</span>
             </label>
           </div>
-          <div class="protocol-wrap" id="protocol-wrap" {'' if default_service == 'xray' else 'hidden'}>
+          <div class="protocol-wrap" id="protocol-wrap" {'' if fc['default_service'] == 'xray' else 'hidden'}>
             <span class="mini-label">Protokol Xray</span>
             <div class="protocol-grid">
-              {proto_html}
+              {fc['proto_html']}
             </div>
           </div>
         </fieldset>
@@ -2599,7 +2785,7 @@ def render_home(form_token: str, settings: dict[str, str]) -> str:
           </div>
         </div>
         <div class="reset-box"><span class="reset-label">RESET DALAM</span><b id="reset-countdown">--:--:--</b><small>WIB</small></div>
-        <button class="btn btn-primary btn-create" type="submit" id="create-button" {'disabled' if maintenance or not available else ''}>Buat akun <span aria-hidden="true">↗</span></button>
+        <button class="btn btn-primary btn-create" type="submit" id="create-button" {'disabled' if fc['maintenance'] or not fc['available'] else ''}>Buat akun <span aria-hidden="true">↗</span></button>
       </div>
       <p class="form-note">Dengan membuat akun, Anda setuju menggunakan layanan secara wajar. Satu IP dibatasi <b>{e(settings.get('per_ip_daily', '2'))} akun</b> per layanan per hari.</p>
     </form>
@@ -2609,22 +2795,42 @@ def render_home(form_token: str, settings: dict[str, str]) -> str:
       <div class="quota-item"><span>Xray · 3 hari</span><b data-quota-chip="xray-3">—</b><i><u data-quota-fill="xray-3"></u></i></div>
       <div class="quota-item"><span>Xray · 7 hari</span><b data-quota-chip="xray-7">—</b><i><u data-quota-fill="xray-7"></u></i></div>
     </div>
-  </section>
-
-  <section class="section wrap premium-section" id="premium">
-    <div class="section-head">
-      <div>
-        <div class="eyebrow"><span class="dot"></span> HITS SSH PREMIUM</div>
-        <h2>Beli sekali.<br>Tanpa login.</h2>
-      </div>
-      <p>Pilih paket, bayar QRIS GoPay, lalu simpan invoice. Akun dibuat otomatis setelah pembayaran terdeteksi.</p>
+    <div class="page-crosslink panel">
+      <div><b>Butuh masa aktif lebih panjang?</b><p>Paket premium tersedia tanpa kuota pembelian harian.</p></div>
+      <a class="btn btn-ghost btn-small" href="/premium">Lihat premium</a>
     </div>
-    {premium_notice}
+  </section>
+</main>
+<script type="application/json" id="quota-data">{quota_json}</script>
+<script type="application/json" id="web-config">{web_config_json}</script>
+"""
+    return page_shell("Buat Akun Gratis", body, active="free")
+
+
+def render_premium_page(form_token: str, settings: dict[str, str]) -> str:
+    pc = _premium_context(settings)
+    premium_json = json.dumps(pc["data"], ensure_ascii=False).replace("</", "<\\/")
+    chips = (
+        f'<span class="page-chip">Mulai {rupiah(pc["cheapest"])}</span>'
+        f'<span class="page-chip">Invoice {e(settings.get("premium_expiry_min", "15"))} menit</span>'
+        '<span class="page-chip">QRIS GoPay</span>'
+    )
+    hero = _page_hero(
+        "HITS SSH PREMIUM",
+        "Beli sekali.<br><em>Tanpa login.</em>",
+        "Pilih layanan dan masa aktif, bayar QRIS GoPay, lalu simpan invoice. Akun dibuat otomatis setelah pembayaran terdeteksi.",
+        chips,
+    )
+    body = f"""
+<main>
+{hero}
+  <section class="section wrap premium-section page-section" id="premium">
+    {pc['notice']}
     <div class="premium-layout">
       <div class="premium-picker panel">
         <div class="premium-step">
           <span class="mini-label">01 · PILIH LAYANAN</span>
-          <div class="premium-services" id="premium-services">{premium_cards}</div>
+          <div class="premium-services" id="premium-services">{pc['cards']}</div>
         </div>
         <div class="premium-step">
           <span class="mini-label">02 · PILIH MASA AKTIF</span>
@@ -2661,59 +2867,103 @@ def render_home(form_token: str, settings: dict[str, str]) -> str:
           <span class="mini-label">SUDAH BELI?</span>
           <h3>Cek Invoice</h3>
           <p>Masukkan kode invoice untuk membuka kembali QR, status pembayaran, dan data akun.</p>
-          <form method="post" action="/cek-invoice" class="stack-form compact">
-            <input type="hidden" name="_form" value="{e(form_token)}">
-            <label>Kode Invoice<input type="text" name="invoice" placeholder="HITS-YYMMDD-XXXXXXXX" autocomplete="off" spellcheck="false" required></label>
-            <button class="btn btn-dark btn-block" type="submit">Buka invoice</button>
-          </form>
+          <a class="btn btn-dark btn-block" href="/cek-invoice">Buka Cek Invoice</a>
+        </div>
+        <div class="panel premium-info compact-info">
+          <span class="mini-label">ALUR SINGKAT</span>
+          <ol class="mini-steps">
+            <li>Pilih paket dan masa aktif.</li>
+            <li>Scan QRIS sesuai nominal.</li>
+            <li>Salin invoice, tunggu akun aktif.</li>
+            <li>Unduh detail akun <b>.txt</b>.</li>
+          </ol>
         </div>
       </aside>
     </div>
     <script type="application/json" id="premium-data">{premium_json}</script>
   </section>
-
-  <section class="section wrap features">
-    <div class="feature-big panel">
-      <div class="eyebrow"><span class="dot"></span> KENAPA HITS SSH</div>
-      <h2>Dibuat simpel.<br>Dijalankan serius.</h2>
-      <p>Kami tidak menyimpan email, tidak meminta nomor telepon, dan tidak memasang iklan. Akun dibuat langsung di server untuk Anda.</p>
-      <div class="feature-list">
-        <div>{icon('clock')}<span><b>Otomatis & cepat</b><small>Akun selesai dalam hitungan detik.</small></span></div>
-        <div>{icon('shield')}<span><b>Kuota adil</b><small>Batas harian menjaga layanan tetap ringan.</small></span></div>
-        <div>{icon('globe')}<span><b>Format asli panel</b><small>Payload, port, dan tautan sama seperti menu VPS.</small></span></div>
-      </div>
-    </div>
-    <div class="feature-side">
-      <div class="mini-card"><span class="mini-icon">{icon('bolt')}</span><h3>SSH & Xray</h3><p>Dua keluarga protokol populer dalam satu tempat.</p></div>
-      <div class="mini-card accent"><span class="mini-icon">{icon('clock')}</span><h3>Reset 00.00</h3><p>Kuota baru tersedia otomatis setiap tengah malam WIB.</p></div>
-    </div>
-  </section>
-
-  <section class="section wrap steps" id="cara">
-    <div class="section-head"><div><div class="eyebrow"><span class="dot"></span> CARA PAKAI</div><h2>Tiga menit, langsung terhubung.</h2></div></div>
-    <div class="step-grid">
-      <article><span class="step-num">01</span><h3>Pilih layanan</h3><p>Tentukan SSH atau Xray, lalu pilih protokol dan masa aktif.</p></article>
-      <article><span class="step-num">02</span><h3>Buat & simpan</h3><p>Salin output akun atau unduh sebagai file teks. Simpan baik-baik.</p></article>
-      <article><span class="step-num">03</span><h3>Impor ke aplikasi</h3><p>Masukkan host, port, dan kredensial ke aplikasi tunnel pilihan Anda.</p></article>
-    </div>
-    <div class="format-note panel"><div class="format-icon">{icon('terminal')}</div><div><b>Output persis seperti menu VPS</b><p>Semua baris, port, payload, dan tautan akun diambil langsung dari file hasil script panel — bukan template buatan website.</p></div></div>
-  </section>
-
-  <section class="section wrap faq" id="faq">
-    <div class="section-head"><div><div class="eyebrow"><span class="dot"></span> FAQ</div><h2>Pertanyaan yang sering muncul.</h2></div></div>
-    <div class="faq-list">
-      <details><summary>Apakah akun ini benar-benar gratis?</summary><p>Ya. Tidak ada pembayaran, email, atau pendaftaran. Kuota harian dibatasi agar layanan tetap tersedia untuk semua orang.</p></details>
-      <details><summary>Kenapa kuota saya habis padahal baru tengah hari?</summary><p>Kuota bersifat global per layanan. Jika slot hari ini habis, kuota akan di-reset otomatis pukul 00.00 WIB.</p></details>
-      <details><summary>Apakah akun bisa dipakai di beberapa perangkat?</summary><p>Bisa, selama jumlah IP yang login tidak melebihi batas yang ditetapkan admin. Pelanggaran limit IP dapat menyebabkan akun dibekukan sementara oleh Timer Mullog.</p></details>
-      <details><summary>Bagaimana kalau saya kehilangan output akun?</summary><p>Simpan tautan hasil atau unduh file teks sebelum menutup halaman. Halaman hasil memakai tautan privat yang tidak dapat ditebak.</p></details>
-      <details><summary>Apakah akun lama di VPS akan terganggu?</summary><p>Tidak. Website hanya membuat akun baru dan tidak mengubah akun yang sudah ada.</p></details>
+  <section class="section wrap page-section">
+    <div class="page-crosslink panel">
+      <div><b>Belum siap membeli?</b><p>Gunakan akun gratis dulu untuk mencoba layanan.</p></div>
+      <a class="btn btn-ghost btn-small" href="/gratis">Buat akun gratis</a>
     </div>
   </section>
 </main>
-<script type="application/json" id="quota-data">{quota_json}</script>
-<script type="application/json" id="web-config">{web_config_json}</script>
 """
-    return page_shell("Akun VPN Gratis & Premium", body)
+    return page_shell("Beli Akun Premium", body, active="premium")
+
+
+def normalize_contact_url(value: str) -> str:
+    value = (value or "").strip()
+    if not value:
+        return ""
+    if re.match(r"^https?://", value, re.I):
+        return value[:300]
+    if value.startswith("@"):
+        return ("https://t.me/" + value[1:])[:300]
+    if re.match(r"^t\.me/", value, re.I):
+        return ("https://" + value)[:300]
+    return ""
+
+
+def render_contact_page(settings: dict[str, str]) -> str:
+    telegram = normalize_contact_url(settings.get("contact_telegram", ""))
+    group = normalize_contact_url(settings.get("contact_group", ""))
+    note = (settings.get("contact_note", "") or "").strip()[:300]
+    links = ""
+    if telegram:
+        links += f"""
+        <a class="contact-card panel" href="{e(telegram)}" target="_blank" rel="noopener">
+          <span class="contact-icon">{icon('terminal')}</span>
+          <span><b>Telegram Admin</b><small>Chat langsung untuk bantuan akun dan pembayaran.</small></span>
+          <span class="contact-arrow" aria-hidden="true">↗</span>
+        </a>"""
+    if group:
+        links += f"""
+        <a class="contact-card panel" href="{e(group)}" target="_blank" rel="noopener">
+          <span class="contact-icon">{icon('globe')}</span>
+          <span><b>Grup Komunitas</b><small>Info server, tips, dan diskusi sesama pengguna.</small></span>
+          <span class="contact-arrow" aria-hidden="true">↗</span>
+        </a>"""
+    if not links:
+        links = """
+        <div class="notice notice-warn contact-empty"><strong>Link kontak belum diatur.</strong> Admin dapat mengisi link Telegram atau grup dari Dashboard → Pengaturan → Kontak &amp; Bantuan.</div>"""
+    note_html = f'<div class="contact-note panel"><span class="mini-label">CATATAN ADMIN</span><p>{e(note)}</p></div>' if note else ""
+    chips = '<span class="page-chip">Tanpa login</span><span class="page-chip">Bantuan akun</span><span class="page-chip">Invoice premium</span>'
+    hero = _page_hero(
+        "KONTAK / BANTUAN",
+        "Butuh bantuan?<br><em>Hubungi kami.</em>",
+        "Untuk kendala akun, pembayaran, atau invoice, gunakan kanal resmi di bawah ini. Sertakan kode invoice jika menyangkut pembelian premium.",
+        chips,
+    )
+    body = f"""
+<main>
+{hero}
+  <section class="section wrap page-section">
+    <div class="contact-grid">
+      <div class="contact-links">{links}</div>
+      <aside class="contact-side">
+        {note_html}
+        <div class="panel contact-help">
+          <span class="mini-label">BANTUAN CEPAT</span>
+          <h3>Sebelum menghubungi admin</h3>
+          <ul>
+            <li><b>Lupa akun premium?</b> Buka <a href="/cek-invoice">Cek Invoice</a> dengan kode invoice.</li>
+            <li><b>Pembayaran sudah masuk?</b> Tunggu ±45 detik, lalu muat ulang invoice.</li>
+            <li><b>Akun gagal dibuat?</b> Simpan invoice dan hubungi admin untuk retry.</li>
+            <li><b>Kuota gratis habis?</b> Kuota di-reset otomatis pukul 00.00 WIB.</li>
+          </ul>
+          <div class="contact-actions">
+            <a class="btn btn-ghost btn-small" href="/cek-invoice">Cek Invoice</a>
+            <a class="btn btn-dark btn-small" href="/gratis">Buat akun gratis</a>
+          </div>
+        </div>
+      </aside>
+    </div>
+  </section>
+</main>
+"""
+    return page_shell("Kontak & Bantuan", body, active="contact")
 
 
 def render_result(row: sqlite3.Row) -> str:
@@ -2988,6 +3238,19 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
         <div class="settings-grid two">
           <label>Invoice premium berlaku (menit)<input type="number" name="premium_expiry_min" min="5" max="120" value="{e(settings['premium_expiry_min'])}"></label>
         </div>
+        <fieldset class="contact-settings">
+          <legend>Kontak &amp; Bantuan</legend>
+          <label>Link Telegram admin / bantuan
+            <input type="text" name="contact_telegram" value="{e(settings.get('contact_telegram', ''))}" placeholder="https://t.me/username atau @username" maxlength="300">
+            <small>Dipakai untuk tombol Telegram di halaman Kontak.</small>
+          </label>
+          <label>Link grup komunitas (opsional)
+            <input type="text" name="contact_group" value="{e(settings.get('contact_group', ''))}" placeholder="https://t.me/grupkamu" maxlength="300">
+          </label>
+          <label>Catatan bantuan
+            <textarea name="contact_note" rows="3" maxlength="300" placeholder="Contoh: Admin online 08.00–22.00 WIB.">{e(settings.get('contact_note', ''))}</textarea>
+          </label>
+        </fieldset>
         <label class="switch maintenance"><input type="checkbox" name="maintenance" value="1" {'checked' if settings['maintenance'] == '1' else ''}><span>Mode perawatan (tutup seluruh pembuatan akun &amp; pembelian)</span></label>
         <div class="form-actions"><button class="btn btn-primary" type="submit">Simpan pengaturan</button></div>
       </form>
@@ -3088,26 +3351,41 @@ def render_check_invoice(form_token: str, error: str = "", code: str = "") -> st
     err = f'<div class="notice notice-error">{e(error)}</div>' if error else ""
     body = f"""
 <main class="invoice-page wrap">
-  <div class="section-head">
-    <div><div class="eyebrow"><span class="dot"></span> CEK INVOICE</div><h2>Buka lagi<br>pesanan Anda.</h2></div>
-    <p>Masukkan kode invoice yang tampil setelah pembelian. Tidak perlu login.</p>
+  <div class="invoice-head check-head">
+    <div class="eyebrow"><span class="dot"></span> CEK INVOICE / RIWAYAT</div>
+    <h1>Buka lagi<br>pesanan Anda.</h1>
+    <p class="page-hero-lead">Masukkan kode invoice yang tampil setelah pembelian. Tidak perlu login, tidak perlu email.</p>
   </div>
-  <div class="panel check-page-card">
-    {err}
-    <form method="post" action="/cek-invoice" class="stack-form">
-      <input type="hidden" name="_form" value="{e(form_token)}">
-      <label>Kode Invoice
-        <input type="text" name="invoice" value="{e(code)}" placeholder="HITS-YYMMDD-XXXXXXXX" autocomplete="off" spellcheck="false" required autofocus>
-      </label>
-      <button class="btn btn-primary" type="submit">Buka invoice</button>
-    </form>
-    <p class="form-note">Kode invoice bersifat privat. Jangan bagikan ke orang lain.</p>
+  <div class="check-layout">
+    <div class="panel check-page-card">
+      {err}
+      <form method="post" action="/cek-invoice" class="stack-form">
+        <input type="hidden" name="_form" value="{e(form_token)}">
+        <label>Kode Invoice
+          <input type="text" name="invoice" value="{e(code)}" placeholder="HITS-YYMMDD-XXXXXXXX" autocomplete="off" spellcheck="false" required autofocus>
+        </label>
+        <button class="btn btn-primary" type="submit">Buka invoice</button>
+      </form>
+      <p class="form-note">Kode invoice bersifat privat. Jangan bagikan ke orang lain.</p>
+      <div class="check-tips">
+        <div><b>Format kode</b><span>HITS-YYMMDD-XXXXXXXX</span></div>
+        <div><b>Invoice berlaku</b><span>15 menit sejak dibuat</span></div>
+        <div><b>Data akun</b><span>Muncul setelah pembayaran lunas</span></div>
+      </div>
+    </div>
+    <aside class="panel invoice-history-card">
+      <span class="mini-label">RIWAYAT DI PERANGKAT INI</span>
+      <h3>Invoice terakhir</h3>
+      <p>Daftar ini disimpan di browser Anda, bukan di server. Berguna jika lupa mencatat kode invoice.</p>
+      <div id="invoice-history" class="invoice-history" data-empty="Belum ada invoice tersimpan di perangkat ini."></div>
+      <a class="btn btn-dark btn-block btn-small" href="/premium">Beli paket premium</a>
+      <a class="check-back-link" href="/kontak">Butuh bantuan? Hubungi admin &rarr;</a>
+    </aside>
   </div>
-  <p class="check-back"><a href="/">&larr; Kembali ke HITS SSH</a></p>
+  <p class="check-back"><a href="/">&larr; Kembali ke Beranda</a></p>
 </main>
 """
-    return page_shell("Cek Invoice", body, noindex=True)
-
+    return page_shell("Cek Invoice", body, noindex=True, active="invoice")
 
 def rupiah(value) -> str:
     return "Rp " + format(int(value), ",d").replace(",", ".")
@@ -3178,7 +3456,14 @@ def render_invoice(row: sqlite3.Row, new: bool = False) -> str:
   <button type="button" class="btn btn-primary btn-block" id="invoice-dialog-close">Saya sudah menyimpan</button>
 </dialog>"""
     data = json.dumps(
-        {"invoice": row["invoice"], "status": status, "expires_at": int(row["expires_at"])},
+        {
+            "invoice": row["invoice"],
+            "status": status,
+            "expires_at": int(row["expires_at"]),
+            "total": total,
+            "label": label,
+            "created_at": int(row["created_at"]),
+        },
         ensure_ascii=False,
     ).replace("</", "<\\/")
     body = f"""
@@ -3198,7 +3483,7 @@ def render_invoice(row: sqlite3.Row, new: bool = False) -> str:
       <span>Invoice <b>{e(row['invoice'])}</b></span>
       <span>Total <b>{rupiah(total)}</b></span>
       <a href="/cek-invoice">Cek invoice lain</a>
-      <a href="/#premium">Beli paket lain</a>
+      <a href="/premium">Beli paket lain</a>
     </div>
   </div>
 </main>

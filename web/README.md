@@ -61,3 +61,17 @@ Saat ON pertama, `setting-web` meminta domain dengan default
 - Checkout tanpa login, QRIS GoPay, kode unik nominal, invoice privat.
 - Cek invoice, download detail akun `.txt`, dan riwayat transaksi admin.
 - Login admin memakai token bot Telegram.
+
+## Halaman publik
+
+- `/` — Beranda dan ringkasan kategori.
+- `/gratis` — pembuatan akun SSH/Xray gratis.
+- `/premium` — pembelian akun premium QRIS GoPay.
+- `/cek-invoice` — cek invoice dan riwayat lokal perangkat.
+- `/kontak` — kontak/bantuan, link diatur dari Admin Dashboard.
+
+## Ganti subdomain
+
+Buka Utility → `26 SETTING WEBSITE` → `4 Ganti domain / subdomain`.
+Wajib membuat DNS A record ke IP VPS dan mengetik `POINTING` sebelum proses.
+Script akan memverifikasi HTTP, menerbitkan SSL, dan rollback otomatis jika gagal.

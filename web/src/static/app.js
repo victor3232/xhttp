@@ -11,6 +11,42 @@
     try { return JSON.parse(node.textContent || "{}"); } catch (e) { return null; }
   }
 
+  var navHeader = $(".nav-public");
+  var navToggle = $("#nav-toggle");
+  var navScrim = $("#nav-scrim");
+
+  function setMenu(open) {
+    if (!navHeader || !navToggle) return;
+    navHeader.classList.toggle("menu-open", open);
+    document.body.classList.toggle("menu-open", open);
+    navToggle.setAttribute("aria-expanded", open ? "true" : "false");
+    navToggle.setAttribute("aria-label", open ? "Tutup menu" : "Buka menu");
+    if (!navScrim) return;
+    if (open) {
+      navScrim.hidden = false;
+      window.requestAnimationFrame(function () { navScrim.classList.add("show"); });
+    } else {
+      navScrim.classList.remove("show");
+      window.setTimeout(function () { navScrim.hidden = true; }, 170);
+    }
+  }
+
+  if (navToggle) {
+    navToggle.addEventListener("click", function () {
+      setMenu(!navHeader.classList.contains("menu-open"));
+    });
+    if (navScrim) navScrim.addEventListener("click", function () { setMenu(false); });
+    $$("#site-menu a").forEach(function (link) {
+      link.addEventListener("click", function () { setMenu(false); });
+    });
+    document.addEventListener("keydown", function (event) {
+      if (event.key === "Escape") setMenu(false);
+    });
+    window.addEventListener("resize", function () {
+      if (window.innerWidth > 900) setMenu(false);
+    });
+  }
+
   var quota = readJson("quota-data");
   var webcfg = readJson("web-config") || {
     free: true,
@@ -387,8 +423,77 @@
     });
   }
 
+  var invoiceHistory = $("#invoice-history");
+
+  function readInvoiceHistory() {
+    try {
+      var data = JSON.parse(window.localStorage.getItem("hits_invoices_v1") || "[]");
+      return Array.isArray(data) ? data.slice(0, 8) : [];
+    } catch (e) {
+      return [];
+    }
+  }
+
+  function writeInvoiceHistory(items) {
+    try {
+      window.localStorage.setItem("hits_invoices_v1", JSON.stringify(items.slice(0, 8)));
+    } catch (e) {}
+  }
+
+  function saveInvoiceHistory(data) {
+    if (!data || !data.invoice) return;
+    var items = readInvoiceHistory().filter(function (item) {
+      return item && item.invoice !== data.invoice;
+    });
+    items.unshift({
+      invoice: data.invoice,
+      status: data.status || "PENDING",
+      total: Number(data.total || 0),
+      label: data.label || ""
+    });
+    writeInvoiceHistory(items);
+  }
+
+  function invoiceStatusLabel(status) {
+    return {
+      PENDING: "Menunggu bayar",
+      PAID: "Sudah dibayar",
+      PROVISIONING: "Menyiapkan",
+      COMPLETED: "Selesai",
+      FAILED: "Gagal akun",
+      EXPIRED: "Kedaluwarsa"
+    }[status] || status;
+  }
+
+  function renderInvoiceHistory() {
+    if (!invoiceHistory) return;
+    var items = readInvoiceHistory();
+    invoiceHistory.innerHTML = "";
+    if (!items.length) {
+      var empty = document.createElement("p");
+      empty.className = "invoice-history-empty";
+      empty.textContent = invoiceHistory.getAttribute("data-empty") || "Belum ada invoice tersimpan.";
+      invoiceHistory.appendChild(empty);
+      return;
+    }
+    items.forEach(function (item) {
+      var link = document.createElement("a");
+      link.href = "/invoice/" + encodeURIComponent(item.invoice);
+      var code = document.createElement("code");
+      code.textContent = item.invoice;
+      var meta = document.createElement("span");
+      meta.textContent = invoiceStatusLabel(item.status) + (item.total ? " · " + premiumRp(item.total) : "");
+      link.appendChild(code);
+      link.appendChild(meta);
+      invoiceHistory.appendChild(link);
+    });
+  }
+
+  if (invoiceHistory) renderInvoiceHistory();
+
   var invoiceData = readJson("invoice-data");
   if (invoiceData && invoiceData.invoice) {
+    saveInvoiceHistory(invoiceData);
     var invoiceDialog = $("#invoice-dialog");
     if (invoiceDialog && typeof invoiceDialog.showModal === "function") {
       invoiceDialog.showModal();
