@@ -62,15 +62,9 @@ Saat ON pertama, `setting-web` meminta domain dengan default
 - Cek invoice, download detail akun `.txt`, dan riwayat transaksi admin.
 - Login admin memakai token bot Telegram.
 
-## Cloudflare Turnstile
+## Branding dari Admin Dashboard
 
-- Diatur dari Utility → `26 SETTING WEBSITE` → `5 Cloudflare Turnstile`.
-- Site Key dipakai widget; Secret Key diverifikasi server-side.
-- Wajib aktif untuk pembuatan akun gratis dan pembuatan invoice premium.
-- Kunci disimpan di `/etc/kyt-web.conf` dan ikut backup/restore.
-
-## Backup & restore
-
-- Backup menyertakan `/opt/kyt-web`, `/etc/kyt-web.conf`, bot token, GoPay token,
-  sertifikat, konfigurasi Nginx/HAProxy, dan script pengatur domain.
-- Restore menampilkan arsip terbaru di atas dan meminta konfirmasi `RESTORE`.
+- Ganti nama brand, bagian aksen warna, meta description, slogan dua baris, dan paragraf hero.
+- Upload logo mark persegi (minimal 128×128, maksimal 2 MB).
+- Logo otomatis di-crop tengah, di-resize ke 256×256 WebP, dan dibuatkan favicon 64×64.
+- Logo disimpan di `/opt/kyt-web/data/branding` dan ikut backup/restore.

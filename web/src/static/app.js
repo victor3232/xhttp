@@ -535,6 +535,64 @@
     }
   }
 
+  var logoInput = $("#brand-logo-input");
+  if (logoInput) {
+    logoInput.addEventListener("change", function () {
+      var file = logoInput.files && logoInput.files[0];
+      if (!file) return;
+      if (file.size > 2 * 1024 * 1024) {
+        window.alert("Logo maksimal 2 MB. Kompres file terlebih dahulu.");
+        logoInput.value = "";
+        return;
+      }
+      var reader = new FileReader();
+      reader.onload = function (event) {
+        var image = new Image();
+        image.onload = function () {
+          if (image.width < 128 || image.height < 128) {
+            window.alert("Logo minimal 128×128 piksel. Pilih gambar yang lebih besar.");
+            logoInput.value = "";
+            return;
+          }
+          var side = Math.min(image.width, image.height);
+          var sx = Math.floor((image.width - side) / 2);
+          var sy = Math.floor((image.height - side) / 2);
+          var canvas = document.createElement("canvas");
+          canvas.width = 256;
+          canvas.height = 256;
+          var context = canvas.getContext("2d");
+          context.clearRect(0, 0, 256, 256);
+          context.drawImage(image, sx, sy, side, side, 0, 0, 256, 256);
+          var data = canvas.toDataURL("image/webp", 0.9);
+          if (data.indexOf("data:image/webp") !== 0) {
+            data = canvas.toDataURL("image/png");
+          }
+          var hidden = $("#brand-logo-data");
+          if (hidden) hidden.value = data;
+          var preview = $("#brand-logo-preview");
+          if (preview) preview.src = data;
+          var label = $("#brand-logo-name");
+          if (label) {
+            label.textContent = file.name + " · " + image.width + "×" + image.height + " → 256×256";
+          }
+        };
+        image.onerror = function () {
+          window.alert("File tidak bisa dibaca sebagai gambar.");
+          logoInput.value = "";
+        };
+        image.src = event.target.result;
+      };
+      reader.readAsDataURL(file);
+    });
+  }
+
+  $$("button[data-confirm]").forEach(function (button) {
+    button.addEventListener("click", function (event) {
+      var message = button.getAttribute("data-confirm") || "Lanjutkan?";
+      if (!window.confirm(message)) event.preventDefault();
+    });
+  });
+
   $$("form[data-confirm]").forEach(function (formNode) {
     formNode.addEventListener("submit", function (event) {
       var message = formNode.getAttribute("data-confirm") || "Lanjutkan?";

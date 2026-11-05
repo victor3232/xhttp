@@ -49,6 +49,7 @@ from pathlib import Path
 
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
+BRANDING_DIR = DATA_DIR / "branding"
 STATIC_DIR = APP_DIR / "static"
 DB_PATH = DATA_DIR / "web.db"
 LOG_PATH = DATA_DIR / "web.log"
@@ -112,7 +113,7 @@ FORM_COOKIE = "kyt_form"
 ADMIN_COOKIE = "kyt_admin"
 SESSION_TTL = 8 * 3600
 FORM_TTL = 24 * 3600
-MAX_BODY = 64 * 1024
+MAX_BODY = 512 * 1024
 
 SERVICES = {
     "ssh": {
@@ -160,8 +161,21 @@ XRAY_CONFIG = Path("/etc/xray/config.json")
 HTML_DIR = Path("/var/www/html")
 MIHOMO_STATE = Path("/etc/kyt/jeda-mullog")
 
+DEFAULT_META = "HITS SSH — akun VPN gratis dan premium SSH, VMess, VLESS, Trojan. Premium tanpa login, bayar QRIS GoPay."
+DEFAULT_HERO_TITLE = "Internet bebas,"
+DEFAULT_HERO_TITLE_ACCENT = "akun langsung jadi."
+DEFAULT_HERO_LEAD = "Buat akun gratis dalam hitungan detik, atau beli akun premium lewat QRIS GoPay. Tanpa registrasi, tanpa email, dan invoice bisa dicek kembali kapan saja."
+
 DEFAULTS = {
     "site_name": BRAND,
+    "brand_name": BRAND,
+    "brand_accent": "SSH",
+    "meta_description": DEFAULT_META,
+    "hero_title": DEFAULT_HERO_TITLE,
+    "hero_title_accent": DEFAULT_HERO_TITLE_ACCENT,
+    "hero_lead": DEFAULT_HERO_LEAD,
+    "brand_logo": "",
+    "brand_logo_version": "",
     "maintenance": "0",
     "free_enabled": "1",
     "premium_enabled": "1",
@@ -452,6 +466,98 @@ def set_settings(values: dict[str, str]) -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+def branding() -> dict[str, str]:
+    try:
+        settings = get_settings()
+    except Exception:
+        settings = {}
+    name = (settings.get("brand_name") or BRAND).strip()[:40] or BRAND
+    accent = (settings.get("brand_accent") or "").strip()[:20]
+    return {
+        "name": name,
+        "accent": accent,
+        "meta": (settings.get("meta_description") or DEFAULT_META).strip()[:300],
+        "hero_title": (settings.get("hero_title") or DEFAULT_HERO_TITLE).strip()[:100],
+        "hero_title_accent": (settings.get("hero_title_accent") or DEFAULT_HERO_TITLE_ACCENT).strip()[:100],
+        "hero_lead": (settings.get("hero_lead") or DEFAULT_HERO_LEAD).strip()[:400],
+        "logo": (settings.get("brand_logo") or "").strip(),
+        "logo_version": (settings.get("brand_logo_version") or "").strip(),
+    }
+
+
+def brand_word_html(name: str, accent: str) -> str:
+    name = (name or BRAND).strip()
+    accent = (accent or "").strip()
+    if accent and accent in name:
+        before, _sep, after = name.partition(accent)
+        return f"{e(before)}<span>{e(accent)}</span>{e(after)}"
+    return e(name)
+
+
+def brand_logo_path(kind: str = "logo") -> Path | None:
+    try:
+        settings = get_settings()
+    except Exception:
+        return None
+    if kind == "favicon":
+        path = BRANDING_DIR / "favicon.png"
+        return path if path.exists() else None
+    name = (settings.get("brand_logo") or "").strip()
+    if name not in ("logo.webp", "logo.png"):
+        return None
+    path = BRANDING_DIR / name
+    return path if path.exists() else None
+
+
+def save_brand_logo(data_url: str) -> tuple[bool, str]:
+    if not data_url.startswith("data:image/"):
+        return False, "Format logo tidak valid."
+    try:
+        _header, encoded = data_url.split(",", 1)
+        raw = base64.b64decode(encoded, validate=True)
+    except Exception:
+        return False, "File logo tidak bisa dibaca."
+    if len(raw) > 2 * 1024 * 1024:
+        return False, "Ukuran logo maksimal 2 MB."
+    try:
+        from PIL import Image
+        image = Image.open(io.BytesIO(raw))
+        image.load()
+    except Exception:
+        return False, "File logo bukan gambar yang didukung."
+    if image.width < 128 or image.height < 128:
+        return False, "Logo minimal 128×128 piksel."
+    image = image.convert("RGBA")
+    side = min(image.width, image.height)
+    left = (image.width - side) // 2
+    top = (image.height - side) // 2
+    image = image.crop((left, top, left + side, top + side))
+    image = image.resize((256, 256), Image.LANCZOS)
+    BRANDING_DIR.mkdir(parents=True, exist_ok=True)
+    logo_name = "logo.webp"
+    try:
+        image.save(BRANDING_DIR / "logo.webp", "WEBP", quality=88, method=6)
+    except Exception:
+        logo_name = "logo.png"
+        image.save(BRANDING_DIR / "logo.png", "PNG", optimize=True)
+    image.resize((64, 64), Image.LANCZOS).save(BRANDING_DIR / "favicon.png", "PNG", optimize=True)
+    for name in ("logo.webp", "logo.png"):
+        if name != logo_name:
+            try:
+                (BRANDING_DIR / name).unlink()
+            except FileNotFoundError:
+                pass
+    return True, logo_name
+
+
+def remove_brand_logo() -> None:
+    for name in ("logo.webp", "logo.png", "favicon.png"):
+        try:
+            (BRANDING_DIR / name).unlink()
+        except FileNotFoundError:
+            pass
 
 
 def quota_state(settings: dict[str, str] | None = None) -> dict:
@@ -1367,8 +1473,9 @@ def create_premium_order(product_code: str, ip: str, user_agent: str) -> sqlite3
 def premium_order_notify(row: sqlite3.Row, ok: bool, error: str = "") -> None:
     label = f"{row['protocol'].upper()} · {row['days']} hari"
     if ok:
+        b = branding()
         text = (
-            "<b>✅ HITS SSH PREMIUM TERJUAL</b>\n"
+            f"<b>✅ {e(b['name'])} PREMIUM TERJUAL</b>\n"
             f"Invoice : <code>{e(row['invoice'])}</code>\n"
             f"Paket   : <code>{e(label)}</code>\n"
             f"Total   : <code>Rp {int(row['total']):,}</code>\n"
@@ -1737,6 +1844,12 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/healthz":
                 self.json(200, {"ok": True, "time": int(time.time())})
                 return
+            if path == "/branding/logo":
+                self.serve_brand_file(False, head_only)
+                return
+            if path == "/branding/favicon":
+                self.serve_brand_file(True, head_only)
+                return
             if path.startswith("/static/"):
                 self.serve_static(path, head_only)
                 return
@@ -1810,6 +1923,20 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             logger.error("GET error: %s", traceback.format_exc())
             self.html(500, render_error("Terjadi kesalahan di server."), head_only=head_only)
+
+    def serve_brand_file(self, favicon: bool = False, head_only: bool = False) -> None:
+        target = brand_logo_path("favicon" if favicon else "logo")
+        if not target:
+            self._send(404, b"Not found", content_type="text/plain", head_only=head_only)
+            return
+        ctype = "image/png" if target.suffix.lower() == ".png" else "image/webp"
+        self._send(
+            200,
+            target.read_bytes(),
+            content_type=ctype,
+            extra_headers={"Cache-Control": "public, max-age=86400"},
+            head_only=head_only,
+        )
 
     def serve_static(self, path: str, head_only: bool = False) -> None:
         rel = path[len("/static/") :]
@@ -1917,6 +2044,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/admin/gopay/test":
                 self.admin_gopay_test()
+                return
+            if path == "/admin/branding":
+                self.admin_branding()
                 return
             self.html(404, render_not_found())
         except ValueError as exc:
@@ -2071,8 +2201,9 @@ class Handler(BaseHTTPRequestHandler):
             if row["status"] != "COMPLETED" or not row["account_output"]:
                 self.html(409, render_error("Akun belum siap. Selesaikan pembayaran terlebih dahulu."))
                 return
+            b = branding()
             header = (
-                "HITS SSH PREMIUM\n"
+                f"{b['name']} PREMIUM\n"
                 f"Invoice : {row['invoice']}\n"
                 f"Paket   : {row['protocol'].upper()} {row['days']} hari\n"
                 f"Total   : Rp {int(row['total']):,}\n"
@@ -2267,6 +2398,35 @@ class Handler(BaseHTTPRequestHandler):
         audit("settings", json.dumps(values, sort_keys=True), self.client_ip())
         self.redirect("/admin?msg=settings")
 
+    def admin_branding(self) -> None:
+        body = self.parse_body()
+        session = self.require_admin(body.get("_csrf", ""))
+        if not session:
+            return
+        values = {
+            "brand_name": (body.get("brand_name", "").strip() or BRAND)[:40],
+            "brand_accent": body.get("brand_accent", "").strip()[:20],
+            "hero_title": (body.get("hero_title", "").strip() or DEFAULT_HERO_TITLE)[:100],
+            "hero_title_accent": (body.get("hero_title_accent", "").strip() or DEFAULT_HERO_TITLE_ACCENT)[:100],
+            "hero_lead": (body.get("hero_lead", "").strip() or DEFAULT_HERO_LEAD)[:400],
+            "meta_description": (body.get("meta_description", "").strip() or DEFAULT_META)[:300],
+        }
+        logo_error = ""
+        if body.get("remove_logo") == "1":
+            remove_brand_logo()
+            values["brand_logo"] = ""
+            values["brand_logo_version"] = ""
+        elif body.get("logo_data"):
+            ok, result = save_brand_logo(body.get("logo_data", ""))
+            if ok:
+                values["brand_logo"] = result
+                values["brand_logo_version"] = str(int(time.time()))
+            else:
+                logo_error = result
+        set_settings(values)
+        audit("branding", f"{values['brand_name']} logo={logo_error or values.get('brand_logo', 'keep')}", self.client_ip())
+        self.redirect("/admin?msg=brandingfail" if logo_error else "/admin?msg=branding")
+
     def admin_delete(self) -> None:
         body = self.parse_body()
         session = self.require_admin(body.get("_csrf", ""))
@@ -2375,19 +2535,26 @@ def favicon_svg() -> str:
 
 
 def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False, active: str = "", turnstile: bool = False) -> str:
+    b = branding()
+    brand_name = b["name"]
+    brand_html = brand_word_html(brand_name, b["accent"])
     robots = '<meta name="robots" content="noindex,nofollow">' if noindex else ""
     turnstile_script = (
         '<script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>'
         if turnstile
         else ""
     )
+    if brand_logo_path("favicon"):
+        favicon = f'<link rel="icon" href="/branding/favicon?v={e(b["logo_version"])}" type="image/png">'
+    else:
+        favicon = '<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">'
     if admin:
         header = f"""
 <header class="nav nav-admin">
   <div class="wrap nav-inner">
-    <a class="brand" href="/" aria-label="HITS SSH">
+    <a class="brand" href="/" aria-label="{e(brand_name)}">
       <span class="brand-mark">{logomark()}</span>
-      <span class="brand-word">HITS <span>SSH</span></span>
+      <span class="brand-word">{brand_html}</span>
     </a>
     <nav class="nav-links nav-links-inline" aria-label="Menu admin">
       <a href="/admin" class="active">Dashboard</a>
@@ -2413,15 +2580,15 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
         header = f"""
 <header class="nav nav-public">
   <div class="wrap nav-inner">
-    <a class="brand" href="/" aria-label="HITS SSH">
+    <a class="brand" href="/" aria-label="{e(brand_name)}">
       <span class="brand-mark">{logomark()}</span>
-      <span class="brand-word">HITS <span>SSH</span></span>
+      <span class="brand-word">{brand_html}</span>
     </a>
     <button class="nav-toggle" id="nav-toggle" type="button" aria-label="Buka menu" aria-expanded="false" aria-controls="site-menu">
       <span></span><span></span><span></span>
     </button>
     <nav class="nav-links" id="site-menu" aria-label="Menu utama">
-      <div class="nav-drawer-head"><span class="mini-label">MENU HITS SSH</span></div>
+      <div class="nav-drawer-head"><span class="mini-label">MENU {e(brand_name.upper())}</span></div>
       {menu}
       <a class="nav-drawer-cta" href="/premium">Beli akun premium <span aria-hidden="true">↗</span></a>
       <div class="nav-drawer-foot"><a href="/admin">Admin</a><span>Free &amp; Premium</span></div>
@@ -2433,7 +2600,7 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
 <footer class="footer">
   <div class="wrap footer-inner">
     <div>
-      <div class="brand footer-brand"><span class="brand-mark">{logomark()}</span><span class="brand-word">HITS <span>SSH</span></span></div>
+      <div class="brand footer-brand"><span class="brand-mark">{logomark()}</span><span class="brand-word">{brand_html}</span></div>
       <p>Akun VPN gratis dan premium untuk belajar, bekerja, dan menjelajah dengan aman.</p>
     </div>
     <div class="footer-links">
@@ -2444,7 +2611,7 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
       <a href="/kontak">Kontak</a>
       <a href="/admin">Admin</a>
     </div>
-    <div class="footer-note">HITS SSH · Free &amp; Premium · Gunakan dengan bijak.</div>
+    <div class="footer-note">{e(brand_name)} · Free &amp; Premium · Gunakan dengan bijak.</div>
   </div>
 </footer>"""
     return f"""<!doctype html>
@@ -2452,24 +2619,27 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{e(title)} — HITS SSH</title>
-<meta name="description" content="HITS SSH — akun VPN gratis dan premium SSH, VMess, VLESS, Trojan. Premium tanpa login, bayar QRIS GoPay.">
+<title>{e(title)} — {e(brand_name)}</title>
+<meta name="description" content="{e(b['meta'])}">
 <meta name="theme-color" content="#fffaf2">
 {robots}
-<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="/static/style.css?v=20261105hits3">
+{favicon}
+<link rel="stylesheet" href="/static/style.css?v=20261105hits4">
 {turnstile_script}
 </head>
 <body>
 {header}
 {body}
 {footer}
-<script src="/static/app.js?v=20261105hits3" defer></script>
+<script src="/static/app.js?v=20261105hits4" defer></script>
 </body>
 </html>"""
 
 
 def logomark() -> str:
+    if brand_logo_path("logo"):
+        b = branding()
+        return f'<img class="brand-logo" src="/branding/logo?v={e(b["logo_version"])}" alt="">'
     return """<svg viewBox="0 0 40 40" role="img" aria-hidden="true"><path d="M20 3.5 34 9v9.4c0 8.9-5.7 15.1-14 18.1C11.7 33.5 6 27.3 6 18.4V9l14-5.5Z" fill="currentColor"/><path d="M20 9.5v18.8c5-2.5 8-6.8 8-12.2v-4.7L20 9.5Z" fill="#fffaf2" opacity=".92"/><path d="m14 19.2 4.1 4.2 8-8.2" fill="none" stroke="currentColor" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"/></svg>"""
 
 
@@ -2631,6 +2801,10 @@ def _page_hero(eyebrow: str, title_html: str, lead: str, chips: str = "") -> str
 def render_home(form_token: str, settings: dict[str, str]) -> str:
     fc = _free_context(settings)
     pc = _premium_context(settings)
+    b = branding()
+    hero_title = b["hero_title"]
+    hero_title_accent = b["hero_title_accent"]
+    hero_lead = b["hero_lead"]
     quota = fc["quota"]
     total_slots = (
         quota["services"]["ssh"]["3"]["limit"]
@@ -2646,8 +2820,8 @@ def render_home(form_token: str, settings: dict[str, str]) -> str:
   <section class="hero wrap">
     <div class="hero-copy">
       <div class="eyebrow"><span class="dot"></span> FREE &amp; PREMIUM · TANPA LOGIN</div>
-      <h1>Internet bebas,<br><em>akun langsung jadi.</em></h1>
-      <p class="hero-lead">Buat akun gratis dalam hitungan detik, atau beli akun premium lewat QRIS GoPay. Tanpa registrasi, tanpa email, dan invoice bisa dicek kembali kapan saja.</p>
+      <h1>{e(hero_title)}<br><em>{e(hero_title_accent)}</em></h1>
+      <p class="hero-lead">{e(hero_lead)}</p>
       <div class="hero-actions">
         <a class="btn btn-primary" href="/gratis">Buat akun gratis <span aria-hidden="true">↘</span></a>
         <a class="btn btn-ghost" href="/premium">Beli akun premium</a>
@@ -2664,7 +2838,7 @@ def render_home(form_token: str, settings: dict[str, str]) -> str:
       <div class="ticket">
         <div class="ticket-top">
           <div class="ticket-logo">{logomark()}</div>
-          <div class="ticket-brand">HITS <span>SSH</span></div>
+          <div class="ticket-brand">{brand_word_html(b["name"], b["accent"])}</div>
           <div class="ticket-chip">FREE + PREMIUM</div>
         </div>
         <div class="ticket-tunnel">
@@ -2865,6 +3039,7 @@ def render_free_page(form_token: str, settings: dict[str, str]) -> str:
 
 def render_premium_page(form_token: str, settings: dict[str, str]) -> str:
     pc = _premium_context(settings)
+    b = branding()
     premium_json = json.dumps(pc["data"], ensure_ascii=False).replace("</", "<\\/")
     ts_site, _ts_secret, ts_on = turnstile_config()
     ts_widget = (
@@ -2881,7 +3056,7 @@ def render_premium_page(form_token: str, settings: dict[str, str]) -> str:
         '<span class="page-chip">QRIS GoPay</span>'
     )
     hero = _page_hero(
-        "HITS SSH PREMIUM",
+        e(b["name"].upper()) + " PREMIUM",
         "Beli sekali.<br><em>Tanpa login.</em>",
         "Pilih layanan dan masa aktif, bayar QRIS GoPay, lalu simpan invoice. Akun dibuat otomatis setelah pembayaran terdeteksi.",
         chips,
@@ -3084,10 +3259,11 @@ def render_result(row: sqlite3.Row) -> str:
 
 def render_admin_login(form_token: str, error: str) -> str:
     err = f'<div class="notice notice-error">{e(error)}</div>' if error else ""
+    b = branding()
     body = f"""
 <main class="admin-login wrap">
   <div class="login-card panel">
-    <div class="login-brand"><span class="brand-mark">{logomark()}</span><span class="brand-word">HITS <span>SSH</span></span></div>
+    <div class="login-brand"><span class="brand-mark">{logomark()}</span><span class="brand-word">{brand_word_html(b["name"], b["accent"])}</span></div>
     <div class="eyebrow"><span class="dot"></span> ADMIN PANEL</div>
     <h1>Masuk dengan token.</h1>
     <p>Tempel Token Bot Telegram. Tidak perlu username atau password.</p>
@@ -3146,6 +3322,8 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
         "ordernotfound": ("error", "Invoice tidak ditemukan."),
         "gopayok": ("ok", "Gateway GoPay merespons dan history berhasil dibaca."),
         "gopayfail": ("error", "Gagal membaca history GoPay. Cek status gateway/token."),
+        "branding": ("ok", "Branding disimpan. Perubahan langsung dipakai di semua halaman."),
+        "brandingfail": ("error", "Logo gagal diproses. Periksa format, ukuran minimal 128×128, dan ukuran file."),
     }
     notice = ""
     if msg in messages:
@@ -3249,11 +3427,15 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
     token_warn = ""
     if gstat["token_invalid"]:
         token_warn = '<div class="notice notice-warn compact-notice">Token GoPay expired. Buka bot Telegram → Store Admin → GoPay → Login OTP, lalu klik Test GoPay.</div>'
+    b = branding()
+    logo_path = brand_logo_path("logo")
+    logo_preview_src = f"/branding/logo?v={e(b['logo_version'])}" if logo_path else "/static/favicon.svg"
+    logo_label = "Logo kustom aktif" if logo_path else "Belum ada logo kustom"
 
     body = f"""
 <main class="admin-main wrap">
   <div class="admin-head">
-    <div><div class="eyebrow"><span class="dot"></span> HITS SSH ADMIN</div><h1>Kendali penuh.</h1><p>Free, premium, invoice, dan pembayaran GoPay dalam satu dashboard.</p></div>
+    <div><div class="eyebrow"><span class="dot"></span> {e(b["name"].upper())} ADMIN</div><h1>Kendali penuh.</h1><p>Free, premium, invoice, dan pembayaran GoPay dalam satu dashboard.</p></div>
     <div class="admin-head-actions">
       <a class="btn btn-ghost" href="/" target="_blank" rel="noopener">Lihat situs</a>
       <form method="post" action="/admin/logout"><button class="btn btn-ghost" type="submit">Keluar</button></form>
@@ -3266,6 +3448,55 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
     <div class="stat-card accent"><span>Pendapatan premium</span><strong>{rupiah(pstats['revenue'])}</strong><small>transaksi sukses</small></div>
     <div class="stat-card"><span>GoPay gateway</span><strong>{'ON' if gopay_ok else 'OFF'}</strong><small>{e(gstat['base'])}</small></div>
   </div>
+
+  <section class="panel admin-panel branding-panel">
+    <div class="panel-head"><div><span class="mini-label">BRANDING</span><h2>Logo, nama &amp; slogan</h2></div><span class="panel-hint">Berlaku di semua halaman dan notifikasi.</span></div>
+    <form method="post" action="/admin/branding" class="branding-form">
+      <input type="hidden" name="_csrf" value="{e(session['csrf'])}">
+      <input type="hidden" name="logo_data" id="brand-logo-data" value="">
+      <div class="branding-grid">
+        <fieldset>
+          <legend>Identitas website</legend>
+          <label>Nama brand
+            <input type="text" name="brand_name" value="{e(settings.get('brand_name', BRAND))}" maxlength="40" required>
+          </label>
+          <label>Bagian yang diwarnai
+            <input type="text" name="brand_accent" value="{e(settings.get('brand_accent', ''))}" maxlength="20" placeholder="SSH">
+            <small>Harus bagian dari nama brand. Kosongkan jika tidak ingin aksen warna.</small>
+          </label>
+          <label>Meta description
+            <textarea name="meta_description" rows="2" maxlength="300">{e(settings.get('meta_description', DEFAULT_META))}</textarea>
+          </label>
+        </fieldset>
+        <fieldset>
+          <legend>Logo mark</legend>
+          <div class="brand-logo-row">
+            <div class="brand-logo-preview"><img id="brand-logo-preview" src="{logo_preview_src}" alt="Logo saat ini"></div>
+            <div class="brand-logo-copy">
+              <input type="file" id="brand-logo-input" accept="image/png,image/jpeg,image/webp">
+              <small id="brand-logo-name">{logo_label}</small>
+              <small>Persegi, minimal 128×128, maksimal 2 MB. Otomatis crop tengah dan resize 256×256.</small>
+              <button type="submit" name="remove_logo" value="1" class="btn btn-tiny btn-danger" data-confirm="Hapus logo kustom dan kembali ke ikon default?">Hapus logo</button>
+            </div>
+          </div>
+        </fieldset>
+      </div>
+      <fieldset class="branding-slogan">
+        <legend>Slogan hero</legend>
+        <div class="settings-grid two">
+          <label>Baris pertama<input type="text" name="hero_title" value="{e(settings.get('hero_title', DEFAULT_HERO_TITLE))}" maxlength="100"></label>
+          <label>Baris kedua (aksen)<input type="text" name="hero_title_accent" value="{e(settings.get('hero_title_accent', DEFAULT_HERO_TITLE_ACCENT))}" maxlength="100"></label>
+        </div>
+        <label>Paragraf pembuka<textarea name="hero_lead" rows="3" maxlength="400">{e(settings.get('hero_lead', DEFAULT_HERO_LEAD))}</textarea></label>
+      </fieldset>
+      <div class="branding-preview">
+        <span class="mini-label">PRATINJAU BRAND</span>
+        <div class="brand"><span class="brand-mark">{logomark()}</span><span class="brand-word">{brand_word_html(b['name'], b['accent'])}</span></div>
+        <p>{e(settings.get('hero_title', DEFAULT_HERO_TITLE))} <em>{e(settings.get('hero_title_accent', DEFAULT_HERO_TITLE_ACCENT))}</em></p>
+      </div>
+      <div class="form-actions"><button class="btn btn-primary btn-small" type="submit">Simpan branding</button></div>
+    </form>
+  </section>
 
   <div class="admin-grid">
     <section class="panel admin-panel">
