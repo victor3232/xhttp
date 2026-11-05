@@ -54,6 +54,21 @@ valid_domain() {
 turnstile_active() {
     [ "$(conf_get TURNSTILE_ENABLED)" = "1" ] && [ -n "$(conf_get TURNSTILE_SITE_KEY)" ] && [ -n "$(conf_get TURNSTILE_SECRET_KEY)" ]
 }
+server_line() {
+    local db="/opt/kyt-web/data/web.db"
+    [ -f "$db" ] || { printf '%s' "-"; return 0; }
+    python3 - "$db" <<'SERVERPY' 2>/dev/null
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+data = dict(c.execute("select key,value from settings where key like 'server_%'"))
+c.close()
+code = (data.get("server_country_code") or "").strip().upper()
+flag = "".join(chr(ord(ch) + 127397) for ch in code) if len(code) == 2 and code.isalpha() else "🌐"
+name = (data.get("server_country_name") or "-").strip() or "-"
+city = (data.get("server_city") or "").strip()
+print(f"{flag} {name}" + (f" ({city})" if city else ""))
+SERVERPY
+}
 turnstile_summary() {
     if turnstile_active; then
         local site
@@ -112,6 +127,7 @@ status_line() {
     printf '  Service       : %s  (boot: %s)\n' "${act:-unknown}" "${boot:-unknown}"
     printf '  Domain        : %s\n' "${dom:--}"
     printf '  IP VPS        : %s\n' "$(server_ip)"
+    printf '  Server        : %s\n' "$(server_line)"
     printf '  Turnstile     : %s\n' "$(turnstile_summary)"
     if [ -n "$dom" ]; then
         printf '  DNS resolve   : %s\n' "$(dns_ips "$dom" | tr '\n' ' ' | sed 's/ $//')"

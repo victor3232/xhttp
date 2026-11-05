@@ -86,6 +86,8 @@ if [ ! -s /etc/bot/.bot.db ] && ! grep -qE '^ADMIN_TOKEN=' "$CONF"; then
 fi
 
 mkdir -p "$WEBROOT/.well-known/acme-challenge" /etc/ssl/kyt-web
+echo "Mendeteksi lokasi server dari IP publik..."
+python3 "$APP_DIR/app.py" --detect-server || echo "Peringatan: lokasi server belum terdeteksi; atur manual di Admin Dashboard."
 python3 /usr/local/sbin/kyt-web-configure-edge "$DOMAIN"
 
 # Coba terbitkan sertifikat jika HTTP-01 sudah bisa diakses dari publik.

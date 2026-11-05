@@ -161,6 +161,41 @@ XRAY_CONFIG = Path("/etc/xray/config.json")
 HTML_DIR = Path("/var/www/html")
 MIHOMO_STATE = Path("/etc/kyt/jeda-mullog")
 
+COUNTRY_NAMES = {
+    "AD": "Andorra", "AE": "Uni Emirat Arab", "AF": "Afganistan", "AL": "Albania",
+    "AM": "Armenia", "AO": "Angola", "AR": "Argentina", "AT": "Austria",
+    "AU": "Australia", "AZ": "Azerbaijan", "BA": "Bosnia dan Herzegovina",
+    "BD": "Bangladesh", "BE": "Belgia", "BG": "Bulgaria", "BH": "Bahrain",
+    "BN": "Brunei", "BO": "Bolivia", "BR": "Brasil", "BY": "Belarus",
+    "CA": "Kanada", "CH": "Swiss", "CL": "Cile", "CN": "Tiongkok",
+    "CO": "Kolombia", "CR": "Kosta Rika", "CY": "Siprus", "CZ": "Ceko",
+    "DE": "Jerman", "DK": "Denmark", "DO": "Republik Dominika", "DZ": "Aljazair",
+    "EC": "Ekuador", "EE": "Estonia", "EG": "Mesir", "ES": "Spanyol",
+    "ET": "Etiopia", "FI": "Finlandia", "FJ": "Fiji", "FR": "Prancis",
+    "GB": "Inggris", "GE": "Georgia", "GH": "Ghana", "GR": "Yunani",
+    "GT": "Guatemala", "HK": "Hong Kong", "HR": "Kroasia", "HU": "Hongaria",
+    "ID": "Indonesia", "IE": "Irlandia", "IL": "Israel", "IN": "India",
+    "IQ": "Irak", "IR": "Iran", "IS": "Islandia", "IT": "Italia",
+    "JM": "Jamaika", "JO": "Yordania", "JP": "Jepang", "KE": "Kenya",
+    "KH": "Kamboja", "KR": "Korea Selatan", "KW": "Kuwait", "KZ": "Kazakhstan",
+    "LA": "Laos", "LB": "Lebanon", "LK": "Sri Lanka", "LT": "Lituania",
+    "LU": "Luksemburg", "LV": "Latvia", "LY": "Libya", "MA": "Maroko",
+    "MD": "Moldova", "ME": "Montenegro", "MK": "Makedonia Utara", "MM": "Myanmar",
+    "MN": "Mongolia", "MO": "Makau", "MT": "Malta", "MU": "Mauritius",
+    "MV": "Maladewa", "MX": "Meksiko", "MY": "Malaysia", "NG": "Nigeria",
+    "NL": "Belanda", "NO": "Norwegia", "NP": "Nepal", "NZ": "Selandia Baru",
+    "OM": "Oman", "PA": "Panama", "PE": "Peru", "PG": "Papua Nugini",
+    "PH": "Filipina", "PK": "Pakistan", "PL": "Polandia", "PT": "Portugal",
+    "PY": "Paraguay", "QA": "Qatar", "RO": "Rumania", "RS": "Serbia",
+    "RU": "Rusia", "RW": "Rwanda", "SA": "Arab Saudi", "SE": "Swedia",
+    "SG": "Singapura", "SI": "Slovenia", "SK": "Slowakia", "SN": "Senegal",
+    "TH": "Thailand", "TJ": "Tajikistan", "TL": "Timor Leste", "TN": "Tunisia",
+    "TR": "Turki", "TW": "Taiwan", "TZ": "Tanzania", "UA": "Ukraina",
+    "UG": "Uganda", "US": "Amerika Serikat", "UY": "Uruguay", "UZ": "Uzbekistan",
+    "VE": "Venezuela", "VN": "Vietnam", "ZA": "Afrika Selatan", "ZM": "Zambia",
+    "ZW": "Zimbabwe",
+}
+
 UI_THEME_COLORS = {
     "cream": "#fffaf2",
     "midnight": "#070b14",
@@ -191,6 +226,14 @@ DEFAULTS = {
     "brand_logo": "",
     "brand_logo_version": "",
     "ui_theme": "cream",
+    "server_show": "1",
+    "server_auto": "1",
+    "server_country_code": "",
+    "server_country_name": "",
+    "server_city": "",
+    "server_note": "",
+    "server_source": "",
+    "server_last_check": "",
     "maintenance": "0",
     "free_enabled": "1",
     "premium_enabled": "1",
@@ -504,6 +547,112 @@ def branding() -> dict[str, str]:
         "logo": (settings.get("brand_logo") or "").strip(),
         "logo_version": (settings.get("brand_logo_version") or "").strip(),
     }
+
+
+def flag_emoji(code: str) -> str:
+    code = (code or "").strip().upper()
+    if len(code) == 2 and code.isalpha():
+        return "".join(chr(ord(ch) + 127397) for ch in code)
+    return "🌐"
+
+
+def _fetch_json(url: str) -> dict:
+    req = urllib.request.Request(url, headers={"User-Agent": "HITS-SSH/1.0"})
+    with urllib.request.urlopen(req, timeout=6) as resp:
+        return json.loads(resp.read().decode("utf-8", "replace"))
+
+
+def detect_server_info() -> dict | None:
+    sources = [
+        ("https://ipinfo.io/json", lambda d: (d.get("country"), d.get("city"), None)),
+        ("https://ipapi.co/json/", lambda d: (d.get("country_code"), d.get("city"), d.get("country_name"))),
+        ("https://ifconfig.co/json", lambda d: (d.get("country_iso"), d.get("city"), d.get("country"))),
+    ]
+    for url, parser in sources:
+        try:
+            data = _fetch_json(url)
+            code, city, fallback_name = parser(data)
+        except Exception as exc:
+            logger.warning("deteksi server gagal via %s: %s", url, exc)
+            continue
+        code = (code or "").strip().upper()
+        if len(code) != 2 or not code.isalpha():
+            continue
+        name = COUNTRY_NAMES.get(code) or (fallback_name or "").strip() or code
+        city = (city or "").strip()
+        if not city:
+            try:
+                city = Path("/etc/xray/city").read_text(encoding="utf-8", errors="ignore").strip()
+            except Exception:
+                city = ""
+        return {"code": code, "name": name, "city": city, "source": url}
+    return None
+
+
+def refresh_server_info(force: bool = False) -> dict | None:
+    settings = get_settings()
+    if not force:
+        if settings.get("server_auto", "1") != "1":
+            return None
+        if (settings.get("server_country_code") or "").strip():
+            return None
+    info = detect_server_info()
+    if not info:
+        return None
+    set_settings(
+        {
+            "server_auto": "1",
+            "server_country_code": info["code"],
+            "server_country_name": info["name"],
+            "server_city": info["city"],
+            "server_note": "",
+            "server_source": info["source"],
+            "server_last_check": str(int(time.time())),
+        }
+    )
+    logger.info("lokasi server: %s %s (%s)", info["code"], info["name"], info["source"])
+    return info
+
+
+def server_info() -> dict:
+    settings = get_settings()
+    code = (settings.get("server_country_code") or "").strip().upper()
+    name = (settings.get("server_country_name") or "").strip() or COUNTRY_NAMES.get(code, code)
+    city = (settings.get("server_city") or "").strip()
+    note = (settings.get("server_note") or "").strip()[:160]
+    show = settings.get("server_show", "1") == "1" and bool(code or name)
+    return {
+        "show": show,
+        "code": code,
+        "name": name,
+        "city": city,
+        "note": note,
+        "flag": flag_emoji(code),
+        "source": (settings.get("server_source") or "").strip(),
+        "last_check": (settings.get("server_last_check") or "").strip(),
+    }
+
+
+def server_strip_html() -> str:
+    info = server_info()
+    if not info["show"] or not info["name"]:
+        return ""
+    details = []
+    if info["city"] and info["city"].lower() != info["name"].lower():
+        details.append(info["city"])
+    if info["note"]:
+        details.append(info["note"])
+    detail = " · ".join(details) or "Lokasi VPS"
+    return f"""
+      <div class="server-strip">
+        <span class="server-flag" aria-hidden="true">{info['flag']}</span>
+        <div class="server-copy">
+          <span class="mini-label">LOKASI SERVER</span>
+          <b>{e(info['name'])}</b>
+          <small>{e(detail)}</small>
+        </div>
+        <span class="server-status">Online</span>
+      </div>"""
 
 
 def brand_word_html(name: str, accent: str) -> str:
@@ -2078,6 +2227,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/admin/theme":
                 self.admin_theme()
                 return
+            if path == "/admin/server":
+                self.admin_server()
+                return
             self.html(404, render_not_found())
         except ValueError as exc:
             self.html(400, render_error(str(exc)))
@@ -2470,6 +2622,41 @@ class Handler(BaseHTTPRequestHandler):
         audit("theme", theme, self.client_ip())
         self.redirect("/admin?msg=theme")
 
+    def admin_server(self) -> None:
+        body = self.parse_body()
+        session = self.require_admin(body.get("_csrf", ""))
+        if not session:
+            return
+        action = body.get("action", "save")
+        if action == "detect":
+            info = refresh_server_info(force=True)
+            if info:
+                audit("server", f"detect {info['code']} {info['city']}", self.client_ip())
+                self.redirect("/admin?msg=serverdetect")
+            else:
+                self.redirect("/admin?msg=serverfail")
+            return
+        code = body.get("server_country_code", "").strip().upper()
+        if code and (len(code) != 2 or not code.isalpha()):
+            self.redirect("/admin?msg=serverfail")
+            return
+        name = body.get("server_country_name", "").strip()[:60]
+        if not name and code:
+            name = COUNTRY_NAMES.get(code, code)
+        values = {
+            "server_show": "1" if body.get("server_show") == "1" else "0",
+            "server_auto": "0",
+            "server_country_code": code,
+            "server_country_name": name,
+            "server_city": body.get("server_city", "").strip()[:80],
+            "server_note": body.get("server_note", "").strip()[:160],
+            "server_source": "manual",
+            "server_last_check": str(int(time.time())),
+        }
+        set_settings(values)
+        audit("server", f"manual {code} {name}", self.client_ip())
+        self.redirect("/admin?msg=server")
+
     def admin_delete(self) -> None:
         body = self.parse_body()
         session = self.require_admin(body.get("_csrf", ""))
@@ -2667,14 +2854,14 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
 <meta name="theme-color" content="{UI_THEME_COLORS.get(b['theme'], '#fffaf2')}">
 {robots}
 {favicon}
-<link rel="stylesheet" href="/static/style.css?v=20261105hits8">
+<link rel="stylesheet" href="/static/style.css?v=20261105hits9">
 {turnstile_script}
 </head>
 <body>
 {header}
 {body}
 {footer}
-<script src="/static/app.js?v=20261105hits8" defer></script>
+<script src="/static/app.js?v=20261105hits9" defer></script>
 </body>
 </html>"""
 
@@ -2973,6 +3160,7 @@ def render_free_page(form_token: str, settings: dict[str, str]) -> str:
     fc = _free_context(settings)
     quota = fc["quota"]
     ts_site, _ts_secret, ts_on = turnstile_config()
+    server_strip = server_strip_html()
     ts_widget = (
         '<div class="turnstile-box">'
         f'<div class="cf-turnstile" data-sitekey="{e(ts_site)}" data-theme="light" data-language="id" data-size="flexible"></div>'
@@ -3048,6 +3236,7 @@ def render_free_page(form_token: str, settings: dict[str, str]) -> str:
         </fieldset>
       </div>
 
+      {server_strip}
       {ts_widget}
       <div class="creator-bottom">
         <div class="quota-readout" id="quota-readout" aria-live="polite">
@@ -3085,6 +3274,7 @@ def render_premium_page(form_token: str, settings: dict[str, str]) -> str:
     b = branding()
     premium_json = json.dumps(pc["data"], ensure_ascii=False).replace("</", "<\\/")
     ts_site, _ts_secret, ts_on = turnstile_config()
+    server_strip = server_strip_html()
     ts_widget = (
         '<div class="turnstile-box premium-turnstile">'
         f'<div class="cf-turnstile" data-sitekey="{e(ts_site)}" data-theme="light" data-language="id" data-size="flexible"></div>'
@@ -3121,6 +3311,7 @@ def render_premium_page(form_token: str, settings: dict[str, str]) -> str:
             <p class="premium-hint">Pilih layanan terlebih dahulu.</p>
           </div>
         </div>
+        {server_strip}
         <div class="premium-summary" id="premium-summary" hidden>
           <div><span>Paket</span><b id="premium-summary-name">—</b></div>
           <div><span>Harga</span><b id="premium-summary-price">—</b></div>
@@ -3369,6 +3560,9 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
         "brandingfail": ("error", "Logo gagal diproses. Periksa format, ukuran minimal 128×128, dan ukuran file."),
         "theme": ("ok", "Tema UI diterapkan ke website dan dashboard."),
         "themefail": ("error", "Tema tidak dikenal. Pilih salah satu tema yang tersedia."),
+        "server": ("ok", "Info server disimpan dan tampil di halaman free & premium."),
+        "serverdetect": ("ok", "Lokasi server berhasil dideteksi otomatis dari IP VPS."),
+        "serverfail": ("error", "Gagal mendeteksi lokasi server. Isi kode negara manual atau coba lagi."),
     }
     notice = ""
     if msg in messages:
@@ -3477,6 +3671,9 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
     logo_preview_src = f"/branding/logo?v={e(b['logo_version'])}" if logo_path else "/static/favicon.svg"
     logo_label = "Logo kustom aktif" if logo_path else "Belum ada logo kustom"
     current_theme = b["theme"]
+    sv = server_info()
+    sv_last = fmt_ts(int(sv["last_check"]), "%d %b %Y %H:%M WIB") if str(sv["last_check"]).isdigit() else "Belum pernah"
+    sv_source = sv["source"] or "-"
     theme_cards = ""
     for theme_key, (theme_label, theme_desc) in UI_THEMES.items():
         theme_cards += (
@@ -3560,6 +3757,34 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
       <div class="theme-grid">{theme_cards}</div>
       <p class="panel-hint">Warna font otomatis menyesuaikan: tema terang memakai teks gelap, tema gelap memakai teks terang.</p>
       <div class="form-actions"><button class="btn btn-primary btn-small" type="submit">Terapkan tema</button></div>
+    </form>
+  </section>
+
+  <section class="panel admin-panel server-panel">
+    <div class="panel-head"><div><span class="mini-label">KETERANGAN SERVER</span><h2>Lokasi server</h2></div><span class="badge badge-ok">{sv['flag']} {e(sv['name'] or 'Belum diatur')}</span></div>
+    <form method="post" action="/admin/server" class="server-form">
+      <input type="hidden" name="_csrf" value="{e(session['csrf'])}">
+      <div class="settings-grid">
+        <fieldset>
+          <legend>Info yang tampil</legend>
+          <label>Kode negara (2 huruf)<input type="text" name="server_country_code" value="{e(sv['code'])}" maxlength="2" placeholder="SG" style="text-transform:uppercase"></label>
+          <label>Nama negara<input type="text" name="server_country_name" value="{e(sv['name'])}" maxlength="60" placeholder="Singapura"></label>
+          <label>Kota (opsional)<input type="text" name="server_city" value="{e(sv['city'])}" maxlength="80" placeholder="Singapore"></label>
+          <label>Catatan (opsional)<input type="text" name="server_note" value="{e(sv['note'])}" maxlength="160" placeholder="Lokasi VPS · Asia Tenggara"></label>
+          <label class="switch"><input type="checkbox" name="server_show" value="1" {'checked' if sv['show'] else ''}><span>Tampilkan info server di halaman free &amp; premium</span></label>
+        </fieldset>
+        <fieldset>
+          <legend>Deteksi otomatis</legend>
+          <div class="server-preview">
+            <span>{sv['flag']}</span>
+            <div><b>{e(sv['name'] or 'Belum terdeteksi')}</b><small>{e(sv['city'] or 'Kota belum diketahui')}</small></div>
+          </div>
+          <p class="panel-hint">Sumber: <b>{e(sv_source)}</b><br>Terakhir dicek: <b>{e(sv_last)}</b></p>
+          <p class="panel-hint">Deteksi memakai IP publik VPS. Jika pindah VPS, klik tombol ini atau install ulang website.</p>
+          <button class="btn btn-ghost btn-small" type="submit" name="action" value="detect">Deteksi otomatis dari IP VPS</button>
+        </fieldset>
+      </div>
+      <div class="form-actions"><button class="btn btn-primary btn-small" type="submit" name="action" value="save">Simpan info server</button></div>
     </form>
   </section>
 
@@ -3899,11 +4124,20 @@ def main() -> int:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8099)
     parser.add_argument("--init-only", action="store_true")
+    parser.add_argument("--detect-server", action="store_true")
     args = parser.parse_args()
 
     # File database/log hanya boleh dibaca root.
     os.umask(0o077)
     init_db()
+    if args.detect_server:
+        info = refresh_server_info(force=True)
+        print(json.dumps(info or {}, ensure_ascii=False))
+        return 0 if info else 1
+    try:
+        refresh_server_info()
+    except Exception:
+        logger.warning("deteksi lokasi server saat start gagal: %s", traceback.format_exc())
     if args.init_only:
         print(f"database siap: {DB_PATH}")
         if ADMIN_CRED_PATH.exists():
