@@ -269,6 +269,8 @@ if [ -d "$AKAR/etc" ]; then
     [ -f "$AKAR/root/kyt-web-admin.txt" ] && salin "$AKAR/root/kyt-web-admin.txt" "/root/kyt-web-admin.txt"
     [ -f "$AKAR/etc/kyt-web.conf" ] && salin "$AKAR/etc/kyt-web.conf" "/etc/kyt-web.conf"
     [ -f "$AKAR/usr/local/sbin/setting-web" ] && salin "$AKAR/usr/local/sbin/setting-web" "/usr/local/sbin/setting-web"
+    [ -f "$AKAR/etc/bot/.bot.db" ] && salin "$AKAR/etc/bot/.bot.db" "/etc/bot/.bot.db"
+    [ -f "$AKAR/usr/bin/kyt/gomerch_token.json" ] && salin "$AKAR/usr/bin/kyt/gomerch_token.json" "/usr/bin/kyt/gomerch_token.json"
     if [ -x /usr/local/sbin/kyt-web-cert-sync ]; then
         mkdir -p /etc/letsencrypt/renewal-hooks/deploy
         ln -sf /usr/local/sbin/kyt-web-cert-sync /etc/letsencrypt/renewal-hooks/deploy/kyt-web-cert-sync

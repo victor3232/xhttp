@@ -104,6 +104,8 @@ BERKAS="
 /root/kyt-web-admin.txt
 /etc/kyt-web.conf
 /usr/local/sbin/setting-web
+/etc/bot/.bot.db
+/usr/bin/kyt/gomerch_token.json
 /etc/ssl/kyt-web/vpnfree.crt
 /etc/ssl/kyt-web/vpnfree.key
 "
