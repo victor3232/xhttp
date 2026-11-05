@@ -580,11 +580,6 @@ def detect_server_info() -> dict | None:
             continue
         name = COUNTRY_NAMES.get(code) or (fallback_name or "").strip() or code
         city = (city or "").strip()
-        if not city:
-            try:
-                city = Path("/etc/xray/city").read_text(encoding="utf-8", errors="ignore").strip()
-            except Exception:
-                city = ""
         return {"code": code, "name": name, "city": city, "source": url}
     return None
 
