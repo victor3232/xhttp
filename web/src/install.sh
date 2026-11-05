@@ -71,6 +71,14 @@ else
     echo 'ENABLED=1' >> "$CONF"
 fi
 
+# Fallback admin login jika bot Telegram belum terpasang.
+if [ ! -s /etc/bot/.bot.db ] && ! grep -qE '^ADMIN_TOKEN=' "$CONF"; then
+    ADMIN_WEB_TOKEN=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 48)
+    echo "ADMIN_TOKEN=$ADMIN_WEB_TOKEN" >> "$CONF"
+    printf 'HITS SSH admin\nURL: https://%s/admin\nToken: %s\n' "$DOMAIN" "$ADMIN_WEB_TOKEN" > /root/hits-admin-token.txt
+    chmod 600 /root/hits-admin-token.txt
+fi
+
 mkdir -p "$WEBROOT/.well-known/acme-challenge" /etc/ssl/kyt-web
 python3 /usr/local/sbin/kyt-web-configure-edge "$DOMAIN"
 

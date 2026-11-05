@@ -53,3 +53,11 @@ ON-kan ulang dari Utility; installer mempertahankan database yang sudah ada.
 
 Saat ON pertama, `setting-web` meminta domain dengan default
 `web.<domain-vpn>`. Domain disimpan di `/etc/kyt-web.conf`.
+
+## Fitur HITS SSH
+
+- Kategori gratis: SSH, VMess, VLESS, Trojan; kuota harian.
+- Kategori premium multi-durasi: harga, masa aktif, limit IP, dan kuota per paket.
+- Checkout tanpa login, QRIS GoPay, kode unik nominal, invoice privat.
+- Cek invoice, download detail akun `.txt`, dan riwayat transaksi admin.
+- Login admin memakai token bot Telegram.

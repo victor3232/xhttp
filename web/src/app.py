@@ -2017,7 +2017,15 @@ class Handler(BaseHTTPRequestHandler):
             if row["status"] != "COMPLETED" or not row["account_output"]:
                 self.html(409, render_error("Akun belum siap. Selesaikan pembayaran terlebih dahulu."))
                 return
-            body = (row["account_output"] or "").encode("utf-8")
+            header = (
+                "HITS SSH PREMIUM\n"
+                f"Invoice : {row['invoice']}\n"
+                f"Paket   : {row['protocol'].upper()} {row['days']} hari\n"
+                f"Total   : Rp {int(row['total']):,}\n"
+                f"Dibayar : {fmt_ts(row['paid_at'], '%d %b %Y %H:%M WIB')}\n"
+                "----------------------------------------\n\n"
+            ).replace(",", ".")
+            body = (header + (row["account_output"] or "")).encode("utf-8")
             self._send(
                 200,
                 body,
@@ -2336,7 +2344,7 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
 <meta name="theme-color" content="#fffaf2">
 {robots}
 <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
-<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/style.css?v=20261105hits1">
 </head>
 <body>
 <header class="nav">
@@ -2366,7 +2374,7 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
     <div class="footer-note">HITS SSH · Free &amp; Premium · Gunakan dengan bijak.</div>
   </div>
 </footer>
-<script src="/static/app.js" defer></script>
+<script src="/static/app.js?v=20261105hits1" defer></script>
 </body>
 </html>"""
 
