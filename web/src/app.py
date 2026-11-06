@@ -1164,7 +1164,14 @@ def create_ssh_account(user: str, password: str, days: int, ip_limit: int, quota
     )
     ok, reason = verify_ssh(user, password)
     if ok:
-        return True, format_ssh_output(read_account_output("ssh", user)), log
+        output = format_ssh_output(read_account_output("ssh", user))
+        try:
+            output_path = HTML_DIR / f"ssh-{user}.txt"
+            output_path.write_text(output + "\n", encoding="utf-8")
+            os.chmod(output_path, 0o644)
+        except OSError:
+            logger.warning("gagal menulis ulang output SSH %s", user)
+        return True, output, log
     logger.error("gagal membuat SSH %s rc=%s reason=%s\n%s", user, rc, reason, log[-4000:])
     remove_ssh_account(user)
     return False, reason, log
