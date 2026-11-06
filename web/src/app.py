@@ -968,6 +968,105 @@ def verify_xray(protocol: str, user: str) -> tuple[bool, str]:
     return True, ""
 
 
+SSH_BOX_SEP = "━" * 19
+
+
+def _ssh_field(raw: str, key: str) -> str:
+    match = re.search(
+        r"^[ \t]*" + re.escape(key) + r"[ \t]*:[ \t]*(.*?)[ \t]*$",
+        raw,
+        re.MULTILINE,
+    )
+    return match.group(1).strip() if match else ""
+
+
+def format_ssh_output(raw: str) -> str:
+    """Rapikan output akun SSH ke format kartu klasik HITS SSH."""
+    raw = clean_output(raw or "")
+    if not raw:
+        return raw
+    head = raw.lstrip()
+    if head.startswith(SSH_BOX_SEP) and "SSH OVPN Account" in head[:120]:
+        return raw
+
+    username = _ssh_field(raw, "Username")
+    password = _ssh_field(raw, "Password")
+    if not username or not password:
+        return raw
+
+    settings = get_settings()
+    host = _ssh_field(raw, "Host") or (settings.get("domain") or "").strip()
+    slowdns = _ssh_field(raw, "Host Slowdns")
+    pubkey = _ssh_field(raw, "Pub Key")
+    expiry = _ssh_field(raw, "Berakhir Pada") or _ssh_field(raw, "Expired until")
+    if not expiry and _ssh_field(raw, "Aktif Selama"):
+        expiry = _ssh_field(raw, "Aktif Selama")
+
+    ports = [
+        ("Port OpenSSH", "443, 80, 22"),
+        ("Port SSH UDP", "1-65535"),
+        ("Port Dropbear", "443, 109"),
+        ("Port SSH WS", "80, 8080, 8081-9999"),
+        ("Port SSH SSL WS", "443"),
+        ("HCR", "8811 (TLS + Plain; akun SSH)"),
+        ("Port SlowDNS", "53, 80, 443"),
+        ("Port SSL/TLS", "400-900"),
+        ("Port OVPN WS SSL", "443"),
+        ("Port OVPN SSL", "443"),
+        ("Port OVPN TCP", "443, 1194"),
+        ("Port OVPN UDP", "2200"),
+        ("BadVPN UDP", "7100, 7200, 7300"),
+    ]
+
+    payload_ssh = _ssh_field(raw, "Payload SSH WS") or (
+        f"GET / HTTP/1.1[crlf]Host: {host}[crlf]Upgrade: websocket"
+        "[crlf]Connection: Keep-Alive[crlf]User-Agent: [ua][crlf][crlf]"
+    )
+    payload_enh = _ssh_field(raw, "Payload WS ENHANCED") or (
+        "PATCH / HTTP/1.1[crlf]Host: [host][crlf]Host: INPUT_YOUR_BUGCDN"
+        "[crlf]Connection: Upgrade[crlf]User-Agent: [ua]"
+        "[crlf]Upgrade: websocket[crlf][crlf]"
+    )
+    payload_cfray = _ssh_field(raw, "CF-RAY without proxy & port") or (
+        "GET / HTTP/1.1[crlf]Host: INPUT_YOUR_BUGCDN[crlf][crlf]"
+        "CF-RAY / HTTP/1.1[crlf]Host: "
+        f"{host}[crlf]Upgrade: websocket[crlf]Connection: Keep-Alive"
+        "[crlf]User-Agent: [ua][crlf][crlf]"
+    )
+    payload_https = (
+        f"GET / HTTP/1.1[crlf]Host: {host}[crlf]Upgrade: websocket[crlf][crlf]"
+    )
+
+    out: list[str] = [SSH_BOX_SEP, " SSH OVPN Account", SSH_BOX_SEP]
+    out.append(f" {'Username':<17}: {username}")
+    out.append(f" {'Password':<17}: {password}")
+    if host:
+        out.append(f" {'Host':<17}: {host}")
+    if slowdns:
+        out.append(f" {'Host Slowdns':<17}: {slowdns}")
+    if pubkey:
+        out.append(f" {'Pub Key':<17}: {pubkey}")
+    for label, default in ports:
+        value = _ssh_field(raw, label) or default
+        if label == "Port OVPN TCP" and value and "443" not in value:
+            value = f"443, {value}"
+        out.append(f" {label:<17}: {value}")
+    out += [SSH_BOX_SEP, " Payload SSH WS", SSH_BOX_SEP, payload_ssh]
+    out += [SSH_BOX_SEP, " Payload WS ENHANCED", SSH_BOX_SEP, payload_enh]
+    out += [SSH_BOX_SEP, " CF-RAY without proxy & port", SSH_BOX_SEP, payload_cfray]
+    out += [SSH_BOX_SEP, " Payload WS HTTPS", SSH_BOX_SEP, payload_https]
+    out += [SSH_BOX_SEP, SSH_BOX_SEP]
+    if host:
+        out.append(f" {'OVPN Download':<17}: https://{host}:81/")
+        out.append(SSH_BOX_SEP)
+        out.append(f" Save Link Account: https://{host}:81/ssh-{username}.txt")
+        out.append(SSH_BOX_SEP)
+    if expiry:
+        out.append(f" Expired until  : {expiry}")
+        out.append(SSH_BOX_SEP)
+    return "\n".join(out)
+
+
 def read_account_output(service: str, user: str, protocol: str = "") -> str:
     name = f"ssh-{user}.txt" if service == "ssh" else f"{protocol}-{user}.txt"
     path = HTML_DIR / name
@@ -1065,7 +1164,7 @@ def create_ssh_account(user: str, password: str, days: int, ip_limit: int, quota
     )
     ok, reason = verify_ssh(user, password)
     if ok:
-        return True, read_account_output("ssh", user), log
+        return True, format_ssh_output(read_account_output("ssh", user)), log
     logger.error("gagal membuat SSH %s rc=%s reason=%s\n%s", user, rc, reason, log[-4000:])
     remove_ssh_account(user)
     return False, reason, log
@@ -2150,7 +2249,10 @@ class Handler(BaseHTTPRequestHandler):
             self.html(404, render_not_found(), head_only=head_only)
             return
         if download:
-            body = (row["output"] or "").encode("utf-8")
+            download_output = row["output"] or ""
+            if row["service"] == "ssh":
+                download_output = format_ssh_output(download_output)
+            body = download_output.encode("utf-8")
             self._send(
                 200,
                 body,
@@ -2387,7 +2489,10 @@ class Handler(BaseHTTPRequestHandler):
                 f"Dibayar : {fmt_ts(row['paid_at'], '%d %b %Y %H:%M WIB')}\n"
                 "----------------------------------------\n\n"
             ).replace(",", ".")
-            body = (header + (row["account_output"] or "")).encode("utf-8")
+            download_output = row["account_output"] or ""
+            if row["protocol"] == "ssh":
+                download_output = format_ssh_output(download_output)
+            body = (header + download_output).encode("utf-8")
             self._send(
                 200,
                 body,
@@ -2423,7 +2528,11 @@ class Handler(BaseHTTPRequestHandler):
             "total": row["total"],
             "expires_at": row["expires_at"],
             "username": row["account_username"] if status == "COMPLETED" else "",
-            "account": row["account_output"] if status == "COMPLETED" else "",
+            "account": (
+                format_ssh_output(row["account_output"])
+                if status == "COMPLETED" and row["protocol"] == "ssh"
+                else (row["account_output"] if status == "COMPLETED" else "")
+            ),
             "error": row["provision_error"] if status == "FAILED" else "",
         }
         self.json(200, payload)
@@ -3440,7 +3549,10 @@ def render_result(row: sqlite3.Row) -> str:
     service = SERVICES.get(row["service"], {"label": row["service"]})
     protocol = PROTOCOLS.get(row["protocol"], {}).get("label", "")
     label = service["label"] + (f" · {protocol}" if protocol else "")
-    output = e(row["output"])
+    raw_output = row["output"] or ""
+    if row["service"] == "ssh":
+        raw_output = format_ssh_output(raw_output)
+    output = e(raw_output)
     expires = fmt_ts(row["expires_at"], "%d %b %Y · %H:%M WIB")
     body = f"""
 <main class="result-main wrap">
@@ -4005,6 +4117,9 @@ def render_invoice(row: sqlite3.Row, new: bool = False) -> str:
         <div class="pay-status" id="invoice-live-status">Status: <b>{e(status_text)}</b></div>
       </div>
     </div>"""
+    invoice_output = row["account_output"] or ""
+    if row["protocol"] == "ssh":
+        invoice_output = format_ssh_output(invoice_output)
     completed_block = f"""
     <div class="invoice-done">
       <div class="success-mark">✓</div>
@@ -4014,7 +4129,7 @@ def render_invoice(row: sqlite3.Row, new: bool = False) -> str:
         <a class="btn btn-small btn-dark" href="/invoice/{e(row['invoice'])}.txt" download>Unduh .txt</a>
       </div>
     </div>
-    <pre class="account-output invoice-output" id="invoice-account">{e(row['account_output'])}</pre>"""
+    <pre class="account-output invoice-output" id="invoice-account">{e(invoice_output)}</pre>"""
     failed_block = f"""
     <div class="invoice-failed">
       <div class="error-code">!</div>
