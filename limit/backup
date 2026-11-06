@@ -86,6 +86,10 @@ BERKAS="
 /etc/kyt.txt
 /etc/kyt/jeda-mullog.conf
 /etc/xray/limit.ssh
+/etc/xray/limit.vmess
+/usr/bin/kyt/modules/conn_notif.py
+/etc/logrotate.d/rsyslog
+/etc/logrotate.d/auth-log
 /usr/bin/limit-ip
 /usr/local/sbin/jeda-mullog
 /usr/local/sbin/setting-jeda
@@ -241,6 +245,8 @@ cek_isi "opt/kyt-web/data/web.db"     "database website (branding, tema, server)
 cek_isi "opt/kyt-web/data/branding/"  "logo branding kustom"
 cek_isi "usr/local/sbin/setting-web"  "setting website (domain, Turnstile, server)"
 cek_isi "usr/local/sbin/slowdns-rcvbuf" "optimasi buffer SlowDNS"
+cek_isi "usr/bin/kyt/modules/conn_notif.py" "monitor koneksi bot"
+cek_isi "etc/logrotate.d/auth-log" "rotasi log auth"
 
 # ---------- kirim ke Telegram ----------
 KEY=""
