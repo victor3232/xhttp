@@ -238,7 +238,7 @@ DEFAULTS = {
     "free_enabled": "1",
     "premium_enabled": "1",
     "premium_expiry_min": "15",
-    "premium_unique_cursor": "0",
+    "premium_unique_last": "0",
     "gopay_base_url": "https://pgku.stunnelv4.biz.id",
     "contact_telegram": "",
     "contact_group": "",
@@ -1635,16 +1635,22 @@ def _invoice_code() -> str:
 
 PREMIUM_UNIQUE_MAX = 50
 PREMIUM_EXPIRED_GRACE = 3600  # kode EXPIRED diamankan 1 jam dari pembayaran telat
+RESERVED_TOTALS: set[int] = set()
+
+
+def _release_total(total: int) -> None:
+    with UNIQUE_CODE_LOCK:
+        RESERVED_TOTALS.discard(int(total))
 
 
 def _allocate_total(price: int) -> tuple[int, int]:
-    """Kode unik 1..50 berputar. Kode bebas lagi setelah invoice selesai/expired."""
+    """Kode unik 1..50 diacak. Kode bebas lagi setelah invoice selesai/expired."""
     with UNIQUE_CODE_LOCK:
         settings = get_settings()
         try:
-            cursor = int(settings.get("premium_unique_cursor", "0") or 0)
+            last = int(settings.get("premium_unique_last", "0") or 0)
         except (TypeError, ValueError):
-            cursor = 0
+            last = 0
         now = int(time.time())
         conn = db_connect()
         try:
@@ -1657,15 +1663,9 @@ def _allocate_total(price: int) -> tuple[int, int]:
                     (now - PREMIUM_EXPIRED_GRACE,),
                 )
             }
-            if cursor < 1 or cursor > PREMIUM_UNIQUE_MAX:
-                row = conn.execute(
-                    "SELECT MAX(unique_code) m FROM orders "
-                    "WHERE unique_code BETWEEN 1 AND ?",
-                    (PREMIUM_UNIQUE_MAX,),
-                ).fetchone()
-                cursor = int(row["m"] or 0)
         finally:
             conn.close()
+        used |= RESERVED_TOTALS
         bot_amounts: set[int] = set()
         if BOT_KYT_DB.exists():
             try:
@@ -1682,13 +1682,20 @@ def _allocate_total(price: int) -> tuple[int, int]:
                     bconn.close()
             except Exception:
                 pass
-        for offset in range(1, PREMIUM_UNIQUE_MAX + 1):
-            code = ((cursor + offset - 1) % PREMIUM_UNIQUE_MAX) + 1
-            total = int(price) + code
-            if total not in used and total not in bot_amounts:
-                set_settings({"premium_unique_cursor": str(code)})
-                return code, total
-        raise ValueError("Nomor unik invoice habis sementara. Coba lagi beberapa saat.")
+        candidates = [
+            code
+            for code in range(1, PREMIUM_UNIQUE_MAX + 1)
+            if int(price) + code not in used and int(price) + code not in bot_amounts
+        ]
+        if not candidates:
+            raise ValueError("Nomor unik invoice habis sementara. Coba lagi beberapa saat.")
+        if last in candidates and len(candidates) > 1:
+            candidates.remove(last)
+        code = secrets.choice(candidates)
+        total = int(price) + code
+        RESERVED_TOTALS.add(total)
+        set_settings({"premium_unique_last": str(code)})
+        return code, total
 
 
 def order_by_invoice(invoice: str) -> sqlite3.Row | None:
@@ -1730,38 +1737,41 @@ def create_premium_order(product_code: str, ip: str, user_agent: str) -> sqlite3
         raise ValueError("Terlalu banyak invoice aktif dari IP Anda. Selesaikan atau tunggu invoice lama kedaluwarsa.")
 
     unique_code, total = _allocate_total(int(product["price"]))
-    qr = gopay_build_qris(total)
-    if not qr:
-        raise ValueError("Gagal membuat QRIS GoPay. Hubungi admin.")
-    invoice = _invoice_code()
-    now = int(time.time())
-    expires = now + int(settings.get("premium_expiry_min", "15")) * 60
-    conn = db_connect()
     try:
-        conn.execute(
-            "INSERT INTO orders(invoice,product_code,protocol,days,price,unique_code,total,"
-            "ip_limit,quota_gb,status,qr_string,buyer_ip,user_agent,created_at,expires_at) "
-            "VALUES(?,?,?,?,?,?,?,?,?,'PENDING',?,?,?,?,?)",
-            (
-                invoice,
-                product["code"],
-                product["protocol"],
-                product["days"],
-                product["price"],
-                unique_code,
-                total,
-                product["ip_limit"],
-                product["quota_gb"],
-                qr,
-                ip,
-                user_agent[:300],
-                now,
-                expires,
-            ),
-        )
-        conn.commit()
+        qr = gopay_build_qris(total)
+        if not qr:
+            raise ValueError("Gagal membuat QRIS GoPay. Hubungi admin.")
+        invoice = _invoice_code()
+        now = int(time.time())
+        expires = now + int(settings.get("premium_expiry_min", "15")) * 60
+        conn = db_connect()
+        try:
+            conn.execute(
+                "INSERT INTO orders(invoice,product_code,protocol,days,price,unique_code,total,"
+                "ip_limit,quota_gb,status,qr_string,buyer_ip,user_agent,created_at,expires_at) "
+                "VALUES(?,?,?,?,?,?,?,?,?,'PENDING',?,?,?,?,?)",
+                (
+                    invoice,
+                    product["code"],
+                    product["protocol"],
+                    product["days"],
+                    product["price"],
+                    unique_code,
+                    total,
+                    product["ip_limit"],
+                    product["quota_gb"],
+                    qr,
+                    ip,
+                    user_agent[:300],
+                    now,
+                    expires,
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
     finally:
-        conn.close()
+        _release_total(total)
     audit("premium_invoice", f"{invoice} {product['code']} total={total} ip={ip}", ip)
     return order_by_invoice(invoice)
 
