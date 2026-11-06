@@ -238,6 +238,7 @@ DEFAULTS = {
     "free_enabled": "1",
     "premium_enabled": "1",
     "premium_expiry_min": "15",
+    "premium_unique_cursor": "0",
     "gopay_base_url": "https://pgku.stunnelv4.biz.id",
     "contact_telegram": "",
     "contact_group": "",
@@ -277,6 +278,7 @@ ANSI_OSC_RE = re.compile(r"\x1b\][^\x07]*(?:\x07|\x1b\\)")
 
 CREATE_LOCK = threading.Lock()
 RATE_LOCK = threading.Lock()
+UNIQUE_CODE_LOCK = threading.Lock()
 RATE_BUCKETS: dict[str, collections.deque] = {}
 PUBLIC_RATE: dict[str, collections.deque] = {}
 
@@ -1631,37 +1633,62 @@ def _invoice_code() -> str:
     raise RuntimeError("gagal membuat kode invoice")
 
 
+PREMIUM_UNIQUE_MAX = 50
+PREMIUM_EXPIRED_GRACE = 3600  # kode EXPIRED diamankan 1 jam dari pembayaran telat
+
+
 def _allocate_total(price: int) -> tuple[int, int]:
-    since = int(time.time()) - 7 * 86400
-    conn = db_connect()
-    try:
-        used = {
-            int(r["total"])
-            for r in conn.execute("SELECT total FROM orders WHERE created_at>=?", (since,))
-        }
-    finally:
-        conn.close()
-    bot_amounts: set[int] = set()
-    if BOT_KYT_DB.exists():
+    """Kode unik 1..50 berputar. Kode bebas lagi setelah invoice selesai/expired."""
+    with UNIQUE_CODE_LOCK:
+        settings = get_settings()
         try:
-            bconn = sqlite3.connect(f"file:{BOT_KYT_DB}?mode=ro", uri=True, timeout=5)
+            cursor = int(settings.get("premium_unique_cursor", "0") or 0)
+        except (TypeError, ValueError):
+            cursor = 0
+        now = int(time.time())
+        conn = db_connect()
+        try:
+            used = {
+                int(r["total"])
+                for r in conn.execute(
+                    "SELECT total FROM orders "
+                    "WHERE status IN ('PENDING','PAID','PROVISIONING') "
+                    "OR (status='EXPIRED' AND expires_at>=?)",
+                    (now - PREMIUM_EXPIRED_GRACE,),
+                )
+            }
+            if cursor < 1 or cursor > PREMIUM_UNIQUE_MAX:
+                row = conn.execute(
+                    "SELECT MAX(unique_code) m FROM orders "
+                    "WHERE unique_code BETWEEN 1 AND ?",
+                    (PREMIUM_UNIQUE_MAX,),
+                ).fetchone()
+                cursor = int(row["m"] or 0)
+        finally:
+            conn.close()
+        bot_amounts: set[int] = set()
+        if BOT_KYT_DB.exists():
             try:
-                for r in bconn.execute(
-                    "SELECT amount FROM deposit WHERE status IN ('PENDING','PAID') AND created>=datetime('now','-2 days')"
-                ):
-                    try:
-                        bot_amounts.add(int(r[0]))
-                    except Exception:
-                        pass
-            finally:
-                bconn.close()
-        except Exception:
-            pass
-    for code in range(1, 1000):
-        total = int(price) + code
-        if total not in used and total not in bot_amounts:
-            return code, total
-    raise ValueError("Nomor unik invoice habis sementara. Coba lagi beberapa saat.")
+                bconn = sqlite3.connect(f"file:{BOT_KYT_DB}?mode=ro", uri=True, timeout=5)
+                try:
+                    for r in bconn.execute(
+                        "SELECT amount FROM deposit WHERE status IN ('PENDING','PAID') AND created>=datetime('now','-2 days')"
+                    ):
+                        try:
+                            bot_amounts.add(int(r[0]))
+                        except Exception:
+                            pass
+                finally:
+                    bconn.close()
+            except Exception:
+                pass
+        for offset in range(1, PREMIUM_UNIQUE_MAX + 1):
+            code = ((cursor + offset - 1) % PREMIUM_UNIQUE_MAX) + 1
+            total = int(price) + code
+            if total not in used and total not in bot_amounts:
+                set_settings({"premium_unique_cursor": str(code)})
+                return code, total
+        raise ValueError("Nomor unik invoice habis sementara. Coba lagi beberapa saat.")
 
 
 def order_by_invoice(invoice: str) -> sqlite3.Row | None:
@@ -1858,6 +1885,19 @@ def expire_premium_orders() -> int:
         conn.close()
 
 
+def _pending_matchable(rows, now: int | None = None) -> list:
+    """Invoice yang masih boleh dicocokkan dengan pembayaran GoPay."""
+    now = int(time.time()) if now is None else int(now)
+    result = []
+    for row in rows:
+        if row["status"] not in ("PENDING", "EXPIRED") or row["reference"]:
+            continue
+        if row["status"] == "EXPIRED" and int(row["expires_at"] or 0) < now - PREMIUM_EXPIRED_GRACE:
+            continue
+        result.append(row)
+    return result
+
+
 def poll_premium_orders() -> None:
     expire_premium_orders()
     conn = db_connect()
@@ -1875,7 +1915,7 @@ def poll_premium_orders() -> None:
         }
     finally:
         conn.close()
-    pending = [r for r in rows if r["status"] in ("PENDING", "EXPIRED") and not r["reference"]]
+    pending = _pending_matchable(rows)
     if not pending:
         pay_state_set("gopay_pending", "0")
         return
