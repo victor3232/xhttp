@@ -61,4 +61,5 @@ Saat ON pertama, `setting-web` meminta domain dengan default
 - Checkout tanpa login, QRIS GoPay, kode unik nominal, invoice privat.
 - Cek invoice, download detail akun `.txt`, dan riwayat transaksi admin.
 - Popup informasi (server/domain/maintenance) yang bisa diatur dan di-ON/OFF-kan dari Dashboard Admin.
+- Filter domain email pendaftaran: blokir temp mail, hanya Google (Gmail), allowlist custom, atau semua domain.
 - Login admin memakai token bot Telegram.

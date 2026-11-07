@@ -4267,3 +4267,12 @@ html, body {
   font: inherit;
   font-size: 11px;
 }
+
+/* Filter domain pendaftaran di dashboard admin */
+.signup-admin-panel textarea {
+  min-height: 108px;
+  resize: vertical;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.6;
+}

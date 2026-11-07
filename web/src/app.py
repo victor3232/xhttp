@@ -349,6 +349,9 @@ DEFAULTS = {
     "popup_button_url": "",
     "popup_mode": "once",
     "popup_version": "1",
+    "signup_email_mode": "block",
+    "signup_email_allow": "gmail.com, googlemail.com",
+    "signup_email_block_extra": "",
 }
 
 INT_SETTINGS = {
@@ -379,6 +382,7 @@ ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 ANSI_OSC_RE = re.compile(r"\x1b\][^\x07]*(?:\x07|\x1b\\)")
 
 CREATE_LOCK = threading.Lock()
+REGISTER_LOCK = threading.Lock()
 RATE_LOCK = threading.Lock()
 UNIQUE_CODE_LOCK = threading.Lock()
 RATE_BUCKETS: dict[str, collections.deque] = {}
@@ -1137,6 +1141,99 @@ def valid_email(value: str) -> bool:
     return bool(re.fullmatch(r"[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+", value))
 
 
+# Domain email sekali pakai yang umum. Admin bisa menambah daftar sendiri.
+DISPOSABLE_EMAIL_DOMAINS = {
+    "0-mail.com", "10minutemail.com", "10minutemail.net", "20minutemail.com",
+    "anonbox.net", "binkmail.com", "bobmail.info", "burnermail.io",
+    "chammy.info", "cool.fr.nf", "courriel.fr.nf", "discard.email",
+    "dispostable.com", "dropmail.me", "emailnator.com", "emailondeck.com",
+    "fakeinbox.com", "getnada.com", "grr.la", "guerrillamail.com",
+    "guerrillamail.net", "guerrillamail.org", "guerrillamailblock.com",
+    "inboxkitten.com", "jetable.fr.nf", "letthemeatspam.com", "luxusmail.org",
+    "mail.gw", "mail.tm", "mail7.io", "mailcatch.com", "maildrop.cc",
+    "mailinater.com", "mailinator.com", "mailmetrash.com", "mailnesia.com",
+    "mailscrap.com", "mintemail.com", "moakt.com", "mohmal.com",
+    "moncourrier.fr.nf", "monemail.fr.nf", "monmail.fr.nf", "mt2009.com",
+    "nomail.xl.cx", "nospam.ze.tc", "pokemail.net", "sharklasers.com",
+    "smailpro.com", "spam.la", "spam4.me", "spamgourmet.com", "speed.1s.fr",
+    "temp-mail.org", "tempail.com", "tempinbox.com", "tempmail.com",
+    "tempmail.plus", "tempmailo.com", "thankyou2010.com", "throwawaymail.com",
+    "trash2009.com", "trashmail.com", "trashymail.com", "tyldd.com",
+    "uggsrock.com", "vortexmail.net", "wegwerfmail.de", "wegwerfmail.net",
+    "wegwerfmail.org", "wh4f.org", "willselfdestruct.com", "wronghead.com",
+    "xagloo.com", "yopmail.com", "yopmail.fr", "yopmail.net",
+}
+
+
+def email_domain(value: str) -> str:
+    email = normalize_email(value)
+    return email.rsplit("@", 1)[-1] if "@" in email else ""
+
+
+def email_compare_key(value: str) -> str:
+    """Gmail/Googlemail tidak membedakan titik dan +tag."""
+    email = normalize_email(value)
+    local, sep, domain = email.partition("@")
+    if sep and domain in ("gmail.com", "googlemail.com"):
+        local = local.split("+", 1)[0].replace(".", "")
+        return f"{local}@gmail.com"
+    return email
+
+
+def parse_domain_list(raw: str) -> list[str]:
+    result: list[str] = []
+    for part in re.split(r"[\s,;]+", raw or ""):
+        domain = part.strip().lower().lstrip("@").rstrip(".")
+        if domain and re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?\.[a-z]{2,}", domain):
+            if domain not in result:
+                result.append(domain)
+    return result
+
+
+def domain_in_list(domain: str, entries) -> bool:
+    domain = (domain or "").lower().strip(".")
+    return any(domain == item or domain.endswith("." + item) for item in entries)
+
+
+def signup_email_allowed(email: str, settings: dict[str, str] | None = None) -> tuple[bool, str]:
+    try:
+        settings = settings or get_settings()
+    except Exception:
+        return True, ""
+    mode = (settings.get("signup_email_mode") or "block").strip()
+    if mode == "all":
+        return True, ""
+    domain = email_domain(email)
+    if not domain:
+        return False, "Format email tidak valid."
+    if mode == "google":
+        if domain in ("gmail.com", "googlemail.com"):
+            return True, ""
+        return False, "Pendaftaran hanya menerima email Google (Gmail)."
+    if mode == "allow":
+        allowed = parse_domain_list(settings.get("signup_email_allow", "")) or ["gmail.com", "googlemail.com"]
+        if domain_in_list(domain, allowed):
+            return True, ""
+        return False, "Domain email belum diizinkan untuk pendaftaran."
+    blocked = set(DISPOSABLE_EMAIL_DOMAINS)
+    blocked.update(parse_domain_list(settings.get("signup_email_block_extra", "")))
+    if domain_in_list(domain, blocked):
+        return False, "Email sementara/temp mail tidak diizinkan. Gunakan email utama Anda."
+    return True, ""
+
+
+def email_already_registered(email: str) -> bool:
+    key = email_compare_key(email)
+    conn = db_connect()
+    try:
+        for row in conn.execute("SELECT email FROM users"):
+            if email_compare_key(row["email"]) == key:
+                return True
+        return False
+    finally:
+        conn.close()
+
+
 def safe_next(value: str) -> str:
     value = (value or "").strip()
     if not value.startswith("/") or value.startswith("//") or "\n" in value or "\r" in value:
@@ -1147,9 +1244,18 @@ def safe_next(value: str) -> str:
 
 
 def user_by_email(email: str) -> sqlite3.Row | None:
+    normalized = normalize_email(email)
     conn = db_connect()
     try:
-        return conn.execute("SELECT * FROM users WHERE email=?", (normalize_email(email),)).fetchone()
+        row = conn.execute("SELECT * FROM users WHERE email=?", (normalized,)).fetchone()
+        if row:
+            return row
+        key = email_compare_key(normalized)
+        if key != normalized:
+            for candidate in conn.execute("SELECT * FROM users"):
+                if email_compare_key(candidate["email"]) == key:
+                    return candidate
+        return None
     finally:
         conn.close()
 
@@ -1165,22 +1271,25 @@ def user_by_id(user_id: int) -> sqlite3.Row | None:
 def create_user(email: str, password: str, ip: str) -> tuple[sqlite3.Row | None, str]:
     email = normalize_email(email)
     now = int(time.time())
-    conn = db_connect()
-    try:
-        cur = conn.execute(
-            "INSERT INTO users(email,password_hash,status,created_at,updated_at,last_ip) "
-            "VALUES(?,?,'pending',?,?,?)",
-            (email, hash_password(password), now, now, ip[:64]),
-        )
-        conn.commit()
-        return user_by_id(int(cur.lastrowid)), ""
-    except sqlite3.IntegrityError:
-        return None, "Email sudah terdaftar. Silakan masuk atau gunakan email lain."
-    except Exception:
-        logger.error("create_user: %s", traceback.format_exc())
-        return None, "Pendaftaran gagal. Coba lagi beberapa saat."
-    finally:
-        conn.close()
+    with REGISTER_LOCK:
+        if email_already_registered(email):
+            return None, "Email sudah terdaftar. Silakan masuk atau gunakan email lain."
+        conn = db_connect()
+        try:
+            cur = conn.execute(
+                "INSERT INTO users(email,password_hash,status,created_at,updated_at,last_ip) "
+                "VALUES(?,?,'pending',?,?,?)",
+                (email, hash_password(password), now, now, ip[:64]),
+            )
+            conn.commit()
+            return user_by_id(int(cur.lastrowid)), ""
+        except sqlite3.IntegrityError:
+            return None, "Email sudah terdaftar. Silakan masuk atau gunakan email lain."
+        except Exception:
+            logger.error("create_user: %s", traceback.format_exc())
+            return None, "Pendaftaran gagal. Coba lagi beberapa saat."
+        finally:
+            conn.close()
 
 
 def create_email_token(user_id: int, kind: str, ttl: int) -> tuple[str, str]:
@@ -4787,6 +4896,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/admin/popup":
                 self.admin_popup()
                 return
+            if path == "/admin/signup":
+                self.admin_signup()
+                return
             if path == "/admin/delete":
                 self.admin_delete()
                 return
@@ -5355,6 +5467,11 @@ class Handler(BaseHTTPRequestHandler):
         if not valid_email(email):
             self.html(400, render_auth_page("register", token_cookie, error="Format email tidak valid.", email=email, next_path=next_path))
             return
+        domain_ok, domain_error = signup_email_allowed(email)
+        if not domain_ok:
+            audit("register_blocked", f"{email} domain={email_domain(email)}", ip)
+            self.html(400, render_auth_page("register", token_cookie, error=domain_error, email=email, next_path=next_path))
+            return
         if len(password) < 8:
             self.html(400, render_auth_page("register", token_cookie, error="Password minimal 8 karakter.", email=email, next_path=next_path))
             return
@@ -5757,6 +5874,23 @@ class Handler(BaseHTTPRequestHandler):
         set_settings(values)
         audit("popup", f"enabled={values['popup_enabled']} mode={mode}", self.client_ip())
         self.redirect("/admin?msg=popup")
+
+    def admin_signup(self) -> None:
+        body = self.parse_body()
+        session = self.require_admin(body.get("_csrf", ""))
+        if not session:
+            return
+        mode = body.get("signup_email_mode", "block").strip()
+        if mode not in ("all", "block", "google", "allow"):
+            mode = "block"
+        values = {
+            "signup_email_mode": mode,
+            "signup_email_allow": body.get("signup_email_allow", "").strip()[:4000],
+            "signup_email_block_extra": body.get("signup_email_block_extra", "").strip()[:4000],
+        }
+        set_settings(values)
+        audit("signup_filter", f"mode={mode}", self.client_ip())
+        self.redirect("/admin?msg=signup")
 
     def admin_branding(self) -> None:
         body = self.parse_body()
@@ -6187,7 +6321,7 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
 <meta name="theme-color" content="{UI_THEME_COLORS.get(b['theme'], '#fffaf2')}">
 {robots}
 {favicon}
-<link rel="stylesheet" href="/static/style.css?v=20261107hero1">
+<link rel="stylesheet" href="/static/style.css?v=20261107signup1">
 {turnstile_script}
 </head>
 <body>
@@ -6195,7 +6329,7 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
 {body}
 {footer}
 {popup_html}
-<script src="/static/app.js?v=20261107hero1" defer></script>
+<script src="/static/app.js?v=20261107signup1" defer></script>
 </body>
 </html>"""
 
@@ -7208,6 +7342,19 @@ def render_auth_page(
         if ts_on and mode != "reset"
         else ""
     )
+    signup_note = ""
+    if mode == "register":
+        try:
+            signup_settings = get_settings()
+        except Exception:
+            signup_settings = {}
+        signup_mode = (signup_settings.get("signup_email_mode") or "block").strip()
+        if signup_mode == "google":
+            signup_note = '<p class="form-note auth-note">Pendaftaran hanya menerima email Google (Gmail).</p>'
+        elif signup_mode == "allow":
+            signup_note = '<p class="form-note auth-note">Gunakan email dari domain yang diizinkan admin.</p>'
+        elif signup_mode == "block":
+            signup_note = '<p class="form-note auth-note">Email sementara/temp mail tidak diterima. Gunakan email utama Anda.</p>'
     if mode == "login":
         fields = f"""
         <label>Email
@@ -7237,6 +7384,7 @@ def render_auth_page(
         </label>
         <input type="hidden" name="next" value="{e(next_path)}">
         {ts_widget}
+        {signup_note}
         <p class="form-note auth-note">Minimal 8 karakter. Tidak perlu simbol rumit.</p>
         <button class="btn btn-primary btn-block" type="submit">{e(submit)}</button>"""
         links = '<div class="auth-links"><span>Sudah punya akun? <a href="/login">Masuk</a></span></div>'
@@ -7799,6 +7947,13 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
     products = premium_products(active_only=False)
     pstats = premium_stats()
     gstat = gopay_admin_status()
+    signup_mode = (settings.get("signup_email_mode") or "block").strip()
+    signup_badge = {
+        "all": ("badge-muted", "Semua domain"),
+        "block": ("badge-ok", "Blokir temp mail"),
+        "google": ("badge-ok", "Hanya Google"),
+        "allow": ("badge-ok", "Allowlist custom"),
+    }.get(signup_mode, ("badge-ok", "Blokir temp mail"))
     like = f"%{q}%"
     conn = db_connect()
     try:
@@ -7834,6 +7989,7 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
         "settings": ("ok", "Pengaturan disimpan."),
         "popup": ("ok", "Popup informasi disimpan dan langsung aktif sesuai pengaturan."),
         "popupfail": ("error", "Popup belum bisa diaktifkan karena isi pesan masih kosong."),
+        "signup": ("ok", "Filter domain pendaftaran disimpan."),
         "deleted": ("ok", "Akun website berhasil dihapus."),
         "notfound": ("error", "Akun tidak ditemukan atau sudah dihapus."),
         "deletefail": ("error", "Akun gagal dihapus. Cek log server."),
@@ -8210,6 +8366,32 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
         </fieldset>
       </div>
       <div class="form-actions"><button class="btn btn-primary btn-small" type="submit">Simpan popup</button></div>
+    </form>
+  </section>
+
+  <section class="panel admin-panel signup-admin-panel">
+    <div class="panel-head"><div><span class="mini-label">PENDAFTARAN</span><h2>Filter domain email</h2></div><span class="badge {signup_badge[0]}">{signup_badge[1]}</span></div>
+    <form method="post" action="/admin/signup" class="server-form">
+      <input type="hidden" name="_csrf" value="{e(session['csrf'])}">
+      <div class="settings-grid">
+        <fieldset>
+          <legend>Kebijakan</legend>
+          <label>Mode filter<select name="signup_email_mode">
+            <option value="block" {'selected' if signup_mode == 'block' else ''}>Blokir temp mail (rekomendasi)</option>
+            <option value="google" {'selected' if signup_mode == 'google' else ''}>Hanya Google (Gmail)</option>
+            <option value="allow" {'selected' if signup_mode == 'allow' else ''}>Hanya domain diizinkan (custom)</option>
+            <option value="all" {'selected' if signup_mode == 'all' else ''}>Semua domain</option>
+          </select></label>
+          <p class="panel-hint">Hanya Google = gmail.com dan googlemail.com. Titik dan +tag di Gmail dianggap alamat yang sama, jadi tidak bisa dipakai mendaftar berkali-kali.</p>
+          <label>Domain yang diizinkan<textarea name="signup_email_allow" rows="4" maxlength="4000" placeholder="gmail.com&#10;googlemail.com">{e(settings.get('signup_email_allow', 'gmail.com, googlemail.com'))}</textarea><small>Dipakai saat mode "Hanya domain diizinkan". Satu domain per baris atau pisahkan koma.</small></label>
+        </fieldset>
+        <fieldset>
+          <legend>Blokir tambahan</legend>
+          <label>Domain yang diblokir<textarea name="signup_email_block_extra" rows="7" maxlength="4000" placeholder="proton.me&#10;protonmail.com">{e(settings.get('signup_email_block_extra', ''))}</textarea><small>Satu domain per baris. Subdomain otomatis ikut diblokir. Berlaku pada mode "Blokir temp mail".</small></label>
+          <p class="panel-hint">Daftar bawaan sudah memuat mailinator.com, yopmail.com, 10minutemail.com, temp-mail.org, dan domain sejenis. Untuk memblokir provider tertentu, tambahkan domainnya di sini.</p>
+        </fieldset>
+      </div>
+      <div class="form-actions"><button class="btn btn-primary btn-small" type="submit">Simpan filter pendaftaran</button></div>
     </form>
   </section>
 
