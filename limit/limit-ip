@@ -3,6 +3,10 @@
 wget() { command wget -4 "$@"; }
 curl() { command curl -4 "$@"; }
 export -f wget curl 2>/dev/null || true
+# Auto Force IPv4
+wget() { command wget -4 "$@"; }
+curl() { command curl -4 "$@"; }
+export -f wget curl 2>/dev/null || true
 # Hybrid Xray IP-limit enforcer
 # Supports Ubuntu 22/24/26 + Debian 12/13.
 # Per-user limit files are authoritative: missing/0 = unlimited.
@@ -47,6 +51,7 @@ count_user_ips() {
     awk -v u="$user" -v cut="$cutoff" '
       function ip_of(s, n, a) {
         sub(/^[a-zA-Z]+:\/\//,"",s)
+        sub(/^(tcp|udp):/,"",s)
         if (s ~ /^\[/) {
           sub(/^\[/,"",s); sub(/\]:[0-9]+$/,"",s)
           return s

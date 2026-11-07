@@ -93,6 +93,7 @@ BERKAS="
 /usr/bin/limit-ip
 /usr/local/sbin/jeda-mullog
 /usr/local/sbin/setting-jeda
+/usr/local/sbin/backup
 /usr/local/sbin/utility
 /etc/systemd/system/jeda-mullog.service
 /etc/systemd/system/vmip.service
@@ -114,6 +115,7 @@ BERKAS="
 /usr/local/sbin/vpnfree.conf.tpl
 /root/kyt-web-admin.txt
 /etc/kyt-web.conf
+/etc/kyt-web-mail.key
 /usr/local/sbin/setting-web
 /etc/bot/.bot.db
 /usr/bin/kyt/gomerch_token.json
@@ -184,6 +186,27 @@ while IFS= read -r f; do
     siapkan "$f"
 done < <(find /etc/letsencrypt/live -type l 2>/dev/null)
 
+# Snapshot konsisten database website (SQLite WAL-safe).
+# Kalau ada user mendaftar saat backup berjalan, data tetap ikut.
+if [ -f /opt/kyt-web/data/web.db ] && command -v python3 >/dev/null 2>&1; then
+    mkdir -p "$SEMENTARA/opt/kyt-web/data"
+    python3 - "$SEMENTARA/opt/kyt-web/data/web.db" >/dev/null 2>&1 <<'PY' || true
+import sqlite3
+import sys
+
+src = sqlite3.connect("file:/opt/kyt-web/data/web.db?mode=ro", uri=True, timeout=20)
+dst = sqlite3.connect(sys.argv[1], timeout=20)
+try:
+    with dst:
+        src.backup(dst)
+finally:
+    dst.close()
+    src.close()
+PY
+    rm -f "$SEMENTARA/opt/kyt-web/data/web.db-wal" "$SEMENTARA/opt/kyt-web/data/web.db-shm"
+    chmod 600 "$SEMENTARA/opt/kyt-web/data/web.db" 2>/dev/null || true
+fi
+
 if [ "$JUMLAH" = "0" ]; then
     echo -e " ${RED}Tidak ada data yang bisa dibackup.${NC}"
     rm -rf "$SEMENTARA"
@@ -239,6 +262,7 @@ cek_isi "etc/xray/xray.key"          "sertifikat TLS Xray"
 cek_isi "etc/haproxy/hap.pem"        "sertifikat haproxy"
 cek_isi "usr/bin/kyt/database.db"    "database bot (saldo/pesanan)"
 cek_isi "etc/kyt-web.conf"           "konfigurasi website + Turnstile"
+cek_isi "etc/kyt-web-mail.key"       "API key email verifikasi (Brevo)"
 cek_isi "opt/kyt-web/app.py"         "aplikasi website"
 cek_isi "usr/local/sbin/kyt-web-configure-edge" "pengatur domain website"
 cek_isi "opt/kyt-web/data/web.db"     "database website (branding, tema, server)"

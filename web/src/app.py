@@ -20,6 +20,7 @@ import fcntl
 import hashlib
 import hmac
 import html
+import http.client
 import io
 import ipaddress
 import json
@@ -31,8 +32,11 @@ import re
 import secrets
 import shutil
 import signal
+import smtplib
+import socket
 import socketserver
 import sqlite3
+import ssl
 import string
 import subprocess
 import sys
@@ -42,6 +46,8 @@ import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
+from email.message import EmailMessage
+from email.utils import formataddr
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
@@ -111,9 +117,15 @@ def verify_turnstile(token: str, ip: str) -> tuple[bool, str]:
 BRAND = "HITS SSH"
 FORM_COOKIE = "kyt_form"
 ADMIN_COOKIE = "kyt_admin"
+USER_COOKIE = "kyt_user"
 SESSION_TTL = 8 * 3600
+USER_SESSION_TTL = 7 * 24 * 3600
+EMAIL_TOKEN_TTL = 24 * 3600
+RESET_TOKEN_TTL = 60 * 60
 FORM_TTL = 24 * 3600
 MAX_BODY = 512 * 1024
+MAIL_KEY_PATH = Path("/etc/kyt-web-mail.key")
+BREVO_API_URL = "https://api.brevo.com/v3/smtp/email"
 
 SERVICES = {
     "ssh": {
@@ -202,6 +214,23 @@ UI_THEME_COLORS = {
     "ocean": "#06121f",
     "forest": "#07120d",
     "royal": "#12071f",
+    "obsidian": "#05070a",
+    "aurora": "#070a16",
+    "ember": "#0b0806",
+    "glacier": "#0b1015",
+    "rosecream": "#fff8f6",
+    "aquacream": "#f4fbfa",
+    "bluecream": "#f5f8ff",
+    "lavendercream": "#faf7ff",
+    "mintcream": "#f5fcf7",
+    "lemoncream": "#fffdf2",
+    "peachcream": "#fff9f5",
+    "slatecream": "#f7f8fa",
+    "black": "#101214",
+    "red": "#170607",
+    "gray": "#15171a",
+    "navy": "#07101f",
+    "pink": "#fff0f6",
 }
 UI_THEMES = {
     "cream": ("Cream", "Hangat, bersih, nyaman untuk penggunaan lama."),
@@ -209,11 +238,28 @@ UI_THEMES = {
     "ocean": ("Ocean", "Biru laut dalam dengan aksen sky blue."),
     "forest": ("Forest", "Hijau gelap dengan aksen lime segar."),
     "royal": ("Royal", "Ungu gelap dengan aksen pink neon."),
+    "obsidian": ("Obsidian", "Hitam glossy dengan aksen lime elektrik."),
+    "aurora": ("Aurora", "Indigo malam dengan glow violet dan teal."),
+    "ember": ("Ember", "Charcoal hangat dengan aksen copper."),
+    "glacier": ("Glacier", "Slate dingin dengan aksen biru es."),
+    "rosecream": ("Rose Cream", "Krem hangat dengan aksen merah rose, tanpa gradasi."),
+    "aquacream": ("Aqua Cream", "Krem sejuk dengan aksen cyan, tanpa gradasi."),
+    "bluecream": ("Blue Cream", "Krem bersih dengan aksen biru, tanpa gradasi."),
+    "lavendercream": ("Lavender Cream", "Krem lembut dengan aksen lavender, tanpa gradasi."),
+    "mintcream": ("Mint Cream", "Krem segar dengan aksen hijau mint, tanpa gradasi."),
+    "lemoncream": ("Lemon Cream", "Krem hangat dengan aksen kuning lemon, tanpa gradasi."),
+    "peachcream": ("Peach Cream", "Krem lembut dengan aksen peach, tanpa gradasi."),
+    "slatecream": ("Slate Cream", "Krem netral dengan aksen slate, tanpa gradasi."),
+    "black": ("Black", "Hitam charcoal solid dengan aksen putih, tidak pekat."),
+    "red": ("Red", "Merah marun solid dengan aksen rose."),
+    "gray": ("Gray", "Abu-abu graphite solid dengan aksen silver."),
+    "navy": ("Navy", "Biru dongker solid dengan aksen gold."),
+    "pink": ("Pink", "Pink lembut solid dengan aksen magenta, tanpa gradasi."),
 }
-DEFAULT_META = "HITS SSH — akun VPN gratis dan premium SSH, VMess, VLESS, Trojan. Premium tanpa login, bayar QRIS GoPay."
+DEFAULT_META = "HITS SSH — akun VPN gratis dan premium SSH, VMess, VLESS, Trojan. Daftar sekali, pantau akun dan invoice dari dashboard."
 DEFAULT_HERO_TITLE = "Internet bebas,"
 DEFAULT_HERO_TITLE_ACCENT = "akun langsung jadi."
-DEFAULT_HERO_LEAD = "Buat akun gratis dalam hitungan detik, atau beli akun premium lewat QRIS GoPay. Tanpa registrasi, tanpa email, dan invoice bisa dicek kembali kapan saja."
+DEFAULT_HERO_LEAD = "Daftar sekali, lalu buat akun gratis atau beli premium lewat QRIS GoPay. Semua akun, kuota, IP, dan invoice bisa dipantau dari satu dashboard."
 
 DEFAULTS = {
     "site_name": BRAND,
@@ -257,6 +303,15 @@ DEFAULTS = {
     "xray_daily_3": "10",
     "xray_daily_7": "5",
     "per_ip_daily": "2",
+    "mail_from_email": "oceantestdigital@gmail.com",
+    "mail_from_name": BRAND,
+    "mail_api_key": "",
+    "mail_smtp_user": "",
+    "mail_smtp_key": "",
+    "mail_smtp_host": "smtp-relay.brevo.com",
+    "mail_smtp_port": "2525",
+    "mail_verify_subject": "Kode Verifikasi Anda",
+    "mail_reset_subject": "Reset Password — HITS SSH",
 }
 
 INT_SETTINGS = {
@@ -281,6 +336,7 @@ RATE_LOCK = threading.Lock()
 UNIQUE_CODE_LOCK = threading.Lock()
 RATE_BUCKETS: dict[str, collections.deque] = {}
 PUBLIC_RATE: dict[str, collections.deque] = {}
+_CURRENT = threading.local()
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -360,6 +416,12 @@ def db_connect() -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout=15000")
     conn.execute("PRAGMA foreign_keys=ON")
     return conn
+
+
+def _ensure_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
+    existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in existing:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
 
 def init_db() -> None:
@@ -455,8 +517,51 @@ def init_db() -> None:
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL DEFAULT ''
             );
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL,
+                verified_at INTEGER,
+                last_login_at INTEGER,
+                last_ip TEXT NOT NULL DEFAULT ''
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email);
+            CREATE TABLE IF NOT EXISTS user_sessions (
+                token_hash TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                csrf TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                ip TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_user_sessions_user ON user_sessions(user_id, expires_at);
+            CREATE TABLE IF NOT EXISTS user_tokens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                token_hash TEXT UNIQUE NOT NULL,
+                code_hash TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                used_at INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_user_tokens_user ON user_tokens(user_id, kind, expires_at);
+            CREATE TABLE IF NOT EXISTS usage_daily (
+                username TEXT NOT NULL,
+                day TEXT NOT NULL,
+                start_bytes INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(username, day)
+            );
             """
         )
+        _ensure_column(conn, "accounts", "user_id", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "orders", "user_id", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "user_tokens", "code_hash", "TEXT NOT NULL DEFAULT ''")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_accounts_user ON accounts(user_id, created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id, created_at)")
         for k, v in DEFAULTS.items():
             conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (k, v))
         if not conn.execute("SELECT 1 FROM premium_products LIMIT 1").fetchone():
@@ -852,6 +957,501 @@ def drop_session(token: str | None) -> None:
 
 
 # ---------------------------------------------------------------------------
+# User accounts, email verification, and user sessions
+# ---------------------------------------------------------------------------
+
+def current_user() -> sqlite3.Row | None:
+    return getattr(_CURRENT, "user", None)
+
+
+def normalize_email(value: str) -> str:
+    return (value or "").strip().lower()[:190]
+
+
+def valid_email(value: str) -> bool:
+    if len(value) < 5 or len(value) > 190:
+        return False
+    return bool(re.fullmatch(r"[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)+", value))
+
+
+def safe_next(value: str) -> str:
+    value = (value or "").strip()
+    if not value.startswith("/") or value.startswith("//") or "\n" in value or "\r" in value:
+        return "/dashboard"
+    if value.startswith("/admin"):
+        return "/dashboard"
+    return value[:300]
+
+
+def user_by_email(email: str) -> sqlite3.Row | None:
+    conn = db_connect()
+    try:
+        return conn.execute("SELECT * FROM users WHERE email=?", (normalize_email(email),)).fetchone()
+    finally:
+        conn.close()
+
+
+def user_by_id(user_id: int) -> sqlite3.Row | None:
+    conn = db_connect()
+    try:
+        return conn.execute("SELECT * FROM users WHERE id=?", (int(user_id),)).fetchone()
+    finally:
+        conn.close()
+
+
+def create_user(email: str, password: str, ip: str) -> tuple[sqlite3.Row | None, str]:
+    email = normalize_email(email)
+    now = int(time.time())
+    conn = db_connect()
+    try:
+        cur = conn.execute(
+            "INSERT INTO users(email,password_hash,status,created_at,updated_at,last_ip) "
+            "VALUES(?,?,'pending',?,?,?)",
+            (email, hash_password(password), now, now, ip[:64]),
+        )
+        conn.commit()
+        return user_by_id(int(cur.lastrowid)), ""
+    except sqlite3.IntegrityError:
+        return None, "Email sudah terdaftar. Silakan masuk atau gunakan email lain."
+    except Exception:
+        logger.error("create_user: %s", traceback.format_exc())
+        return None, "Pendaftaran gagal. Coba lagi beberapa saat."
+    finally:
+        conn.close()
+
+
+def create_email_token(user_id: int, kind: str, ttl: int) -> tuple[str, str]:
+    raw = secrets.token_urlsafe(32)
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    code_hash = hashlib.sha256(f"{code}:{int(user_id)}".encode("utf-8")).hexdigest()
+    now = int(time.time())
+    conn = db_connect()
+    try:
+        conn.execute("DELETE FROM user_tokens WHERE expires_at<? OR used_at IS NOT NULL", (now,))
+        conn.execute(
+            "INSERT INTO user_tokens(user_id,kind,token_hash,code_hash,created_at,expires_at) VALUES(?,?,?,?,?,?)",
+            (int(user_id), kind, token_hash(raw), code_hash, now, now + ttl),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return raw, code
+
+
+def peek_email_token(raw: str, kind: str) -> sqlite3.Row | None:
+    if not raw or len(raw) > 200:
+        return None
+    conn = db_connect()
+    try:
+        return conn.execute(
+            "SELECT * FROM user_tokens WHERE token_hash=? AND kind=? AND used_at IS NULL AND expires_at>=?",
+            (token_hash(raw), kind, int(time.time())),
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+def consume_email_token(raw: str, kind: str) -> sqlite3.Row | None:
+    row = peek_email_token(raw, kind)
+    if not row:
+        return None
+    conn = db_connect()
+    try:
+        cur = conn.execute(
+            "UPDATE user_tokens SET used_at=? WHERE id=? AND used_at IS NULL",
+            (int(time.time()), row["id"]),
+        )
+        conn.commit()
+        return row if cur.rowcount else None
+    finally:
+        conn.close()
+
+
+def verify_email_code(email: str, code: str) -> sqlite3.Row | None:
+    user = user_by_email(email)
+    if not user:
+        return None
+    code = (code or "").strip()
+    if not re.fullmatch(r"\d{6}", code):
+        return None
+    target = hashlib.sha256(f"{code}:{int(user['id'])}".encode("utf-8")).hexdigest()
+    now = int(time.time())
+    conn = db_connect()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM user_tokens WHERE user_id=? AND kind='verify' "
+            "AND used_at IS NULL AND expires_at>=? ORDER BY id DESC LIMIT 10",
+            (int(user["id"]), now),
+        ).fetchall()
+        for row in rows:
+            if hmac.compare_digest(str(row["code_hash"] or ""), target):
+                conn.execute("UPDATE user_tokens SET used_at=? WHERE id=?", (now, row["id"]))
+                conn.commit()
+                return user
+        return None
+    finally:
+        conn.close()
+
+
+def create_user_session(user_id: int, ip: str) -> tuple[str, str]:
+    token = secrets.token_urlsafe(32)
+    csrf = secrets.token_urlsafe(24)
+    now = int(time.time())
+    conn = db_connect()
+    try:
+        conn.execute("DELETE FROM user_sessions WHERE expires_at<?", (now,))
+        conn.execute(
+            "INSERT INTO user_sessions(token_hash,user_id,csrf,created_at,expires_at,ip) VALUES(?,?,?,?,?,?)",
+            (token_hash(token), int(user_id), csrf, now, now + USER_SESSION_TTL, ip[:64]),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return token, csrf
+
+
+def get_user_session(token: str | None) -> sqlite3.Row | None:
+    if not token:
+        return None
+    conn = db_connect()
+    try:
+        return conn.execute(
+            "SELECT s.*, u.email, u.status AS user_status, u.created_at AS user_created_at, "
+            "u.verified_at, u.last_login_at FROM user_sessions s "
+            "JOIN users u ON u.id=s.user_id "
+            "WHERE s.token_hash=? AND s.expires_at>=? AND u.status='active'",
+            (token_hash(token), int(time.time())),
+        ).fetchone()
+    finally:
+        conn.close()
+
+
+def drop_user_session(token: str | None) -> None:
+    if not token:
+        return
+    conn = db_connect()
+    try:
+        conn.execute("DELETE FROM user_sessions WHERE token_hash=?", (token_hash(token),))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def drop_user_sessions(user_id: int, keep_token: str | None = None) -> None:
+    conn = db_connect()
+    try:
+        if keep_token:
+            conn.execute(
+                "DELETE FROM user_sessions WHERE user_id=? AND token_hash<>?",
+                (int(user_id), token_hash(keep_token)),
+            )
+        else:
+            conn.execute("DELETE FROM user_sessions WHERE user_id=?", (int(user_id),))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def set_user_verified(user_id: int) -> None:
+    now = int(time.time())
+    conn = db_connect()
+    try:
+        conn.execute(
+            "UPDATE users SET status='active', verified_at=COALESCE(verified_at,?), updated_at=? WHERE id=?",
+            (now, now, int(user_id)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def update_user_password(user_id: int, password: str) -> None:
+    conn = db_connect()
+    try:
+        conn.execute(
+            "UPDATE users SET password_hash=?, updated_at=? WHERE id=?",
+            (hash_password(password), int(time.time()), int(user_id)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def audit_user(user_id: int, action: str, detail: str = "", ip: str = "") -> None:
+    user = user_by_id(user_id)
+    email = user["email"] if user else str(user_id)
+    audit(action, f"user={email} {detail}".strip(), ip)
+
+
+# ---------------------------------------------------------------------------
+# Email delivery (Brevo HTTPS API)
+# ---------------------------------------------------------------------------
+
+def base_url() -> str:
+    host = (PUBLIC_HOST or "").strip().rstrip("/")
+    if host.startswith("http://") or host.startswith("https://"):
+        return host
+    return "https://" + host
+
+
+def mail_config() -> dict[str, str]:
+    cfg = {
+        "api_key": "",
+        "smtp_user": "",
+        "smtp_key": "",
+        "smtp_host": "smtp-relay.brevo.com",
+        "smtp_port": "2525",
+        "from_email": "oceantestdigital@gmail.com",
+        "from_name": BRAND,
+        "verify_subject": "Kode Verifikasi Anda",
+        "reset_subject": "Reset Password — HITS SSH",
+    }
+    try:
+        raw = MAIL_KEY_PATH.read_text(errors="ignore")
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip().upper()
+            value = value.strip().strip("'\"")
+            if key in ("BREVO_API_KEY", "API_KEY", "MAIL_API_KEY"):
+                cfg["api_key"] = value
+            elif key in ("SMTP_USER", "MAIL_SMTP_USER", "BREVO_SMTP_USER"):
+                cfg["smtp_user"] = value
+            elif key in ("SMTP_KEY", "SMTP_PASSWORD", "MAIL_SMTP_KEY", "BREVO_SMTP_KEY"):
+                cfg["smtp_key"] = value
+            elif key in ("SMTP_HOST", "MAIL_SMTP_HOST"):
+                cfg["smtp_host"] = value
+            elif key in ("SMTP_PORT", "MAIL_SMTP_PORT"):
+                cfg["smtp_port"] = value
+            elif key in ("MAIL_FROM_EMAIL", "FROM_EMAIL", "MAIL_FROM"):
+                cfg["from_email"] = value
+            elif key in ("MAIL_FROM_NAME", "FROM_NAME"):
+                cfg["from_name"] = value
+            elif key in ("MAIL_VERIFY_SUBJECT", "VERIFY_SUBJECT"):
+                cfg["verify_subject"] = value
+            elif key in ("MAIL_RESET_SUBJECT", "RESET_SUBJECT"):
+                cfg["reset_subject"] = value
+    except FileNotFoundError:
+        pass
+    try:
+        settings = get_settings()
+        cfg["api_key"] = cfg["api_key"] or (settings.get("mail_api_key") or "").strip()
+        cfg["smtp_key"] = cfg["smtp_key"] or (settings.get("mail_smtp_key") or "").strip()
+        cfg["smtp_user"] = (settings.get("mail_smtp_user") or cfg["smtp_user"]).strip()
+        cfg["smtp_host"] = (settings.get("mail_smtp_host") or cfg["smtp_host"]).strip()
+        cfg["smtp_port"] = (settings.get("mail_smtp_port") or cfg["smtp_port"]).strip()
+        cfg["from_email"] = (settings.get("mail_from_email") or cfg["from_email"]).strip()
+        cfg["from_name"] = (settings.get("mail_from_name") or cfg["from_name"]).strip()
+        cfg["verify_subject"] = (settings.get("mail_verify_subject") or cfg["verify_subject"]).strip()
+        cfg["reset_subject"] = (settings.get("mail_reset_subject") or cfg["reset_subject"]).strip()
+    except Exception:
+        pass
+    return cfg
+
+
+def mail_ready() -> tuple[bool, str]:
+    cfg = mail_config()
+    if cfg["api_key"]:
+        if not cfg["api_key"].startswith("xkeysib-"):
+            return False, "API key Brevo harus diawali xkeysib-."
+        return (True, "") if cfg["from_email"] else (False, "Alamat pengirim email belum diatur.")
+    if cfg["smtp_key"]:
+        if not cfg["smtp_key"].startswith("xsmtpsib-"):
+            return False, "SMTP key Brevo harus diawali xsmtpsib-."
+        if not cfg["smtp_user"]:
+            return False, "SMTP Login Brevo belum diisi (bukan email pengirim)."
+        return (True, "") if cfg["from_email"] else (False, "Alamat pengirim email belum diatur.")
+    return False, "Isi API key xkeysib- atau SMTP Login + SMTP key xsmtpsib-."
+
+
+class _IPv4HTTPSConnection(http.client.HTTPSConnection):
+    """Koneksi HTTPS yang dipaksa lewat IPv4 agar whitelist IP Brevo stabil."""
+
+    def connect(self):
+        infos = socket.getaddrinfo(self.host, self.port, socket.AF_INET, socket.SOCK_STREAM)
+        if not infos:
+            raise OSError("no IPv4 address for " + str(self.host))
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(self.timeout)
+        sock.connect(infos[0][4])
+        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+
+
+def _send_email_api(cfg: dict[str, str], to_email: str, subject: str, html_body: str, text_body: str) -> tuple[bool, str]:
+    payload = {
+        "sender": {"name": cfg["from_name"] or BRAND, "email": cfg["from_email"]},
+        "to": [{"email": to_email}],
+        "subject": subject,
+        "htmlContent": html_body,
+        "textContent": text_body,
+        "replyTo": {"name": cfg["from_name"] or BRAND, "email": cfg["from_email"]},
+    }
+    body = json.dumps(payload).encode("utf-8")
+    headers = {
+        "accept": "application/json",
+        "content-type": "application/json",
+        "api-key": cfg["api_key"],
+        "content-length": str(len(body)),
+    }
+    conn = None
+    try:
+        conn = _IPv4HTTPSConnection("api.brevo.com", timeout=20, context=ssl.create_default_context())
+        conn.request("POST", "/v3/smtp/email", body=body, headers=headers)
+        resp = conn.getresponse()
+        data = resp.read().decode("utf-8", "replace")[:600]
+        if 200 <= resp.status < 300:
+            return True, ""
+        logger.warning("brevo api status %s: %s", resp.status, data)
+        if resp.status in (401, 403) and "authorised_ips" in data:
+            return False, "IP VPS belum diizinkan di Brevo (Security → Authorised IPs)."
+        return False, "Email gagal dikirim. Coba lagi beberapa saat."
+    except Exception as exc:
+        logger.warning("brevo api error: %s", exc)
+        return False, "Email gagal dikirim. Coba lagi beberapa saat."
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+
+def _send_email_smtp(cfg: dict[str, str], to_email: str, subject: str, html_body: str, text_body: str) -> tuple[bool, str]:
+    host = cfg["smtp_host"] or "smtp-relay.brevo.com"
+    try:
+        port = int(cfg["smtp_port"] or "2525")
+    except ValueError:
+        port = 2525
+    safe_subject = (subject or "").replace("\n", " ").replace("\r", " ")[:200]
+    msg = EmailMessage()
+    msg["From"] = formataddr((cfg["from_name"] or BRAND, cfg["from_email"]))
+    msg["To"] = to_email
+    msg["Subject"] = safe_subject
+    msg["Reply-To"] = formataddr((cfg["from_name"] or BRAND, cfg["from_email"]))
+    msg["X-Mailer"] = BRAND
+    msg.set_content(text_body)
+    msg.add_alternative(html_body, subtype="html")
+    try:
+        if port == 465:
+            server = smtplib.SMTP_SSL(host, port, timeout=25, context=ssl.create_default_context())
+        else:
+            server = smtplib.SMTP(host, port, timeout=25)
+        try:
+            server.ehlo()
+            if port != 465 and server.has_extn("starttls"):
+                server.starttls(context=ssl.create_default_context())
+                server.ehlo()
+            server.login(cfg["smtp_user"], cfg["smtp_key"])
+            server.send_message(msg)
+            return True, ""
+        finally:
+            try:
+                server.quit()
+            except Exception:
+                pass
+    except smtplib.SMTPAuthenticationError:
+        logger.warning("brevo smtp auth gagal untuk user %s", cfg["smtp_user"])
+        return False, "SMTP Login atau SMTP key Brevo salah."
+    except Exception as exc:
+        logger.warning("brevo smtp error: %s", exc)
+        return False, "Email gagal dikirim via SMTP. Coba lagi beberapa saat."
+
+
+def send_email(to_email: str, subject: str, html_body: str, text_body: str) -> tuple[bool, str]:
+    cfg = mail_config()
+    api_ok = bool(cfg["api_key"]) and cfg["api_key"].startswith("xkeysib-")
+    smtp_ok = bool(cfg["smtp_key"]) and cfg["smtp_key"].startswith("xsmtpsib-") and bool(cfg["smtp_user"])
+    if api_ok:
+        ok, message = _send_email_api(cfg, to_email, subject, html_body, text_body)
+        if ok:
+            return True, ""
+        if not smtp_ok:
+            return False, message
+        logger.warning("Brevo API gagal, mencoba SMTP fallback")
+    if smtp_ok:
+        return _send_email_smtp(cfg, to_email, subject, html_body, text_body)
+    logger.warning("email ke %s dilewati: Brevo API/SMTP belum lengkap", to_email)
+    return False, "Pengiriman email belum dikonfigurasi. Hubungi admin."
+
+
+def email_layout(title: str, intro: str, button: str, url: str, note: str, code: str = "") -> tuple[str, str]:
+    b = branding()
+    name = e(b["name"])
+    code_html = ""
+    code_text = ""
+    if code:
+        code_html = f"""
+<tr><td style="padding:6px 30px 0">
+<div style="border:1px dashed #d9bf9f;border-radius:14px;background:#fff8ed;padding:16px 18px;text-align:center">
+<div style="color:#8b7562;font-size:11px;letter-spacing:1.5px;font-weight:700">KODE VERIFIKASI</div>
+<div style="margin-top:6px;color:#30241d;font-size:34px;line-height:1.1;font-weight:800;letter-spacing:9px">{e(code)}</div>
+<div style="margin-top:6px;color:#8b7562;font-size:11px">Masukkan kode ini di halaman verifikasi.</div>
+</div>
+</td></tr>"""
+        code_text = f"\nKode verifikasi: {code}\n"
+    html_body = f"""<!doctype html>
+<html lang="id"><body style="margin:0;padding:0;background:#f6f1e8;font-family:Arial,Helvetica,sans-serif;color:#30241d">
+<div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent">Klik tombol verifikasi atau masukkan kode 6 digit dari email ini.</div>
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f6f1e8;padding:28px 12px">
+<tr><td align="center">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;background:#fffdf8;border:1px solid #e6d3bd;border-radius:18px;overflow:hidden">
+<tr><td style="padding:26px 30px 8px">
+<div style="font-size:12px;letter-spacing:2px;color:#a63f23;font-weight:700">{name}</div>
+<h1 style="margin:12px 0 8px;font-size:26px;line-height:1.2;color:#30241d">{e(title)}</h1>
+<p style="margin:0;color:#6b5544;font-size:14px;line-height:1.65">{e(intro)}</p>
+<p style="margin:10px 0 0;color:#30241d;font-size:13px;line-height:1.6"><b>Klik tombol biru di bawah ini.</b> Kalau tombol tidak terlihat, salin tautan panjang di bagian bawah email ke browser.</p>
+</td></tr>
+{code_html}
+<tr><td style="padding:22px 30px 10px">
+<a href="{e(url)}" style="display:inline-block;background:#a63f23;color:#fffdf8;text-decoration:none;font-weight:700;font-size:15px;padding:15px 28px;border-radius:999px">✅ {e(button)}</a>
+</td></tr>
+<tr><td style="padding:8px 30px 26px">
+<p style="margin:0 0 8px;color:#6b5544;font-size:12px;line-height:1.6">{e(note)}</p>
+<p style="margin:0 0 5px;color:#8b7562;font-size:11px">Jika tombol tidak bisa diklik, salin <b>link verifikasi</b> ini:</p>
+<p style="margin:0;color:#8b7562;font-size:11px;line-height:1.6;word-break:break-all">{e(url)}</p>
+</td></tr>
+<tr><td style="padding:16px 30px;background:#fbf1e3;color:#8b7562;font-size:11px;line-height:1.6">
+Email otomatis dari {name}. Jangan bagikan tautan/kode ini ke siapa pun.
+</td></tr>
+</table>
+</td></tr></table>
+</body></html>"""
+    text_body = (
+        f"{title}\n\n{intro}\n{code_text}\n{button}: {url}\n\n{note}\n\n{name}"
+    )
+    return html_body, text_body
+
+
+def send_verification_email(user: sqlite3.Row, raw_token: str, code: str = "") -> tuple[bool, str]:
+    cfg = mail_config()
+    url = f"{base_url()}/verify?token={urllib.parse.quote(raw_token)}"
+    html_body, text_body = email_layout(
+        "Kode verifikasi Anda",
+        f"Halo, terima kasih sudah mendaftar di {branding()['name']}. Verifikasi email untuk mengaktifkan akun Anda.",
+        "Buka Link Verifikasi",
+        url,
+        "Link dan kode verifikasi berlaku 24 jam. Jika Anda tidak mendaftar, abaikan email ini.",
+        code=code,
+    )
+    return send_email(user["email"], cfg["verify_subject"] or "Kode Verifikasi Anda", html_body, text_body)
+
+
+def send_reset_email(user: sqlite3.Row, raw_token: str) -> tuple[bool, str]:
+    cfg = mail_config()
+    url = f"{base_url()}/reset-password?token={urllib.parse.quote(raw_token)}"
+    html_body, text_body = email_layout(
+        "Atur ulang password",
+        "Kami menerima permintaan untuk mengatur ulang password akun Anda. Klik tombol di bawah untuk membuat password baru.",
+        "Buat password baru",
+        url,
+        "Tautan berlaku 1 jam dan hanya bisa dipakai sekali. Jika bukan Anda, abaikan email ini.",
+    )
+    return send_email(user["email"], cfg["reset_subject"] or "Reset Password", html_body, text_body)
+
+
+# ---------------------------------------------------------------------------
 # VPS account operations
 # ---------------------------------------------------------------------------
 
@@ -1196,7 +1796,7 @@ def create_xray_account(protocol: str, user: str, days: int, ip_limit: int, quot
     return False, reason, log
 
 
-def create_account(service: str, protocol: str, days: int, ip: str, user_agent: str) -> dict:
+def create_account(service: str, protocol: str, days: int, ip: str, user_agent: str, user_id: int = 0) -> dict:
     settings = get_settings()
     quota = quota_state(settings)
     if settings.get("maintenance") == "1":
@@ -1245,8 +1845,8 @@ def create_account(service: str, protocol: str, days: int, ip: str, user_agent: 
         try:
             conn.execute(
                 "INSERT INTO accounts(token,username,service,protocol,days,ip,created_at,"
-                "created_day,expires_at,status,output,error,user_agent) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "created_day,expires_at,status,output,error,user_agent,user_id) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     token,
                     username,
@@ -1261,6 +1861,7 @@ def create_account(service: str, protocol: str, days: int, ip: str, user_agent: 
                     output if ok else "",
                     "" if ok else output or "gagal",
                     user_agent[:300],
+                    int(user_id or 0),
                 ),
             )
             conn.commit()
@@ -1706,7 +2307,7 @@ def order_by_invoice(invoice: str) -> sqlite3.Row | None:
         conn.close()
 
 
-def create_premium_order(product_code: str, ip: str, user_agent: str) -> sqlite3.Row:
+def create_premium_order(product_code: str, ip: str, user_agent: str, user_id: int = 0) -> sqlite3.Row:
     settings = get_settings()
     if settings.get("maintenance") == "1":
         raise ValueError("Website sedang dalam perawatan. Silakan coba lagi nanti.")
@@ -1748,8 +2349,8 @@ def create_premium_order(product_code: str, ip: str, user_agent: str) -> sqlite3
         try:
             conn.execute(
                 "INSERT INTO orders(invoice,product_code,protocol,days,price,unique_code,total,"
-                "ip_limit,quota_gb,status,qr_string,buyer_ip,user_agent,created_at,expires_at) "
-                "VALUES(?,?,?,?,?,?,?,?,?,'PENDING',?,?,?,?,?)",
+                "ip_limit,quota_gb,status,qr_string,buyer_ip,user_agent,created_at,expires_at,user_id) "
+                "VALUES(?,?,?,?,?,?,?,?,?,'PENDING',?,?,?,?,?,?)",
                 (
                     invoice,
                     product["code"],
@@ -1765,6 +2366,7 @@ def create_premium_order(product_code: str, ip: str, user_agent: str) -> sqlite3
                     user_agent[:300],
                     now,
                     expires,
+                    int(user_id or 0),
                 ),
             )
             conn.commit()
@@ -2007,6 +2609,467 @@ def gopay_admin_status() -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Dashboard data: usage, IP login, and mullog status
+# ---------------------------------------------------------------------------
+
+MULLOG_STATE_DIR = MIHOMO_STATE / "state"
+MULLOG_HISTORY = MIHOMO_STATE / "history.jsonl"
+
+
+def _int_file(path: Path | str) -> int:
+    try:
+        value = Path(path).read_text(errors="ignore").strip()
+        return max(0, int(value)) if value else 0
+    except Exception:
+        return 0
+
+
+def _read_state_file(path: Path) -> dict | None:
+    try:
+        data = json.loads(path.read_text(errors="ignore"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def mullog_states() -> list[dict]:
+    result = []
+    try:
+        names = sorted(MULLOG_STATE_DIR.glob("*.json"))
+    except Exception:
+        return result
+    for path in names:
+        state = _read_state_file(path)
+        if state:
+            state["_file"] = path.name
+            result.append(state)
+    return result
+
+
+def mullog_state_for(states: list[dict], user: str, proto: str = "") -> dict | None:
+    for state in states:
+        if str(state.get("user", "")) != user:
+            continue
+        if proto and str(state.get("proto", "")) != proto:
+            continue
+        return state
+    return None
+
+
+def mullog_history(user: str, limit: int = 100) -> list[dict]:
+    events: list[dict] = []
+    try:
+        with open(MULLOG_HISTORY, "r", errors="ignore") as fh:
+            lines = fh.readlines()[-3000:]
+    except FileNotFoundError:
+        return events
+    for raw in lines:
+        try:
+            item = json.loads(raw)
+        except Exception:
+            continue
+        if not isinstance(item, dict) or str(item.get("user", "")) != user:
+            continue
+        events.append(item)
+    events.sort(key=lambda x: int(x.get("ts", 0)), reverse=True)
+    suspend_by_key: dict[tuple, dict] = {}
+    for item in events:
+        if item.get("event") == "suspend":
+            key = (item.get("kind"), item.get("proto") or "", int(item.get("created", 0) or 0))
+            suspend_by_key.setdefault(key, item)
+    for item in events:
+        if item.get("event") == "restore":
+            key = (item.get("kind"), item.get("proto") or "", int(item.get("created", 0) or 0))
+            target = suspend_by_key.get(key)
+            if target is not None:
+                target["restored_at"] = item.get("ts")
+    return events[:limit]
+
+
+def account_paths(service: str, protocol: str, username: str) -> dict[str, Path]:
+    if service == "ssh":
+        return {
+            "quota": Path("/etc/ssh") / username,
+            "usage": Path("/etc/limit/ssh") / username,
+            "ip": Path("/etc/kyt/limit/ssh/ip") / username,
+        }
+    return {
+        "quota": Path("/etc") / protocol / username,
+        "usage": Path("/etc/limit") / protocol / username,
+        "ip": Path("/etc/kyt/limit") / protocol / "ip" / username,
+    }
+
+
+def _strip_hostport(value: str) -> str:
+    value = (value or "").strip()
+    if not value:
+        return ""
+    # Xray kadang menulis sumber sebagai "tcp:1.2.3.4:0" atau "udp://...".
+    value = re.sub(r"^(?:tcp|udp):(?://)?", "", value, flags=re.I)
+    if value.startswith("["):
+        return value[1:].split("]", 1)[0]
+    if value.count(":") == 1:
+        host, port = value.rsplit(":", 1)
+        if port.isdigit():
+            return host
+    return value
+
+
+def _local_ip(value: str) -> bool:
+    return value in ("127.0.0.1", "::1", "::", "0.0.0.0") or value.startswith("127.")
+
+
+def _tail_lines(path: Path, count: int = 5000) -> list[str]:
+    try:
+        if not path.exists():
+            return []
+        proc = subprocess.run(
+            ["tail", "-n", str(count), str(path)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=8,
+        )
+        return proc.stdout.splitlines()
+    except Exception:
+        return []
+
+
+def collect_xray_ips(usernames: set[str], minutes: int = 20) -> dict[str, set[str]]:
+    result: dict[str, set[str]] = {name: set() for name in usernames}
+    if not usernames:
+        return result
+    now = dt.datetime.now()
+    cutoff = now - dt.timedelta(minutes=max(1, minutes))
+    pattern = re.compile(
+        r"^(\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2})\.\d+\s+from\s+(\S+)\s+accepted\b.*?\bemail:\s*(\S+)"
+    )
+    for line in _tail_lines(Path("/var/log/xray/access.log"), 6000):
+        match = pattern.search(line)
+        if not match:
+            continue
+        try:
+            stamp = dt.datetime.strptime(match.group(1), "%Y/%m/%d %H:%M:%S")
+        except ValueError:
+            continue
+        if stamp < cutoff:
+            continue
+        user = match.group(3)
+        if user not in result:
+            continue
+        ip = _strip_hostport(match.group(2))
+        if ip and not _local_ip(ip):
+            result[user].add(ip)
+    return result
+
+
+def _ssh_listener_ports() -> set[str]:
+    ports: set[str] = set()
+    try:
+        proc = subprocess.run(
+            ["ss", "-tlnpH"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=8,
+        )
+    except Exception:
+        return ports
+    for line in proc.stdout.splitlines():
+        if "sshd" not in line and "dropbear" not in line:
+            continue
+        fields = line.split()
+        if len(fields) >= 4:
+            ports.add(fields[3].rsplit(":", 1)[-1])
+    return ports or {"22", "2222", "2223", "109", "143"}
+
+
+def _pid_user(pid: int) -> str:
+    try:
+        with open(f"/proc/{pid}/status", "r", errors="ignore") as fh:
+            for line in fh:
+                if line.startswith("Uid:"):
+                    uid = int(line.split()[1])
+                    return pwd.getpwuid(uid).pw_name
+    except Exception:
+        pass
+    return ""
+
+
+def _ws_peer_map() -> dict[str, str]:
+    result: dict[str, str] = {}
+    try:
+        for line in Path("/run/ws-ssh.map").read_text(errors="ignore").splitlines()[-400:]:
+            parts = line.split()
+            if len(parts) >= 3:
+                result[parts[1]] = parts[2]
+    except Exception:
+        pass
+    return result
+
+
+def collect_ssh_ips(usernames: set[str], minutes: int = 30) -> dict[str, set[str]]:
+    result: dict[str, set[str]] = {name: set() for name in usernames}
+    if not usernames:
+        return result
+    ports = _ssh_listener_ports()
+    ws_map = _ws_peer_map()
+    try:
+        proc = subprocess.run(
+            ["ss", "-tnpH"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=10,
+        )
+        for line in proc.stdout.splitlines():
+            if "ESTAB" not in line and "SYN-RECV" not in line:
+                continue
+            if "sshd" not in line and "dropbear" not in line:
+                continue
+            fields = line.split()
+            if len(fields) < 5:
+                continue
+            local_port = fields[3].rsplit(":", 1)[-1]
+            if local_port not in ports:
+                continue
+            peer_ip = _strip_hostport(fields[4])
+            peer_port = fields[4].rsplit(":", 1)[-1]
+            pid_match = re.search(r"pid=(\d+)", line)
+            if not pid_match:
+                continue
+            user = _pid_user(int(pid_match.group(1)))
+            if user not in result:
+                continue
+            if _local_ip(peer_ip):
+                peer_ip = ws_map.get(peer_port, "")
+            if peer_ip and not _local_ip(peer_ip):
+                result[user].add(peer_ip)
+    except Exception:
+        pass
+
+    missing = {name for name in usernames if not result[name]}
+    if missing:
+        now = dt.datetime.now(dt.timezone.utc)
+        cutoff = now - dt.timedelta(minutes=max(1, minutes))
+        regex = re.compile(
+            r"^(\S+)\s+\S+\s+sshd(?:-session)?\[\d+\]:\s+Accepted\s+(?:password|publickey|keyboard-interactive)\s+for\s+(\S+)\s+from\s+(\S+)\s+port"
+        )
+        for line in _tail_lines(Path("/var/log/auth.log"), 6000):
+            match = regex.search(line)
+            if not match or match.group(2) not in missing:
+                continue
+            try:
+                stamp = dt.datetime.fromisoformat(match.group(1))
+                if stamp.tzinfo is None:
+                    stamp = stamp.replace(tzinfo=dt.timezone.utc)
+            except ValueError:
+                continue
+            if stamp < cutoff:
+                continue
+            ip = _strip_hostport(match.group(3))
+            if ip and not _local_ip(ip):
+                result[match.group(2)].add(ip)
+    return result
+
+
+def collect_online_ips(accounts: list[dict]) -> dict[str, list[str]]:
+    xray_users = {a["username"] for a in accounts if a["service"] == "xray"}
+    ssh_users = {a["username"] for a in accounts if a["service"] == "ssh"}
+    merged: dict[str, set[str]] = {}
+    for name, ips in collect_xray_ips(xray_users).items():
+        merged.setdefault(name, set()).update(ips)
+    for name, ips in collect_ssh_ips(ssh_users).items():
+        merged.setdefault(name, set()).update(ips)
+    return {name: sorted(ips) for name, ips in merged.items()}
+
+
+def usage_snapshot_once() -> None:
+    conn = db_connect()
+    try:
+        rows = conn.execute(
+            "SELECT username, service, protocol, created_at FROM accounts WHERE status='active' "
+            "UNION ALL "
+            "SELECT account_username AS username, "
+            "CASE WHEN protocol='ssh' THEN 'ssh' ELSE 'xray' END AS service, "
+            "protocol, COALESCE(paid_at, created_at) AS created_at FROM orders "
+            "WHERE status='COMPLETED' AND account_username<>''"
+        ).fetchall()
+    finally:
+        conn.close()
+    day = today_key()
+    day_start = int(now_jkt().replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+    seen: set[str] = set()
+    conn = db_connect()
+    try:
+        for row in rows:
+            username = row["username"]
+            if not username or username in seen:
+                continue
+            seen.add(username)
+            current = _int_file(account_paths(row["service"], row["protocol"], username)["usage"])
+            baseline = 0 if int(row["created_at"] or 0) >= day_start else current
+            conn.execute(
+                "INSERT OR IGNORE INTO usage_daily(username,day,start_bytes) VALUES(?,?,?)",
+                (username, day, baseline),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def usage_snapshot_loop() -> None:
+    while True:
+        try:
+            usage_snapshot_once()
+        except Exception:
+            logger.warning("usage snapshot gagal: %s", traceback.format_exc())
+        time.sleep(60)
+
+
+def usage_today(username: str, current: int, created_at: int) -> int:
+    day = today_key()
+    conn = db_connect()
+    try:
+        row = conn.execute(
+            "SELECT start_bytes FROM usage_daily WHERE username=? AND day=?",
+            (username, day),
+        ).fetchone()
+        if row is None:
+            day_start = int(now_jkt().replace(hour=0, minute=0, second=0, microsecond=0).timestamp())
+            baseline = 0 if int(created_at or 0) >= day_start else int(current)
+            conn.execute(
+                "INSERT OR IGNORE INTO usage_daily(username,day,start_bytes) VALUES(?,?,?)",
+                (username, day, baseline),
+            )
+            conn.commit()
+            return max(0, int(current) - baseline)
+        return max(0, int(current) - int(row["start_bytes"]))
+    finally:
+        conn.close()
+
+
+def user_orders(user_id: int) -> list[sqlite3.Row]:
+    conn = db_connect()
+    try:
+        return conn.execute(
+            "SELECT * FROM orders WHERE user_id=? ORDER BY id DESC",
+            (int(user_id),),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+def user_accounts(user_id: int) -> list[dict]:
+    now = int(time.time())
+    states = mullog_states()
+    conn = db_connect()
+    try:
+        free_rows = conn.execute(
+            "SELECT * FROM accounts WHERE user_id=? AND status IN ('active','failed') ORDER BY id DESC",
+            (int(user_id),),
+        ).fetchall()
+        order_rows = conn.execute(
+            "SELECT * FROM orders WHERE user_id=? AND status='COMPLETED' ORDER BY id DESC",
+            (int(user_id),),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    accounts: list[dict] = []
+    for row in free_rows:
+        username = row["username"]
+        paths = account_paths(row["service"], row["protocol"], username)
+        quota = _int_file(paths["quota"])
+        usage = _int_file(paths["usage"])
+        ip_limit = _int_file(paths["ip"])
+        state = mullog_state_for(states, username, row["protocol"] if row["service"] == "xray" else "")
+        expires = int(row["expires_at"] or 0)
+        accounts.append({
+            "source": "free",
+            "username": username,
+            "service": row["service"],
+            "protocol": row["protocol"] or "",
+            "days": int(row["days"] or 0),
+            "created_at": int(row["created_at"] or 0),
+            "expires_at": expires,
+            "output": row["output"] or "",
+            "error": row["error"] or "",
+            "row_status": row["status"],
+            "token": row["token"],
+            "invoice": "",
+            "quota_bytes": quota,
+            "usage_bytes": usage,
+            "today_bytes": usage_today(username, usage, int(row["created_at"] or 0)),
+            "ip_limit": ip_limit,
+            "suspended": state,
+            "expired": expires < now,
+        })
+
+    for row in order_rows:
+        username = row["account_username"]
+        if not username:
+            continue
+        service = "ssh" if row["protocol"] == "ssh" else "xray"
+        paths = account_paths(service, row["protocol"], username)
+        quota = _int_file(paths["quota"])
+        if quota <= 0 and int(row["quota_gb"] or 0) > 0:
+            quota = int(row["quota_gb"]) * 1024 ** 3
+        usage = _int_file(paths["usage"])
+        ip_limit = _int_file(paths["ip"])
+        if ip_limit <= 0 and int(row["ip_limit"] or 0) > 0:
+            ip_limit = int(row["ip_limit"])
+        base_time = int(row["paid_at"] or row["created_at"] or 0)
+        expires = base_time + int(row["days"] or 0) * 86400
+        state = mullog_state_for(states, username, row["protocol"] if service == "xray" else "")
+        accounts.append({
+            "source": "premium",
+            "username": username,
+            "service": service,
+            "protocol": row["protocol"] or "",
+            "days": int(row["days"] or 0),
+            "created_at": base_time,
+            "expires_at": expires,
+            "output": row["account_output"] or "",
+            "error": row["provision_error"] or "",
+            "row_status": "active" if row["status"] == "COMPLETED" else row["status"],
+            "token": "",
+            "invoice": row["invoice"],
+            "quota_bytes": quota,
+            "usage_bytes": usage,
+            "today_bytes": usage_today(username, usage, base_time),
+            "ip_limit": ip_limit,
+            "suspended": state,
+            "expired": expires < now,
+        })
+
+    accounts.sort(key=lambda item: item["created_at"], reverse=True)
+    online = collect_online_ips(accounts)
+    for item in accounts:
+        item["online_ips"] = online.get(item["username"], [])
+    return accounts
+
+
+def dashboard_data(user_id: int) -> dict:
+    accounts = user_accounts(user_id)
+    active = [a for a in accounts if not a["expired"] and a["row_status"] == "active" and not a["suspended"]]
+    suspended = [a for a in accounts if a["suspended"]]
+    expired = [a for a in accounts if a["expired"]]
+    today_total = sum(int(a["today_bytes"]) for a in accounts)
+    usage_total = sum(int(a["usage_bytes"]) for a in accounts)
+    return {
+        "accounts": accounts,
+        "active": active,
+        "suspended": suspended,
+        "expired": expired,
+        "today_total": today_total,
+        "usage_total": usage_total,
+        "orders": user_orders(user_id),
+        "security_ok": not suspended,
+    }
+
+
+# ---------------------------------------------------------------------------
 # HTTP helpers
 # ---------------------------------------------------------------------------
 
@@ -2146,6 +3209,27 @@ class Handler(BaseHTTPRequestHandler):
     def admin_session(self) -> sqlite3.Row | None:
         return get_session(self.cookie(ADMIN_COOKIE))
 
+    def user_session(self) -> sqlite3.Row | None:
+        return get_user_session(self.cookie(USER_COOKIE))
+
+    def require_user(self, csrf: str | None = None) -> sqlite3.Row | None:
+        session = self.user_session()
+        if not session:
+            target = urllib.parse.quote(self.path[:300], safe="/")
+            self.redirect("/login?next=" + target)
+            return None
+        if csrf is not None and not hmac.compare_digest(csrf, session["csrf"]):
+            self.html(
+                403,
+                page_shell(
+                    "Akses ditolak",
+                    "<main class='wrap narrow'><div class='panel'><h1>403</h1>"
+                    "<p>Token keamanan tidak valid. Muat ulang halaman.</p></div></main>",
+                ),
+            )
+            return None
+        return session
+
     def require_admin(self, csrf: str | None = None) -> sqlite3.Row | None:
         session = self.admin_session()
         if not session:
@@ -2167,6 +3251,8 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlsplit(self.path)
         path = parsed.path
         query = urllib.parse.parse_qs(parsed.query)
+        if not (path.startswith("/static/") or path.startswith("/branding/") or path in ("/healthz", "/favicon.ico")):
+            _CURRENT.user = self.user_session()
         try:
             if path == "/healthz":
                 self.json(200, {"ok": True, "time": int(time.time())})
@@ -2180,15 +3266,42 @@ class Handler(BaseHTTPRequestHandler):
             if path.startswith("/static/"):
                 self.serve_static(path, head_only)
                 return
+            if path in ("/login", "/login/"):
+                self.auth_page("login", query, head_only)
+                return
+            if path in ("/register", "/register/"):
+                self.auth_page("register", query, head_only)
+                return
+            if path in ("/forgot-password", "/forgot-password/"):
+                self.auth_page("forgot", query, head_only)
+                return
+            if path in ("/reset-password", "/reset-password/"):
+                self.reset_password_page(query, head_only)
+                return
+            if path in ("/verify", "/verify/"):
+                self.verify_email_page(query, head_only)
+                return
+            if path in ("/verify-pending", "/verify-pending/"):
+                self.auth_page("verify", query, head_only)
+                return
+            if path.startswith("/dashboard"):
+                self.dashboard_page(path, query, head_only)
+                return
             if path == "/":
                 token, cookie = self.public_form_token()
                 self.html(200, render_home(token, get_settings()), cookies=[cookie] if cookie else None, head_only=head_only)
                 return
             if path == "/gratis" or path == "/gratis/":
+                if not self.user_session():
+                    self.redirect("/login?next=/gratis")
+                    return
                 token, cookie = self.public_form_token()
                 self.html(200, render_free_page(token, get_settings()), cookies=[cookie] if cookie else None, head_only=head_only)
                 return
             if path == "/premium" or path == "/premium/":
+                if not self.user_session():
+                    self.redirect("/login?next=/premium")
+                    return
                 token, cookie = self.public_form_token()
                 self.html(200, render_premium_page(token, get_settings()), cookies=[cookie] if cookie else None, head_only=head_only)
                 return
@@ -2305,6 +3418,14 @@ class Handler(BaseHTTPRequestHandler):
         if not row:
             self.html(404, render_not_found(), head_only=head_only)
             return
+        if int(row["user_id"] or 0):
+            session = self.user_session()
+            if not session:
+                self.redirect("/login?next=" + urllib.parse.quote(self.path[:300], safe="/"))
+                return
+            if int(session["user_id"]) != int(row["user_id"]):
+                self.html(404, render_not_found(), head_only=head_only)
+                return
         if download:
             download_output = row["output"] or ""
             if row["service"] == "ssh":
@@ -2335,7 +3456,35 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         parsed = urllib.parse.urlsplit(self.path)
         path = parsed.path
+        _CURRENT.user = self.user_session()
         try:
+            if path == "/register":
+                self.register_post()
+                return
+            if path == "/login":
+                self.login_post()
+                return
+            if path == "/logout":
+                self.logout_post()
+                return
+            if path == "/verify/resend":
+                self.verify_resend_post()
+                return
+            if path == "/verify/code":
+                self.verify_code_post()
+                return
+            if path == "/forgot-password":
+                self.forgot_password_post()
+                return
+            if path == "/reset-password":
+                self.reset_password_post()
+                return
+            if path == "/dashboard/password":
+                self.dashboard_password_post()
+                return
+            if path == "/dashboard/logout-all":
+                self.dashboard_logout_all()
+                return
             if path == "/buat":
                 self.public_create()
                 return
@@ -2347,6 +3496,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/admin/login":
                 self.admin_login()
+                return
+            if path == "/admin/user/verify":
+                self.admin_user_verify()
                 return
             if path == "/admin/logout":
                 session = self.admin_session()
@@ -2384,6 +3536,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/admin/server":
                 self.admin_server()
                 return
+            if path == "/admin/mail":
+                self.admin_mail()
+                return
             self.html(404, render_not_found())
         except ValueError as exc:
             self.html(400, render_error(str(exc)))
@@ -2392,6 +3547,10 @@ class Handler(BaseHTTPRequestHandler):
             self.html(500, render_error("Terjadi kesalahan di server."))
 
     def public_create(self) -> None:
+        session = self.user_session()
+        if not session:
+            self.redirect("/login?next=/gratis")
+            return
         body = self.parse_body()
         token_cookie = self.cookie(FORM_COOKIE)
         if not token_cookie or not hmac.compare_digest(body.get("_form", ""), token_cookie):
@@ -2429,6 +3588,7 @@ class Handler(BaseHTTPRequestHandler):
                 days,
                 self.client_ip(),
                 self.headers.get("User-Agent", ""),
+                int(session["user_id"]),
             )
         except ValueError as exc:
             self.html(409, render_error(str(exc), retry=True))
@@ -2440,6 +3600,10 @@ class Handler(BaseHTTPRequestHandler):
         self.redirect(f"/hasil/{account['token']}")
 
     def premium_buy(self) -> None:
+        session = self.user_session()
+        if not session:
+            self.redirect("/login?next=/premium")
+            return
         body = self.parse_body()
         token_cookie = self.cookie(FORM_COOKIE)
         if not token_cookie or not hmac.compare_digest(body.get("_form", ""), token_cookie):
@@ -2457,7 +3621,12 @@ class Handler(BaseHTTPRequestHandler):
             self.html(400, render_error("Paket premium tidak valid."))
             return
         try:
-            order = create_premium_order(product_code, self.client_ip(), self.headers.get("User-Agent", ""))
+            order = create_premium_order(
+                product_code,
+                self.client_ip(),
+                self.headers.get("User-Agent", ""),
+                int(session["user_id"]),
+            )
         except ValueError as exc:
             self.html(409, render_error(str(exc), retry=True))
             return
@@ -2526,6 +3695,14 @@ class Handler(BaseHTTPRequestHandler):
         if not row:
             self.html(404, render_not_found(), head_only=head_only)
             return
+        if int(row["user_id"] or 0):
+            session = self.user_session()
+            if not session:
+                self.redirect("/login?next=" + urllib.parse.quote(self.path[:300], safe="/"))
+                return
+            if int(session["user_id"]) != int(row["user_id"]):
+                self.html(404, render_not_found(), head_only=head_only)
+                return
         if qr:
             svg = gopay_qr_svg(row["qr_string"])
             if not svg:
@@ -2577,6 +3754,11 @@ class Handler(BaseHTTPRequestHandler):
         if not row:
             self.json(404, {"ok": False, "error": "not found"})
             return
+        if int(row["user_id"] or 0):
+            session = self.user_session()
+            if not session or int(session["user_id"]) != int(row["user_id"]):
+                self.json(403, {"ok": False, "error": "forbidden"})
+                return
         status = row["status"]
         payload = {
             "ok": True,
@@ -2593,6 +3775,340 @@ class Handler(BaseHTTPRequestHandler):
             "error": row["provision_error"] if status == "FAILED" else "",
         }
         self.json(200, payload)
+
+    # ------------------------------------------------------------------
+    # User authentication & dashboard
+    # ------------------------------------------------------------------
+
+    def auth_page(self, mode: str, query: dict, head_only: bool = False) -> None:
+        if mode in ("login", "register") and self.user_session():
+            self.redirect("/dashboard")
+            return
+        token, cookie = self.public_form_token()
+        msg = (query.get("msg", [""])[0] or "").strip()[:40]
+        info = {
+            "verified": "Email berhasil diverifikasi. Silakan masuk.",
+            "logout": "Anda sudah keluar dari akun.",
+            "reset": "Password berhasil diubah. Silakan masuk dengan password baru.",
+            "reset-sent": "Jika email terdaftar, tautan reset password sudah dikirim.",
+            "registered": "Pendaftaran berhasil. Cek email untuk verifikasi.",
+            "pending": "Email belum diverifikasi. Masukkan kode 6 digit dari email, atau klik link verifikasi.",
+        }.get(msg, "")
+        error = ""
+        if msg == "mailfail":
+            error = "Email verifikasi gagal dikirim. Hubungi admin agar akun diverifikasi manual."
+        email = (query.get("email", [""])[0] or "").strip()[:190]
+        next_path = safe_next(query.get("next", ["/dashboard"])[0])
+        self.html(
+            200,
+            render_auth_page(mode, token, error=error, info=info, email=email, next_path=next_path),
+            cookies=[cookie] if cookie else None,
+            extra_headers={"Cache-Control": "no-store", "X-Robots-Tag": "noindex, nofollow"},
+            head_only=head_only,
+        )
+
+    def verify_email_page(self, query: dict, head_only: bool = False) -> None:
+        token = (query.get("token", [""])[0] or "").strip()
+        row = consume_email_token(token, "verify")
+        if not row:
+            token_cookie, cookie = self.public_form_token()
+            self.html(
+                400,
+                render_auth_page(
+                    "verify",
+                    token_cookie,
+                    error="Tautan verifikasi tidak valid atau sudah kedaluwarsa. Minta tautan baru di bawah.",
+                ),
+                cookies=[cookie] if cookie else None,
+                extra_headers={"Cache-Control": "no-store", "X-Robots-Tag": "noindex, nofollow"},
+                head_only=head_only,
+            )
+            return
+        set_user_verified(int(row["user_id"]))
+        audit_user(int(row["user_id"]), "verify_email", "", self.client_ip())
+        self.redirect("/login?msg=verified")
+
+    def reset_password_page(self, query: dict, head_only: bool = False) -> None:
+        token = (query.get("token", [""])[0] or "").strip()
+        row = peek_email_token(token, "reset")
+        token_cookie, cookie = self.public_form_token()
+        if not row:
+            self.html(
+                400,
+                render_auth_page(
+                    "reset",
+                    token_cookie,
+                    error="Tautan reset tidak valid atau sudah kedaluwarsa. Minta tautan baru dari halaman login.",
+                ),
+                cookies=[cookie] if cookie else None,
+                extra_headers={"Cache-Control": "no-store", "X-Robots-Tag": "noindex, nofollow"},
+                head_only=head_only,
+            )
+            return
+        self.html(
+            200,
+            render_auth_page("reset", token_cookie, reset_token=token),
+            cookies=[cookie] if cookie else None,
+            extra_headers={"Cache-Control": "no-store", "X-Robots-Tag": "noindex, nofollow"},
+            head_only=head_only,
+        )
+
+    def dashboard_page(self, path: str, query: dict, head_only: bool = False) -> None:
+        session = self.require_user()
+        if not session:
+            return
+        section = path[len("/dashboard"):].strip("/").split("/")[0] or "overview"
+        if section not in ("overview", "akun", "mullog", "invoice", "profil"):
+            self.html(404, render_not_found(), head_only=head_only)
+            return
+        msg = (query.get("msg", [""])[0] or "").strip()[:40]
+        data = dashboard_data(int(session["user_id"]))
+        body = render_dashboard_page(session, data, section, msg)
+        self.html(
+            200,
+            body,
+            extra_headers={"Cache-Control": "no-store", "X-Robots-Tag": "noindex, nofollow"},
+            head_only=head_only,
+        )
+
+    def register_post(self) -> None:
+        body = self.parse_body()
+        token_cookie = self.cookie(FORM_COOKIE)
+        if not token_cookie or not hmac.compare_digest(body.get("_form", ""), token_cookie):
+            self.html(400, render_auth_page("register", "", error="Sesi formulir kedaluwarsa. Muat ulang halaman."))
+            return
+        ip = self.client_ip()
+        if not rate_ok("register:" + ip, 6, 900):
+            self.html(429, render_auth_page("register", token_cookie, error="Terlalu banyak percobaan. Tunggu 15 menit."))
+            return
+        ts_ok, ts_msg = verify_turnstile(body.get("cf-turnstile-response", ""), ip)
+        if not ts_ok:
+            self.html(400, render_auth_page("register", token_cookie, error=ts_msg, email=body.get("email", "")))
+            return
+        email = normalize_email(body.get("email", ""))
+        password = body.get("password", "")
+        confirm = body.get("confirm", "")
+        next_path = safe_next(body.get("next", "/dashboard"))
+        if not valid_email(email):
+            self.html(400, render_auth_page("register", token_cookie, error="Format email tidak valid.", email=email, next_path=next_path))
+            return
+        if len(password) < 8:
+            self.html(400, render_auth_page("register", token_cookie, error="Password minimal 8 karakter.", email=email, next_path=next_path))
+            return
+        if len(password) > 200:
+            self.html(400, render_auth_page("register", token_cookie, error="Password terlalu panjang.", email=email, next_path=next_path))
+            return
+        if password != confirm:
+            self.html(400, render_auth_page("register", token_cookie, error="Konfirmasi password tidak sama.", email=email, next_path=next_path))
+            return
+        user, error = create_user(email, password, ip)
+        if not user:
+            self.html(409, render_auth_page("register", token_cookie, error=error, email=email, next_path=next_path))
+            return
+        raw_token, code = create_email_token(int(user["id"]), "verify", EMAIL_TOKEN_TTL)
+        sent, _mail_msg = send_verification_email(user, raw_token, code)
+        audit_user(int(user["id"]), "register", "pending" if not sent else "verification_sent", ip)
+        target = "/verify-pending?email=" + urllib.parse.quote(email)
+        self.redirect(target + ("" if sent else "&mailfail=1"))
+
+    def login_post(self) -> None:
+        body = self.parse_body()
+        token_cookie = self.cookie(FORM_COOKIE)
+        if not token_cookie or not hmac.compare_digest(body.get("_form", ""), token_cookie):
+            self.html(400, render_auth_page("login", "", error="Sesi formulir kedaluwarsa. Muat ulang halaman."))
+            return
+        ip = self.client_ip()
+        email = normalize_email(body.get("email", ""))
+        next_path = safe_next(body.get("next", "/dashboard"))
+        if not rate_ok("login:" + ip, 12, 900) or not rate_ok("login-email:" + email, 8, 900):
+            self.html(429, render_auth_page("login", token_cookie, error="Terlalu banyak percobaan. Tunggu 15 menit.", email=email, next_path=next_path))
+            return
+        ts_ok, ts_msg = verify_turnstile(body.get("cf-turnstile-response", ""), ip)
+        if not ts_ok:
+            self.html(400, render_auth_page("login", token_cookie, error=ts_msg, email=email, next_path=next_path))
+            return
+        user = user_by_email(email)
+        password = body.get("password", "")
+        if not user or not verify_password(password, user["password_hash"]):
+            time.sleep(0.4)
+            audit("user_login_failed", email, ip)
+            self.html(401, render_auth_page("login", token_cookie, error="Email atau password salah.", email=email, next_path=next_path))
+            return
+        if user["status"] != "active":
+            self.redirect("/verify-pending?email=" + urllib.parse.quote(email) + "&pending=1")
+            return
+        drop_user_session(self.cookie(USER_COOKIE))
+        token, _csrf = create_user_session(int(user["id"]), ip)
+        conn = db_connect()
+        try:
+            conn.execute(
+                "UPDATE users SET last_login_at=?, last_ip=?, updated_at=? WHERE id=?",
+                (int(time.time()), ip[:64], int(time.time()), int(user["id"])),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        audit_user(int(user["id"]), "login", "", ip)
+        self.redirect(
+            next_path,
+            cookies=[self.set_cookie(USER_COOKIE, token, USER_SESSION_TTL, http_only=True)],
+        )
+
+    def logout_post(self) -> None:
+        session = self.user_session()
+        if session:
+            body = self.parse_body()
+            if not hmac.compare_digest(body.get("_csrf", ""), session["csrf"]):
+                self.html(403, render_error("Token keamanan tidak valid. Muat ulang halaman."))
+                return
+            drop_user_session(self.cookie(USER_COOKIE))
+            audit_user(int(session["user_id"]), "logout", "", self.client_ip())
+        self.redirect("/login?msg=logout", cookies=[self.clear_cookie(USER_COOKIE)])
+
+    def verify_resend_post(self) -> None:
+        body = self.parse_body()
+        token_cookie = self.cookie(FORM_COOKIE)
+        if not token_cookie or not hmac.compare_digest(body.get("_form", ""), token_cookie):
+            self.html(400, render_auth_page("verify", "", error="Sesi formulir kedaluwarsa. Muat ulang halaman."))
+            return
+        ip = self.client_ip()
+        email = normalize_email(body.get("email", ""))
+        if not rate_ok("resend:" + ip, 5, 900) or not rate_ok("resend-email:" + email, 3, 900):
+            self.html(429, render_auth_page("verify", token_cookie, error="Terlalu banyak permintaan. Tunggu 15 menit.", email=email))
+            return
+        ts_ok, ts_msg = verify_turnstile(body.get("cf-turnstile-response", ""), ip)
+        if not ts_ok:
+            self.html(400, render_auth_page("verify", token_cookie, error=ts_msg, email=email))
+            return
+        user = user_by_email(email)
+        sent = True
+        if user and user["status"] != "active":
+            raw_token, code = create_email_token(int(user["id"]), "verify", EMAIL_TOKEN_TTL)
+            sent, _ = send_verification_email(user, raw_token, code)
+            audit_user(int(user["id"]), "verify_resend", "" if sent else "mail_failed", ip)
+        target = "/verify-pending?email=" + urllib.parse.quote(email)
+        self.redirect(target + ("" if sent else "&mailfail=1"))
+
+    def verify_code_post(self) -> None:
+        body = self.parse_body()
+        token_cookie = self.cookie(FORM_COOKIE)
+        if not token_cookie or not hmac.compare_digest(body.get("_form", ""), token_cookie):
+            self.html(400, render_auth_page("verify", "", error="Sesi formulir kedaluwarsa. Muat ulang halaman."))
+            return
+        ip = self.client_ip()
+        email = normalize_email(body.get("email", ""))
+        code = (body.get("code", "") or "").strip()
+        if not rate_ok("verifycode:" + ip, 12, 900) or not rate_ok("verifycode-email:" + email, 8, 900):
+            self.html(429, render_auth_page("verify", token_cookie, error="Terlalu banyak percobaan. Tunggu 15 menit.", email=email))
+            return
+        if not valid_email(email) or not re.fullmatch(r"\d{6}", code):
+            self.html(400, render_auth_page("verify", token_cookie, error="Email atau kode 6 digit tidak valid.", email=email))
+            return
+        user = verify_email_code(email, code)
+        if not user:
+            time.sleep(0.4)
+            audit("user_verify_code_failed", email, ip)
+            self.html(400, render_auth_page("verify", token_cookie, error="Kode salah atau sudah kedaluwarsa. Kirim ulang email verifikasi.", email=email))
+            return
+        set_user_verified(int(user["id"]))
+        audit_user(int(user["id"]), "verify_code", "", ip)
+        self.redirect("/login?msg=verified")
+
+    def forgot_password_post(self) -> None:
+        body = self.parse_body()
+        token_cookie = self.cookie(FORM_COOKIE)
+        if not token_cookie or not hmac.compare_digest(body.get("_form", ""), token_cookie):
+            self.html(400, render_auth_page("forgot", "", error="Sesi formulir kedaluwarsa. Muat ulang halaman."))
+            return
+        ip = self.client_ip()
+        email = normalize_email(body.get("email", ""))
+        if not rate_ok("forgot:" + ip, 5, 900) or not rate_ok("forgot-email:" + email, 3, 900):
+            self.html(429, render_auth_page("forgot", token_cookie, error="Terlalu banyak permintaan. Tunggu 15 menit.", email=email))
+            return
+        ts_ok, ts_msg = verify_turnstile(body.get("cf-turnstile-response", ""), ip)
+        if not ts_ok:
+            self.html(400, render_auth_page("forgot", token_cookie, error=ts_msg, email=email))
+            return
+        user = user_by_email(email)
+        if user and user["status"] == "active":
+            raw_token, _code = create_email_token(int(user["id"]), "reset", RESET_TOKEN_TTL)
+            sent, _ = send_reset_email(user, raw_token)
+            audit_user(int(user["id"]), "forgot_password", "" if sent else "mail_failed", ip)
+        self.redirect("/login?msg=reset-sent")
+
+    def reset_password_post(self) -> None:
+        body = self.parse_body()
+        token_cookie = self.cookie(FORM_COOKIE)
+        if not token_cookie or not hmac.compare_digest(body.get("_form", ""), token_cookie):
+            self.html(400, render_auth_page("reset", "", error="Sesi formulir kedaluwarsa. Muat ulang halaman."))
+            return
+        ip = self.client_ip()
+        token = (body.get("token", "") or "").strip()
+        password = body.get("password", "")
+        confirm = body.get("confirm", "")
+        if len(password) < 8:
+            self.html(400, render_auth_page("reset", token_cookie, error="Password minimal 8 karakter.", reset_token=token))
+            return
+        if password != confirm:
+            self.html(400, render_auth_page("reset", token_cookie, error="Konfirmasi password tidak sama.", reset_token=token))
+            return
+        row = consume_email_token(token, "reset")
+        if not row:
+            self.html(400, render_auth_page("reset", token_cookie, error="Tautan reset tidak valid atau sudah kedaluwarsa."))
+            return
+        update_user_password(int(row["user_id"]), password)
+        drop_user_sessions(int(row["user_id"]))
+        audit_user(int(row["user_id"]), "reset_password", "", ip)
+        self.redirect("/login?msg=reset", cookies=[self.clear_cookie(USER_COOKIE)])
+
+    def dashboard_password_post(self) -> None:
+        body = self.parse_body()
+        session = self.require_user(body.get("_csrf", ""))
+        if not session:
+            return
+        current = body.get("current", "")
+        new = body.get("new", "")
+        confirm = body.get("confirm", "")
+        if len(new) < 8:
+            self.redirect("/dashboard/profil?msg=password-short")
+            return
+        if new != confirm:
+            self.redirect("/dashboard/profil?msg=password-mismatch")
+            return
+        user = user_by_id(int(session["user_id"]))
+        if not user or not verify_password(current, user["password_hash"]):
+            self.redirect("/dashboard/profil?msg=password-wrong")
+            return
+        update_user_password(int(user["id"]), new)
+        drop_user_sessions(int(user["id"]), keep_token=self.cookie(USER_COOKIE))
+        audit_user(int(user["id"]), "password_change", "", self.client_ip())
+        self.redirect("/dashboard/profil?msg=password-ok")
+
+    def dashboard_logout_all(self) -> None:
+        body = self.parse_body()
+        session = self.require_user(body.get("_csrf", ""))
+        if not session:
+            return
+        drop_user_sessions(int(session["user_id"]))
+        audit_user(int(session["user_id"]), "logout_all", "", self.client_ip())
+        self.redirect("/login?msg=logout", cookies=[self.clear_cookie(USER_COOKIE)])
+
+    def admin_user_verify(self) -> None:
+        body = self.parse_body()
+        session = self.require_admin(body.get("_csrf", ""))
+        if not session:
+            return
+        try:
+            user_id = int(body.get("user_id", "0"))
+        except ValueError:
+            user_id = 0
+        user = user_by_id(user_id)
+        if user:
+            set_user_verified(user_id)
+            audit("admin_verify_user", user["email"], self.client_ip())
+            self.redirect("/admin?msg=userverified")
+        else:
+            self.redirect("/admin?msg=userverifyfail")
 
     def admin_premium(self) -> None:
         body = self.parse_body()
@@ -2818,6 +4334,61 @@ class Handler(BaseHTTPRequestHandler):
         audit("server", f"manual {code} {name}", self.client_ip())
         self.redirect("/admin?msg=server")
 
+    def admin_mail(self) -> None:
+        body = self.parse_body()
+        session = self.require_admin(body.get("_csrf", ""))
+        if not session:
+            return
+        from_name = (body.get("mail_from_name", "") or "").strip()[:60] or BRAND
+        from_email = (body.get("mail_from_email", "") or "").strip().lower()[:190]
+        verify_subject = (body.get("mail_verify_subject", "") or "").strip()[:120] or "Kode Verifikasi Anda"
+        reset_subject = (body.get("mail_reset_subject", "") or "").strip()[:120] or "Reset Password — HITS SSH"
+        api_key = (body.get("mail_api_key", "") or "").strip()
+        smtp_user = (body.get("mail_smtp_user", "") or "").strip()[:190]
+        smtp_key = (body.get("mail_smtp_key", "") or "").strip()
+        smtp_host = (body.get("mail_smtp_host", "") or "").strip()[:190] or "smtp-relay.brevo.com"
+        try:
+            smtp_port = int(body.get("mail_smtp_port", "2525") or "2525")
+        except ValueError:
+            smtp_port = 2525
+        smtp_port = max(1, min(65535, smtp_port))
+        if not valid_email(from_email):
+            self.redirect("/admin?msg=mailfail")
+            return
+        if api_key and not api_key.startswith("xkeysib-"):
+            self.redirect("/admin?msg=mailkeybad")
+            return
+        if smtp_key and not smtp_key.startswith("xsmtpsib-"):
+            self.redirect("/admin?msg=mailkeybad")
+            return
+        values = {
+            "mail_from_name": from_name,
+            "mail_from_email": from_email,
+            "mail_verify_subject": verify_subject,
+            "mail_reset_subject": reset_subject,
+            "mail_smtp_user": smtp_user,
+            "mail_smtp_host": smtp_host,
+            "mail_smtp_port": str(smtp_port),
+        }
+        if api_key:
+            values["mail_api_key"] = api_key[:200]
+        if smtp_key:
+            values["mail_smtp_key"] = smtp_key[:200]
+        set_settings(values)
+        audit("mail", f"from={from_email} verify={verify_subject} api={'changed' if api_key else 'keep'} smtp={'changed' if smtp_key else 'keep'}", self.client_ip())
+        if body.get("action") == "test":
+            html_body, text_body = email_layout(
+                "Tes pengiriman email",
+                "Ini email percobaan dari dashboard admin. Jika Anda menerima email ini, konfigurasi Brevo sudah benar.",
+                "Buka situs",
+                base_url(),
+                "Tidak ada tindakan yang diperlukan.",
+            )
+            ok, _ = send_email(from_email, f"Tes Email — {branding()['name']}", html_body, text_body)
+            self.redirect("/admin?msg=mailtestok" if ok else "mailtestfail")
+            return
+        self.redirect("/admin?msg=mail")
+
     def admin_delete(self) -> None:
         body = self.parse_body()
         session = self.require_admin(body.get("_csrf", ""))
@@ -2927,6 +4498,7 @@ def favicon_svg() -> str:
 
 def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False, active: str = "", turnstile: bool = False) -> str:
     b = branding()
+    cu = current_user()
     brand_name = b["name"]
     brand_html = brand_word_html(brand_name, b["accent"])
     robots = '<meta name="robots" content="noindex,nofollow">' if noindex else ""
@@ -2958,16 +4530,29 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
         items = [
             ("home", "/", "Beranda"),
             ("premium", "/premium", "Beli Akun"),
-            ("free", "/gratis", "Buat Akun Gratis"),
+            ("free", "/gratis", "Buat Akun"),
             ("invoice", "/cek-invoice", "Cek Invoice"),
-            ("contact", "/kontak", "Kontak / Bantuan"),
+            ("contact", "/kontak", "Kontak"),
         ]
+        if cu:
+            items.insert(3, ("dashboard", "/dashboard", "Dashboard"))
         menu_parts = []
         for key, href, label in items:
             cls = "nav-link" + (" active" if active == key else "")
             aria = ' aria-current="page"' if active == key else ""
             menu_parts.append(f'<a href="{href}" class="{cls}"{aria}>{label}</a>')
         menu = "".join(menu_parts)
+        if cu:
+            auth_menu = f"""
+      <a class="nav-link nav-user-chip" href="/dashboard/profil"><span class="nav-avatar">{e((cu['email'][:1] or 'M').upper())}</span><span class="nav-email">{e(cu['email'])}</span></a>
+      <form method="post" action="/logout" class="nav-logout"><input type="hidden" name="_csrf" value="{e(cu['csrf'])}"><button class="nav-link nav-logout-btn" type="submit">Keluar</button></form>"""
+            drawer_cta = '<a class="nav-drawer-cta" href="/dashboard">Buka dashboard <span aria-hidden="true">↗</span></a>'
+        else:
+            auth_menu = ""
+            drawer_cta = (
+                '<a class="nav-drawer-cta" href="/login">Login <span aria-hidden="true">↗</span></a>'
+                '<a class="nav-drawer-cta" href="/register">Daftar gratis <span aria-hidden="true">↗</span></a>'
+            )
         header = f"""
 <header class="nav nav-public">
   <div class="wrap nav-inner">
@@ -2981,7 +4566,8 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
     <nav class="nav-links" id="site-menu" aria-label="Menu utama">
       <div class="nav-drawer-head"><span class="mini-label">MENU {e(brand_name.upper())}</span></div>
       {menu}
-      <a class="nav-drawer-cta" href="/premium">Beli akun premium <span aria-hidden="true">↗</span></a>
+      {auth_menu}
+      {drawer_cta}
       <div class="nav-drawer-foot"><a href="/admin">Admin</a><span>Free &amp; Premium</span></div>
     </nav>
   </div>
@@ -2998,6 +4584,7 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
       <a href="/">Beranda</a>
       <a href="/gratis">Akun gratis</a>
       <a href="/premium">Premium</a>
+      <a href="/dashboard">Dashboard</a>
       <a href="/cek-invoice">Cek Invoice</a>
       <a href="/kontak">Kontak</a>
       <a href="/admin">Admin</a>
@@ -3015,14 +4602,14 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
 <meta name="theme-color" content="{UI_THEME_COLORS.get(b['theme'], '#fffaf2')}">
 {robots}
 {favicon}
-<link rel="stylesheet" href="/static/style.css?v=20261105hits9">
+<link rel="stylesheet" href="/static/style.css?v=20261107themes6">
 {turnstile_script}
 </head>
 <body>
 {header}
 {body}
 {footer}
-<script src="/static/app.js?v=20261105hits9" defer></script>
+<script src="/static/app.js?v=20261107themes6" defer></script>
 </body>
 </html>"""
 
@@ -3210,7 +4797,7 @@ def render_home(form_token: str, settings: dict[str, str]) -> str:
 <main>
   <section class="hero wrap">
     <div class="hero-copy">
-      <div class="eyebrow"><span class="dot"></span> FREE &amp; PREMIUM · TANPA LOGIN</div>
+      <div class="eyebrow"><span class="dot"></span> FREE &amp; PREMIUM · MEMBER AREA</div>
       <h1>{e(hero_title)}<br><em>{e(hero_title_accent)}</em></h1>
       <p class="hero-lead">{e(hero_lead)}</p>
       <div class="hero-actions">
@@ -3261,7 +4848,7 @@ def render_home(form_token: str, settings: dict[str, str]) -> str:
         <div class="eyebrow"><span class="dot"></span> PILIH KEBUTUHAN</div>
         <h2>Dua kategori.<br>Satu tempat.</h2>
       </div>
-      <p>Gratis untuk coba-coba, premium untuk masa aktif lebih panjang. Keduanya tanpa akun website dan tanpa email.</p>
+      <p>Gratis untuk coba-coba, premium untuk masa aktif lebih panjang. Daftar sekali, lalu semua akun dan invoice tersimpan di dashboard.</p>
     </div>
     {free_note}
     {premium_note}
@@ -3307,7 +4894,7 @@ def render_home(form_token: str, settings: dict[str, str]) -> str:
     <div class="faq-list">
       <details><summary>Apakah akun gratis benar-benar gratis?</summary><p>Ya. Tidak ada pembayaran, email, atau pendaftaran. Kuota harian dibatasi agar layanan tetap tersedia untuk semua orang.</p></details>
       <details><summary>Apa bedanya akun gratis dan premium?</summary><p>Akun gratis memakai kuota harian dan masa aktif 3–7 hari. Premium berbayar, tanpa kuota pembelian harian, dengan masa aktif dan limit yang diatur per paket.</p></details>
-      <details><summary>Bagaimana kalau saya lupa invoice premium?</summary><p>Buka halaman Cek Invoice, lalu masukkan kode invoice yang tampil setelah pembelian. Tidak perlu login.</p></details>
+      <details><summary>Bagaimana kalau saya lupa invoice premium?</summary><p>Buka <a href="/dashboard/invoice">Riwayat Invoice</a> di dashboard. Invoice lama sebelum fitur akun tetap bisa dicek lewat <a href="/cek-invoice">Cek Invoice</a> dengan kodenya.</p></details>
       <details><summary>Apakah akun bisa dipakai di beberapa perangkat?</summary><p>Bisa, selama jumlah IP yang login tidak melebihi batas paket. Pelanggaran limit IP dapat menyebabkan akun dibekukan sementara.</p></details>
       <details><summary>Butuh bantuan lain?</summary><p>Buka halaman <a href="/kontak">Kontak / Bantuan</a>. Admin dapat mengatur link Telegram atau grup komunitas dari dashboard.</p></details>
     </div>
@@ -3340,7 +4927,7 @@ def render_free_page(form_token: str, settings: dict[str, str]) -> str:
     hero = _page_hero(
         "KATEGORI GRATIS",
         "Akun gratis,<br><em>langsung jadi.</em>",
-        "Pilih layanan dan masa aktif. Akun dibuat langsung di server, tanpa email dan tanpa login website.",
+        "Pilih layanan dan masa aktif. Login diperlukan agar akun dan monitoring tersimpan di dashboard Anda.",
         chips,
     )
     body = f"""
@@ -3451,7 +5038,7 @@ def render_premium_page(form_token: str, settings: dict[str, str]) -> str:
     )
     hero = _page_hero(
         e(b["name"].upper()) + " PREMIUM",
-        "Beli sekali.<br><em>Tanpa login.</em>",
+        "Beli sekali.<br><em>Khusus member.</em>",
         "Pilih layanan dan masa aktif, bayar QRIS GoPay, lalu simpan invoice. Akun dibuat otomatis setelah pembayaran terdeteksi.",
         chips,
     )
@@ -3494,7 +5081,7 @@ def render_premium_page(form_token: str, settings: dict[str, str]) -> str:
           <h3>Bayar dari mana saja.</h3>
           <p>Scan QRIS dengan GoPay, OVO, DANA, ShopeePay, atau m-banking. Akun dibuat otomatis setelah transaksi terdeteksi.</p>
           <ul>
-            <li>Tanpa daftar dan tanpa login.</li>
+            <li>Wajib login, riwayat tersimpan.</li>
             <li>Invoice {e(settings.get("premium_expiry_min", "15"))} menit dan bisa dicek ulang.</li>
             <li>Download detail akun <b>.txt</b> setelah lunas.</li>
           </ul>
@@ -3565,7 +5152,7 @@ def render_contact_page(settings: dict[str, str]) -> str:
         links = """
         <div class="notice notice-warn contact-empty"><strong>Link kontak belum diatur.</strong> Admin dapat mengisi link Telegram atau grup dari Dashboard → Pengaturan → Kontak &amp; Bantuan.</div>"""
     note_html = f'<div class="contact-note panel"><span class="mini-label">CATATAN ADMIN</span><p>{e(note)}</p></div>' if note else ""
-    chips = '<span class="page-chip">Tanpa login</span><span class="page-chip">Bantuan akun</span><span class="page-chip">Invoice premium</span>'
+    chips = '<span class="page-chip">Member area</span><span class="page-chip">Bantuan akun</span><span class="page-chip">Invoice premium</span>'
     hero = _page_hero(
         "KONTAK / BANTUAN",
         "Butuh bantuan?<br><em>Hubungi kami.</em>",
@@ -3600,6 +5187,589 @@ def render_contact_page(settings: dict[str, str]) -> str:
 </main>
 """
     return page_shell("Kontak & Bantuan", body, active="contact")
+
+
+def fmt_bytes(value) -> str:
+    try:
+        number = max(0, int(value or 0))
+    except (TypeError, ValueError):
+        number = 0
+    mb = number / (1024 * 1024)
+    if mb >= 1024:
+        return f"{mb / 1024:.2f}".replace(".", ",") + " GB"
+    if mb >= 1:
+        return f"{mb:.2f}".replace(".", ",") + " MB"
+    kb = number / 1024
+    return f"{kb:.1f}".replace(".", ",") + " KB"
+
+
+def _service_label(service: str, protocol: str) -> str:
+    base = SERVICES.get(service, {"label": service})["label"]
+    if protocol:
+        base += " · " + PROTOCOLS.get(protocol, {}).get("label", protocol.upper())
+    return base
+
+
+def _account_badge(account: dict) -> tuple[str, str]:
+    if account.get("row_status") == "failed":
+        return "badge-bad", "Gagal"
+    if account.get("suspended"):
+        return "badge-bad", "Suspended"
+    if account.get("expired"):
+        return "badge-bad", "Expired"
+    quota = int(account.get("quota_bytes") or 0)
+    usage = int(account.get("usage_bytes") or 0)
+    remaining = int(account.get("expires_at") or 0) - int(time.time())
+    if (quota > 0 and usage >= quota * 0.9) or remaining <= 86400:
+        return "badge-warn", "Hampir habis"
+    return "badge-ok", "Aktif"
+
+
+def _usage_html(account: dict) -> str:
+    quota = int(account.get("quota_bytes") or 0)
+    usage = int(account.get("usage_bytes") or 0)
+    today = int(account.get("today_bytes") or 0)
+    if quota > 0:
+        pct = max(0.0, min(100.0, usage * 100.0 / quota))
+        bar_class = "usage-bar-fill" + (" is-warn" if pct >= 80 else "") + (" is-bad" if pct >= 100 else "")
+        remaining = max(0, quota - usage)
+        label = f"{fmt_bytes(usage)} / {fmt_bytes(quota)}"
+        foot = f"Sisa {fmt_bytes(remaining)} · hari ini {fmt_bytes(today)}"
+    else:
+        pct = 0.0
+        bar_class = "usage-bar-fill is-muted"
+        label = f"{fmt_bytes(usage)} terpakai"
+        foot = f"Tanpa batas kuota · hari ini {fmt_bytes(today)}"
+    return f"""
+      <div class="usage-block">
+        <div class="usage-head"><span>Pemakaian kuota</span><b>{e(label)}</b></div>
+        <div class="usage-bar"><i class="{bar_class}" style="width:{pct:.1f}%"></i></div>
+        <small class="usage-foot">{e(foot)}</small>
+      </div>"""
+
+
+def _online_html(account: dict) -> str:
+    ips = account.get("online_ips") or []
+    ip_limit = int(account.get("ip_limit") or 0)
+    limit_text = f"limit {ip_limit} IP" if ip_limit > 0 else "tanpa batas IP"
+    over = ip_limit > 0 and len(ips) > ip_limit
+    chip_class = "ip-count is-over" if over else "ip-count"
+    ip_list = ""
+    if ips:
+        ip_list = '<div class="ip-list">' + "".join(f'<code>{e(ip)}</code>' for ip in ips) + "</div>"
+    else:
+        ip_list = '<p class="dash-empty-inline">Tidak ada koneksi aktif saat ini.</p>'
+    return f"""
+      <div class="ip-block">
+        <div class="ip-head"><span>IP login aktif</span><b class="{chip_class}">{len(ips)} / {ip_limit if ip_limit > 0 else '∞'}</b></div>
+        <small class="usage-foot">{e(limit_text)}</small>
+        {ip_list}
+      </div>"""
+
+
+def _suspended_html(account: dict) -> str:
+    state = account.get("suspended")
+    if not state:
+        return ""
+    until = int(state.get("until", 0) or 0)
+    count = state.get("count")
+    limit = state.get("limit")
+    return f"""
+      <div class="acct-alert">
+        <b>Terkena suspend mullog</b>
+        <span>{e(str(count if count not in (None, '') else '-'))} IP terdeteksi, batas {e(str(limit if limit not in (None, '') else '-'))}.</span>
+        <span>Pulih <b data-countdown-until="{until}">{e(fmt_ts(until, '%d %b %Y · %H:%M WIB'))}</b></span>
+      </div>"""
+
+
+def render_account_card(account: dict) -> str:
+    username = account["username"]
+    badge_class, badge_text = _account_badge(account)
+    output = account.get("output") or ""
+    if account["service"] == "ssh" and output:
+        output = format_ssh_output(output)
+    output_id = "acct-" + re.sub(r"[^A-Za-z0-9_-]", "-", f"{account['source']}-{username}")
+    expires = int(account.get("expires_at") or 0)
+    remaining = max(0, int((expires - time.time()) // 86400) + (1 if expires > time.time() else 0))
+    expiry_text = fmt_ts(expires, "%d %b %Y · %H:%M WIB")
+    if account.get("expired"):
+        expiry_text = "Berakhir " + expiry_text
+    else:
+        expiry_text = f"{remaining} hari lagi · {expiry_text}"
+    download_url = ""
+    link_url = ""
+    if account["source"] == "free" and account.get("token"):
+        download_url = f"/hasil/{account['token']}.txt"
+        link_url = f"/hasil/{account['token']}"
+    elif account.get("invoice"):
+        download_url = f"/invoice/{account['invoice']}.txt"
+        link_url = f"/invoice/{account['invoice']}"
+    actions = []
+    if output:
+        actions.append(f'<button class="btn btn-small btn-ghost" type="button" data-copy-target="{output_id}">{icon("copy")} Salin config</button>')
+    if download_url:
+        actions.append(f'<a class="btn btn-small btn-dark" href="{e(download_url)}" download>{icon("download")} Unduh .txt</a>')
+    if link_url:
+        actions.append(f'<button class="btn btn-small btn-ghost" type="button" data-copy-text="{e(base_url() + link_url)}">Salin link</button>')
+    if output:
+        actions.append(f'<button class="btn btn-small btn-ghost" type="button" data-output-toggle="{output_id}">Lihat config</button>')
+    error_html = ""
+    if account.get("error"):
+        error_html = f'<div class="notice notice-error compact-notice">{e(account["error"])}</div>'
+    output_html = ""
+    if output:
+        output_html = f'<pre class="account-output acct-output" id="{output_id}" hidden>{e(output)}</pre>'
+    return f"""
+      <article class="acct-card">
+        <div class="acct-top">
+          <div class="acct-id">
+            <span class="mini-label">{e(_service_label(account['service'], account['protocol']))}</span>
+            <b>{e(username)}</b>
+            <small>{e(str(account['days']))} hari · {e('Premium' if account['source'] == 'premium' else 'Gratis')}</small>
+          </div>
+          <span class="badge {badge_class}">{badge_text}</span>
+        </div>
+        {_suspended_html(account)}
+        {error_html}
+        <div class="acct-meta">
+          <span>{icon('clock')} {e(expiry_text)}</span>
+          <span>{icon('shield')} {e('Mullog aktif' if account.get('suspended') else 'Tidak ada pelanggaran')}</span>
+        </div>
+        {_usage_html(account)}
+        {_online_html(account)}
+        <div class="acct-actions">{''.join(actions)}</div>
+        {output_html}
+      </article>"""
+
+
+def render_auth_page(
+    mode: str,
+    form_token: str,
+    error: str = "",
+    info: str = "",
+    email: str = "",
+    next_path: str = "/dashboard",
+    reset_token: str = "",
+    show_resend: bool = False,
+) -> str:
+    b = branding()
+    ts_site, _ts_secret, ts_on = turnstile_config()
+    copy = {
+        "login": ("MEMBER AREA", "Selamat datang kembali.", "Masuk untuk membuat akun, memantau kuota, IP, dan invoice.", "Masuk"),
+        "register": ("DAFTAR GRATIS", "Satu akun, semua terkendali.", "Cukup email dan password. Setelah verifikasi, dashboard langsung aktif.", "Daftar sekarang"),
+        "forgot": ("LUPA PASSWORD", "Atur ulang dengan aman.", "Masukkan email akun. Kami kirim tautan untuk membuat password baru.", "Kirim tautan reset"),
+        "reset": ("PASSWORD BARU", "Buat password baru.", "Minimal 8 karakter. Bebas kombinasi huruf, angka, atau simbol.", "Simpan password"),
+        "verify": ("VERIFIKASI EMAIL", "Cek inbox Anda.", "Masukkan kode 6 digit dari email, atau klik tombol verifikasi di email. Belum menerima email? Kirim ulang di bawah.", "Verifikasi dengan kode"),
+    }
+    eyebrow, title, lead, submit = copy.get(mode, copy["login"])
+    err_html = f'<div class="notice notice-error">{e(error)}</div>' if error else ""
+    info_html = f'<div class="notice notice-ok">{e(info)}</div>' if info else ""
+    ts_widget = (
+        '<div class="turnstile-box">'
+        f'<div class="cf-turnstile" data-sitekey="{e(ts_site)}" data-theme="light" data-language="id" data-size="flexible"></div>'
+        '<small class="turnstile-status" data-turnstile-status>Memuat verifikasi keamanan…</small>'
+        "</div>"
+        if ts_on and mode != "reset"
+        else ""
+    )
+    if mode == "login":
+        fields = f"""
+        <label>Email
+          <input type="email" name="email" value="{e(email)}" autocomplete="email" required autofocus placeholder="nama@email.com">
+        </label>
+        <label>Password
+          <span class="pass-wrap"><input type="password" name="password" autocomplete="current-password" required placeholder="Password Anda"><button type="button" class="pass-toggle" data-toggle-pass aria-label="Tampilkan password">Lihat</button></span>
+        </label>
+        <input type="hidden" name="next" value="{e(next_path)}">
+        {ts_widget}
+        <button class="btn btn-primary btn-block" type="submit">{e(submit)}</button>"""
+        links = f"""
+        <div class="auth-links">
+          <span>Belum punya akun? <a href="/register?next={urllib.parse.quote(next_path, safe='/')}">Daftar gratis</a></span>
+          <a href="/forgot-password">Lupa password?</a>
+        </div>"""
+    elif mode == "register":
+        fields = f"""
+        <label>Email
+          <input type="email" name="email" value="{e(email)}" autocomplete="email" required autofocus placeholder="nama@email.com">
+        </label>
+        <label>Password
+          <span class="pass-wrap"><input type="password" name="password" minlength="8" autocomplete="new-password" required placeholder="Minimal 8 karakter"><button type="button" class="pass-toggle" data-toggle-pass aria-label="Tampilkan password">Lihat</button></span>
+        </label>
+        <label>Ulangi password
+          <input type="password" name="confirm" minlength="8" autocomplete="new-password" required placeholder="Ketik ulang password">
+        </label>
+        <input type="hidden" name="next" value="{e(next_path)}">
+        {ts_widget}
+        <p class="form-note auth-note">Minimal 8 karakter. Tidak perlu simbol rumit.</p>
+        <button class="btn btn-primary btn-block" type="submit">{e(submit)}</button>"""
+        links = '<div class="auth-links"><span>Sudah punya akun? <a href="/login">Masuk</a></span></div>'
+    elif mode == "forgot":
+        fields = f"""
+        <label>Email
+          <input type="email" name="email" value="{e(email)}" autocomplete="email" required autofocus placeholder="nama@email.com">
+        </label>
+        {ts_widget}
+        <button class="btn btn-primary btn-block" type="submit">{e(submit)}</button>"""
+        links = '<div class="auth-links"><span>Ingat password? <a href="/login">Kembali masuk</a></span></div>'
+    elif mode == "reset":
+        fields = f"""
+        <input type="hidden" name="token" value="{e(reset_token)}">
+        <label>Password baru
+          <span class="pass-wrap"><input type="password" name="password" minlength="8" autocomplete="new-password" required autofocus placeholder="Minimal 8 karakter"><button type="button" class="pass-toggle" data-toggle-pass aria-label="Tampilkan password">Lihat</button></span>
+        </label>
+        <label>Ulangi password baru
+          <input type="password" name="confirm" minlength="8" autocomplete="new-password" required placeholder="Ketik ulang password">
+        </label>
+        <button class="btn btn-primary btn-block" type="submit">{e(submit)}</button>"""
+        links = '<div class="auth-links"><span>Sudah diubah? <a href="/login">Masuk</a></span></div>'
+    else:  # verify
+        fields = f"""
+        <label>Email
+          <input type="email" name="email" value="{e(email)}" autocomplete="email" required placeholder="nama@email.com">
+        </label>
+        <label>Kode verifikasi 6 digit
+          <input type="text" name="code" inputmode="numeric" pattern="[0-9]{{6}}" maxlength="6" autocomplete="one-time-code" required placeholder="123456" style="letter-spacing:6px;font-family:var(--font-mono);font-size:20px;text-align:center">
+        </label>
+        <button class="btn btn-primary btn-block" type="submit">{e(submit)}</button>
+        <p class="form-note auth-note">Kode dan link verifikasi berlaku 24 jam. Cek email Anda, lalu masukkan kode di atas atau klik link verifikasi.</p>"""
+        links = '<div class="auth-links"><span>Sudah verifikasi? <a href="/login">Masuk</a></span></div>'
+    resend_block = ""
+    if (show_resend and mode == "login") or mode == "verify":
+        resend_block = f"""
+        <div class="auth-divider"><span>atau</span></div>
+        <form method="post" action="/verify/resend" class="resend-form">
+          <input type="hidden" name="_form" value="{e(form_token)}">
+          <input type="hidden" name="email" value="{e(email)}">
+          {ts_widget}
+          <button class="btn btn-ghost btn-block btn-small" type="submit">Kirim ulang email verifikasi</button>
+        </form>"""
+    body = f"""
+<main class="auth-main wrap">
+  <section class="auth-shell">
+    <aside class="auth-visual panel">
+      <a class="auth-brand" href="/"><span class="brand-mark">{logomark()}</span><span class="brand-word">{brand_word_html(b['name'], b['accent'])}</span></a>
+      <div class="eyebrow"><span class="dot"></span> MEMBER AREA</div>
+      <h2>Satu dashboard.<br><em>Semua akun.</em></h2>
+      <p>Pantau akun SSH &amp; Xray, pemakaian kuota, IP login, status mullog, dan riwayat invoice dalam satu tempat.</p>
+      <ul class="auth-benefits">
+        <li><b>Monitoring real-time</b><span>Kuota, IP online, dan status suspend.</span></li>
+        <li><b>Riwayat aman</b><span>Invoice dan config bisa dibuka kembali.</span></li>
+        <li><b>Lebih rapi</b><span>Tidak perlu mencatat link satu per satu.</span></li>
+      </ul>
+      {server_strip_html()}
+    </aside>
+    <div class="auth-card panel">
+      <div class="eyebrow"><span class="dot"></span> {e(eyebrow)}</div>
+      <h1>{e(title)}</h1>
+      <p class="auth-lead">{e(lead)}</p>
+      {err_html}
+      {info_html}
+      <form method="post" action="{'/verify/code' if mode == 'verify' else '/reset-password' if mode == 'reset' else '/forgot-password' if mode == 'forgot' else '/register' if mode == 'register' else '/login'}" class="stack-form auth-form">
+        <input type="hidden" name="_form" value="{e(form_token)}">
+        {fields}
+      </form>
+      {resend_block}
+      {links}
+      <p class="form-note auth-foot">Dengan masuk, Anda setuju memakai layanan secara wajar.</p>
+    </div>
+  </section>
+</main>"""
+    return page_shell("Masuk" if mode == "login" else "Daftar" if mode == "register" else "Akun", body, noindex=True, turnstile=ts_on and mode != "reset")
+
+
+def _dash_nav(active: str) -> str:
+    items = [
+        ("overview", "/dashboard", "Ringkasan", "globe"),
+        ("akun", "/dashboard/akun", "Akun & Monitoring", "terminal"),
+        ("mullog", "/dashboard/mullog", "Cek Mullog", "shield"),
+        ("invoice", "/dashboard/invoice", "Riwayat Invoice", "download"),
+        ("profil", "/dashboard/profil", "Profil & Password", "clock"),
+    ]
+    out = []
+    for key, href, label, ic in items:
+        cls = "dash-nav-link" + (" active" if key == active else "")
+        out.append(f'<a class="{cls}" href="{href}"><span>{icon(ic)}</span>{e(label)}</a>')
+    return "".join(out)
+
+
+def _dash_bottom(active: str) -> str:
+    items = [
+        ("overview", "/dashboard", "Ringkasan", "globe"),
+        ("buat", "/gratis", "Buat", "bolt"),
+        ("akun", "/dashboard/akun", "Akun", "terminal"),
+        ("mullog", "/dashboard/mullog", "Mullog", "shield"),
+        ("invoice", "/dashboard/invoice", "Invoice", "download"),
+        ("profil", "/dashboard/profil", "Profil", "clock"),
+    ]
+    out = []
+    for key, href, label, ic in items:
+        cls = "dash-bottom-link" + (" active" if key == active else "")
+        out.append(f'<a class="{cls}" href="{href}"><span>{icon(ic)}</span><small>{e(label)}</small></a>')
+    return "".join(out)
+
+
+def _dash_alerts(msg: str) -> str:
+    mapping = {
+        "password-ok": ("ok", "Password berhasil diperbarui. Sesi lain sudah dikeluarkan."),
+        "password-wrong": ("error", "Password saat ini salah."),
+        "password-short": ("error", "Password baru minimal 8 karakter."),
+        "password-mismatch": ("error", "Konfirmasi password baru tidak sama."),
+    }
+    if msg in mapping:
+        kind, text = mapping[msg]
+        return f'<div class="notice notice-{kind}">{e(text)}</div>'
+    return ""
+
+
+def render_dashboard_page(session: sqlite3.Row, data: dict, section: str, msg: str = "") -> str:
+    email = session["email"]
+    initial = (email[:1] or "M").upper()
+    accounts = data["accounts"]
+    orders = data["orders"]
+    alerts = _dash_alerts(msg)
+    nav = _dash_nav(section)
+    bottom = _dash_bottom(section)
+    current_user_row = session
+
+    if section == "overview":
+        security_class = "is-ok" if data["security_ok"] else "is-bad"
+        security_text = "Aman" if data["security_ok"] else "Ada akun ter-suspend"
+        security_sub = "Tidak ada pelanggaran mullog aktif." if data["security_ok"] else f"{len(data['suspended'])} akun perlu perhatian."
+        recent = accounts[:4]
+        recent_html = "".join(render_account_card(a) for a in recent) if recent else """
+          <div class="dash-empty">
+            <b>Belum ada akun.</b>
+            <p>Buat akun gratis atau beli paket premium untuk mulai memantau di sini.</p>
+            <div class="dash-empty-actions"><a class="btn btn-primary btn-small" href="/gratis">Buat akun gratis</a><a class="btn btn-ghost btn-small" href="/premium">Beli premium</a></div>
+          </div>"""
+        suspend_html = ""
+        if data["suspended"]:
+            rows = "".join(
+                f"<li><b>{e(a['username'])}</b> — {e(str(a['suspended'].get('count', '-')))} IP, pulih {e(fmt_ts(int(a['suspended'].get('until', 0)), '%d %b %Y · %H:%M WIB'))}</li>"
+                for a in data["suspended"]
+            )
+            suspend_html = f'<div class="notice notice-error"><b>Mullog aktif.</b> Akun berikut sedang dibekukan sementara:<ul class="dash-alert-list">{rows}</ul><a href="/dashboard/mullog">Lihat detail mullog →</a></div>'
+        content = f"""
+        {alerts}
+        <div class="dash-summary">
+          <article class="dash-stat">
+            <span>Total akun aktif</span>
+            <b>{len(data['active'])}</b>
+            <small>{len(data['expired'])} expired · {len(accounts)} total</small>
+          </article>
+          <article class="dash-stat">
+            <span>Pemakaian hari ini</span>
+            <b>{fmt_bytes(data['today_total'])}</b>
+            <small>Total kumulatif {fmt_bytes(data['usage_total'])}</small>
+          </article>
+          <article class="dash-stat {security_class}">
+            <span>Status keamanan</span>
+            <b>{e(security_text)}</b>
+            <small>{e(security_sub)}</small>
+          </article>
+        </div>
+        {suspend_html}
+        <section class="dash-section">
+          <div class="dash-section-head"><div><span class="mini-label">AKUN TERBARU</span><h2>Akun &amp; monitoring</h2></div><a class="btn btn-ghost btn-small" href="/dashboard/akun">Lihat semua</a></div>
+          <div class="acct-list">{recent_html}</div>
+        </section>
+        <section class="dash-section">
+          <div class="dash-section-head"><div><span class="mini-label">AKSES CEPAT</span><h2>Butuh akun baru?</h2></div></div>
+          <div class="dash-quick">
+            <a class="dash-quick-card" href="/gratis"><span>{icon('terminal')}</span><b>Buat akun gratis</b><small>SSH atau Xray, 3–7 hari.</small></a>
+            <a class="dash-quick-card" href="/premium"><span>{icon('bolt')}</span><b>Beli premium</b><small>QRIS GoPay, masa aktif lebih panjang.</small></a>
+            <a class="dash-quick-card" href="/dashboard/invoice"><span>{icon('download')}</span><b>Riwayat invoice</b><small>{len(orders)} transaksi tersimpan.</small></a>
+          </div>
+        </section>"""
+        title, subtitle = "Ringkasan akun", "Pantau semua akun dan status keamanan Anda."
+    elif section == "akun":
+        active = [a for a in accounts if not a["expired"] and a["row_status"] == "active"]
+        expired = [a for a in accounts if a["expired"] or a["row_status"] == "failed"]
+        active_html = "".join(render_account_card(a) for a in active) or """
+          <div class="dash-empty"><b>Belum ada akun aktif.</b><p>Buat akun baru untuk mulai memantau kuota dan IP.</p><div class="dash-empty-actions"><a class="btn btn-primary btn-small" href="/gratis">Buat akun gratis</a><a class="btn btn-ghost btn-small" href="/premium">Beli premium</a></div></div>"""
+        expired_html = "".join(render_account_card(a) for a in expired) or '<div class="dash-empty"><b>Tidak ada akun expired.</b><p>Semua akun Anda masih aktif.</p></div>'
+        content = f"""
+        {alerts}
+        <section class="dash-section">
+          <div class="dash-section-head"><div><span class="mini-label">AKTIF</span><h2>Akun berjalan</h2></div><span class="dash-count">{len(active)} akun</span></div>
+          <div class="acct-list">{active_html}</div>
+        </section>
+        <section class="dash-section">
+          <div class="dash-section-head"><div><span class="mini-label">ARSIP</span><h2>Expired &amp; gagal</h2></div><span class="dash-count">{len(expired)} akun</span></div>
+          <div class="acct-list">{expired_html}</div>
+        </section>"""
+        title, subtitle = "Akun & monitoring", "Kuota, IP login, dan status mullog per akun."
+    elif section == "mullog":
+        active_states = data["suspended"]
+        active_html = ""
+        if active_states:
+            cards = []
+            for a in active_states:
+                st = a["suspended"]
+                cards.append(f"""
+                <article class="mullog-active">
+                  <div class="mullog-active-head"><div><span class="mini-label">SEDANG DIBEKUKAN</span><b>{e(a['username'])}</b><small>{e(_service_label(a['service'], a['protocol']))}</small></div><span class="badge badge-bad">Suspended</span></div>
+                  <div class="mullog-grid">
+                    <div><span>Jam pelanggaran</span><b>{e(fmt_ts(int(st.get('created', 0)), '%d %b %Y · %H:%M WIB'))}</b></div>
+                    <div><span>IP terdeteksi</span><b>{e(str(st.get('count', '-')))} IP</b></div>
+                    <div><span>Batas IP</span><b>{e(str(st.get('limit', '-')))} IP</b></div>
+                    <div><span>Pulih dalam</span><b data-countdown-until="{int(st.get('until', 0))}">{e(fmt_ts(int(st.get('until', 0)), '%d %b %Y · %H:%M WIB'))}</b></div>
+                  </div>
+                  <p class="mullog-note">Akun tidak bisa dipakai sampai timer selesai. Kuota dan config tidak dihapus.</p>
+                </article>""")
+            active_html = "".join(cards)
+        else:
+            active_html = '<div class="dash-empty is-ok"><b>Tidak ada suspend aktif.</b><p>Semua akun Anda dalam status normal. Pelanggaran limit IP akan muncul di sini secara otomatis.</p></div>'
+        history = []
+        for a in accounts:
+            for ev in mullog_history(a["username"], 50):
+                if ev.get("event") == "suspend":
+                    ev["_username"] = a["username"]
+                    ev["_service"] = _service_label(a["service"], a["protocol"])
+                    history.append(ev)
+        history.sort(key=lambda x: int(x.get("ts", 0)), reverse=True)
+        if history:
+            rows = []
+            for ev in history[:80]:
+                restored = ev.get("restored_at")
+                status = '<span class="badge badge-ok">Dipulihkan</span>' if restored else '<span class="badge badge-bad">Aktif / belum pulih</span>'
+                duration = max(1, int((int(ev.get("until", 0)) - int(ev.get("created", ev.get("ts", 0)))) / 60))
+                rows.append(
+                    "<tr>"
+                    f"<td>{e(fmt_ts(int(ev.get('ts', 0)), '%d %b %Y · %H:%M WIB'))}</td>"
+                    f"<td><b>{e(ev.get('_username', '-'))}</b><small>{e(ev.get('_service', '-'))}</small></td>"
+                    f"<td>{e(str(ev.get('count', '-')))} / {e(str(ev.get('limit', '-')))} IP</td>"
+                    f"<td>{duration} menit</td>"
+                    f"<td>{status}</td>"
+                    "</tr>"
+                )
+            history_html = f'<div class="dash-table-wrap"><table class="dash-table"><thead><tr><th>Waktu</th><th>Akun</th><th>IP</th><th>Durasi</th><th>Status</th></tr></thead><tbody>{"".join(rows)}</tbody></table></div>'
+        else:
+            history_html = '<div class="dash-empty"><b>Belum ada riwayat mullog.</b><p>Riwayat dicatat otomatis saat akun terkena suspend limit IP.</p></div>'
+        content = f"""
+        {alerts}
+        <section class="dash-section">
+          <div class="dash-section-head"><div><span class="mini-label">STATUS SAAT INI</span><h2>Mullog aktif</h2></div><span class="dash-count">{len(active_states)} akun</span></div>
+          <div class="mullog-list">{active_html}</div>
+        </section>
+        <section class="dash-section">
+          <div class="dash-section-head"><div><span class="mini-label">RIWAYAT</span><h2>Histori pelanggaran</h2></div></div>
+          {history_html}
+        </section>"""
+        title, subtitle = "Cek mullog", "Status suspend sementara dan riwayat pelanggaran limit IP."
+    elif section == "invoice":
+        status_map = {
+            "PENDING": ("badge-warn", "Pending"),
+            "PAID": ("badge-warn", "Paid"),
+            "PROVISIONING": ("badge-warn", "Diproses"),
+            "COMPLETED": ("badge-ok", "Selesai"),
+            "FAILED": ("badge-bad", "Gagal"),
+            "EXPIRED": ("badge-muted", "Expired"),
+        }
+        cards = []
+        for row in orders:
+            cls, text = status_map.get(row["status"], ("badge-muted", row["status"]))
+            label = _service_label("ssh" if row["protocol"] == "ssh" else "xray", "" if row["protocol"] == "ssh" else row["protocol"])
+            actions = f'<a class="btn btn-small btn-ghost" href="/invoice/{e(row["invoice"])}">Buka invoice</a>'
+            if row["status"] == "COMPLETED":
+                actions += f'<a class="btn btn-small btn-dark" href="/invoice/{e(row["invoice"])}.txt" download>{icon("download")} Unduh .txt</a>'
+            cards.append(f"""
+            <article class="invoice-card">
+              <div class="invoice-card-top"><div><span class="mini-label">{e(row['invoice'])}</span><b>{e(label)} · {int(row['days'])} hari</b></div><span class="badge {cls}">{text}</span></div>
+              <div class="invoice-card-meta"><span>Total <b>{rupiah(row['total'])}</b></span><span>Dibuat {e(fmt_ts(row['created_at'], '%d %b %Y · %H:%M WIB'))}</span></div>
+              <div class="invoice-card-actions">{actions}</div>
+            </article>""")
+        invoice_html = "".join(cards) or """
+          <div class="dash-empty"><b>Belum ada invoice.</b><p>Pembelian premium akan muncul di sini beserta status dan file akunnya.</p><div class="dash-empty-actions"><a class="btn btn-primary btn-small" href="/premium">Beli premium</a></div></div>"""
+        content = f"""
+        {alerts}
+        <section class="dash-section">
+          <div class="dash-section-head"><div><span class="mini-label">TRANSAKSI</span><h2>Riwayat pembelian</h2></div><span class="dash-count">{len(orders)} invoice</span></div>
+          <div class="invoice-list">{invoice_html}</div>
+        </section>
+        <div class="dash-note">Invoice lama yang dibuat sebelum fitur akun tetap bisa dibuka lewat <a href="/cek-invoice">Cek Invoice</a> dengan kodenya.</div>"""
+        title, subtitle = "Riwayat invoice", "Semua transaksi premium dan file akun tersimpan di sini."
+    else:
+        user_created = fmt_ts(session["user_created_at"], "%d %b %Y")
+        last_login = fmt_ts(session["last_login_at"], "%d %b %Y · %H:%M WIB") if session["last_login_at"] else "Baru pertama masuk"
+        verified = fmt_ts(session["verified_at"], "%d %b %Y · %H:%M WIB") if session["verified_at"] else "-"
+        content = f"""
+        {alerts}
+        <section class="dash-section">
+          <div class="dash-section-head"><div><span class="mini-label">PROFIL</span><h2>Data akun</h2></div><span class="badge badge-ok">Terverifikasi</span></div>
+          <div class="dash-profile-grid">
+            <div class="dash-profile-card"><span>Email</span><b>{e(email)}</b><small>Dipakai untuk login dan verifikasi.</small></div>
+            <div class="dash-profile-card"><span>Bergabung</span><b>{e(user_created)}</b><small>Verifikasi: {e(verified)}</small></div>
+            <div class="dash-profile-card"><span>Login terakhir</span><b>{e(last_login)}</b><small>Dari IP {e(session['ip'] or '-')}</small></div>
+          </div>
+        </section>
+        <section class="dash-section">
+          <div class="dash-section-head"><div><span class="mini-label">KEAMANAN</span><h2>Ganti password</h2></div></div>
+          <div class="dash-panel panel">
+            <form method="post" action="/dashboard/password" class="stack-form">
+              <input type="hidden" name="_csrf" value="{e(session['csrf'])}">
+              <label>Password saat ini
+                <input type="password" name="current" autocomplete="current-password" required>
+              </label>
+              <label>Password baru
+                <input type="password" name="new" minlength="8" autocomplete="new-password" required placeholder="Minimal 8 karakter">
+              </label>
+              <label>Ulangi password baru
+                <input type="password" name="confirm" minlength="8" autocomplete="new-password" required>
+              </label>
+              <button class="btn btn-primary" type="submit">Simpan password</button>
+            </form>
+          </div>
+        </section>
+        <section class="dash-section">
+          <div class="dash-section-head"><div><span class="mini-label">SESI</span><h2>Keluar dari perangkat lain</h2></div></div>
+          <div class="dash-panel panel dash-danger">
+            <p>Jika Anda merasa ada perangkat lain yang masih login, keluarkan semua sesi. Anda akan diminta login ulang.</p>
+            <form method="post" action="/dashboard/logout-all" data-confirm="Keluar dari semua perangkat?">
+              <input type="hidden" name="_csrf" value="{e(session['csrf'])}">
+              <button class="btn btn-danger" type="submit">Keluar dari semua perangkat</button>
+            </form>
+          </div>
+        </section>"""
+        title, subtitle = "Profil & password", "Kelola data akun dan keamanan login Anda."
+
+    body = f"""
+<main class="dash-main wrap">
+  <div class="dash-layout">
+    <aside class="dash-side panel">
+      <div class="dash-user">
+        <span class="dash-avatar">{e(initial)}</span>
+        <div><b>{e(email)}</b><small>Member {e(branding()['name'])}</small></div>
+      </div>
+      <nav class="dash-nav" aria-label="Menu dashboard">{nav}</nav>
+      <div class="dash-side-cta">
+        <a class="btn btn-primary btn-small btn-block" href="/gratis">Buat akun</a>
+        <a class="btn btn-ghost btn-small btn-block" href="/premium">Beli premium</a>
+      </div>
+      <form method="post" action="/logout" class="dash-logout">
+        <input type="hidden" name="_csrf" value="{e(current_user_row['csrf'])}">
+        <button class="dash-logout-btn" type="submit">Keluar</button>
+      </form>
+    </aside>
+    <div class="dash-content">
+      <header class="dash-head">
+        <div>
+          <div class="eyebrow"><span class="dot"></span> DASHBOARD MEMBER</div>
+          <h1>{e(title)}</h1>
+          <p>{e(subtitle)}</p>
+        </div>
+        <div class="dash-head-actions">
+          <a class="btn btn-ghost btn-small" href="/dashboard/akun">Monitoring</a>
+          <a class="btn btn-primary btn-small" href="/gratis">Buat akun</a>
+        </div>
+      </header>
+      {content}
+    </div>
+  </div>
+  <nav class="dash-bottom" aria-label="Menu dashboard mobile">{bottom}</nav>
+</main>"""
+    return page_shell(title, body, noindex=True)
 
 
 def render_result(row: sqlite3.Row) -> str:
@@ -3703,6 +5873,7 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
             (q, like, like, like),
         ).fetchall()
         recent_audit = conn.execute("SELECT * FROM audit ORDER BY id DESC LIMIT 10").fetchall()
+        users = conn.execute("SELECT * FROM users ORDER BY id DESC LIMIT 50").fetchall()
     finally:
         conn.close()
 
@@ -3727,6 +5898,13 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
         "server": ("ok", "Info server disimpan dan tampil di halaman free & premium."),
         "serverdetect": ("ok", "Lokasi server berhasil dideteksi otomatis dari IP VPS."),
         "serverfail": ("error", "Gagal mendeteksi lokasi server. Isi kode negara manual atau coba lagi."),
+        "userverified": ("ok", "User berhasil diverifikasi manual dan sekarang bisa login."),
+        "userverifyfail": ("error", "User tidak ditemukan."),
+        "mail": ("ok", "Pengaturan email disimpan."),
+        "mailfail": ("error", "Email pengirim tidak valid."),
+        "mailkeybad": ("error", "API key Brevo harus diawali xkeysib- (bukan xsmtpsib- / SMTP key)."),
+        "mailtestok": ("ok", "Email percobaan berhasil dikirim. Cek inbox/spam."),
+        "mailtestfail": ("error", "Email percobaan gagal. Periksa API key, sender terverifikasi, dan log server."),
     }
     notice = ""
     if msg in messages:
@@ -3820,6 +5998,48 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
         f"<li><span>{e(fmt_ts(a['at'], '%d %b %H:%M'))}</span><b>{e(a['action'])}</b><small>{e(a['detail'])}</small></li>"
         for a in recent_audit
     ) or "<li class='empty'>Belum ada aktivitas.</li>"
+
+    user_rows = ""
+    for u in users:
+        is_active = u["status"] == "active"
+        badge = '<span class="badge badge-ok">Terverifikasi</span>' if is_active else '<span class="badge badge-warn">Pending</span>'
+        last = fmt_ts(u["last_login_at"], "%d %b %H:%M") if u["last_login_at"] else "-"
+        action = "-"
+        if not is_active:
+            action = (
+                f'<form method="post" action="/admin/user/verify" class="inline-form">'
+                f'<input type="hidden" name="_csrf" value="{e(session["csrf"])}">'
+                f'<input type="hidden" name="user_id" value="{int(u["id"])}">'
+                f'<button class="btn btn-tiny btn-ghost" type="submit">Verifikasi</button></form>'
+            )
+        user_rows += (
+            f"<tr><td><b>{e(u['email'])}</b><small>{e(fmt_ts(u['created_at'], '%d %b %Y'))}</small></td>"
+            f"<td>{badge}</td><td>{e(last)}</td><td>{action}</td></tr>"
+        )
+    if not user_rows:
+        user_rows = '<tr><td colspan="4" class="empty">Belum ada user terdaftar.</td></tr>'
+
+    mail_ok, mail_msg = mail_ready()
+    mail_cfg = mail_config()
+    api_active = str(mail_cfg.get("api_key", "")).startswith("xkeysib-")
+    smtp_active = str(mail_cfg.get("smtp_key", "")).startswith("xsmtpsib-") and bool(mail_cfg.get("smtp_user"))
+    mail_method = "Brevo API (xkeysib-)" if api_active else ("SMTP Brevo (xsmtpsib-)" if smtp_active else "Belum aktif")
+    mail_backup = "SMTP siap (port 2525)" if smtp_active else "SMTP belum siap"
+    mail_status = f"""
+    <div class="mail-status-grid">
+      <div><span>METODE AKTIF</span><b>{e(mail_method)}</b><small>Dipakai lebih dulu untuk kirim email.</small></div>
+      <div><span>CADANGAN</span><b>{e(mail_backup)}</b><small>Otomatis dipakai kalau API gagal.</small></div>
+      <div><span>PENGIRIM</span><b>{e(mail_cfg.get('from_name', BRAND))}</b><small>{e(mail_cfg.get('from_email', '-'))}</small></div>
+    </div>"""
+    mail_notice = ""
+    if not mail_ok:
+        mail_notice = (
+            '<div class="notice notice-warn compact-notice">'
+            f'<b>Email verifikasi belum aktif.</b> {e(mail_msg)} '
+            "Isi konfigurasi di panel <b>Email Verifikasi</b> di atas (API key xkeysib- atau SMTP Login + SMTP key xsmtpsib-), "
+            "lalu klik <b>Test kirim</b>. Sementara itu, verifikasi user manual lewat tombol di bawah."
+            "</div>"
+        )
 
     gopay_ok = gstat["token"] and gstat["static_qr"]
     gopay_badge = '<span class="badge badge-ok">Siap</span>' if gopay_ok else '<span class="badge badge-bad">Belum siap</span>'
@@ -3949,6 +6169,40 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
         </fieldset>
       </div>
       <div class="form-actions"><button class="btn btn-primary btn-small" type="submit" name="action" value="save">Simpan info server</button></div>
+    </form>
+  </section>
+
+  <section class="panel admin-panel server-panel">
+    <div class="panel-head"><div><span class="mini-label">EMAIL VERIFIKASI</span><h2>Pengirim &amp; subjek</h2></div><span class="badge {'badge-ok' if mail_ok else 'badge-warn'}">{'Siap' if mail_ok else 'Belum siap'}</span></div>
+    {mail_status}
+    <form method="post" action="/admin/mail" class="server-form">
+      <input type="hidden" name="_csrf" value="{e(session['csrf'])}">
+      <div class="settings-grid">
+        <fieldset>
+          <legend>Nama &amp; pengirim</legend>
+          <label>Nama pengirim<input type="text" name="mail_from_name" value="{e(settings.get('mail_from_name', BRAND))}" maxlength="60" placeholder="HITS SSH"></label>
+          <label>Email pengirim<input type="email" name="mail_from_email" value="{e(settings.get('mail_from_email', 'oceantestdigital@gmail.com'))}" maxlength="190"></label>
+          <label>API key Brevo (xkeysib-)<input type="password" name="mail_api_key" autocomplete="off" placeholder="xkeysib-... (kosongkan = key lama tetap dipakai)"><small><b>Ini key utama yang aktif.</b> Kosongkan jika tidak ingin mengganti.</small></label>
+          <label>SMTP Login Brevo<input type="text" name="mail_smtp_user" value="{e(settings.get('mail_smtp_user', ''))}" maxlength="190" placeholder="Login yang tampil di halaman SMTP Brevo"><small>Opsional / cadangan. Bukan email pengirim.</small></label>
+          <label>SMTP key Brevo (xsmtpsib-)<input type="password" name="mail_smtp_key" autocomplete="off" placeholder="xsmtpsib-... (kosongkan = key lama tetap dipakai)"><small>Cadangan otomatis jika API gagal. Port 2525.</small></label>
+          <div class="settings-grid two">
+            <label>SMTP host<input type="text" name="mail_smtp_host" value="{e(settings.get('mail_smtp_host', 'smtp-relay.brevo.com'))}" maxlength="190"></label>
+            <label>SMTP port<input type="number" name="mail_smtp_port" min="1" max="65535" value="{e(settings.get('mail_smtp_port', '2525'))}"></label>
+          </div>
+          <p class="panel-hint">{e(mail_msg) if not mail_ok else 'Email API siap dipakai.'}</p>
+        </fieldset>
+        <fieldset>
+          <legend>Subjek email</legend>
+          <label>Subjek verifikasi<input type="text" name="mail_verify_subject" value="{e(settings.get('mail_verify_subject', 'Kode Verifikasi Anda'))}" maxlength="120" placeholder="Kode Verifikasi Anda"></label>
+          <label>Subjek reset password<input type="text" name="mail_reset_subject" value="{e(settings.get('mail_reset_subject', 'Reset Password — HITS SSH'))}" maxlength="120"></label>
+          <p class="panel-hint">Contoh format yang tampil di inbox:<br><b>{e(settings.get('mail_from_name', BRAND))}</b> · <b>{e(settings.get('mail_verify_subject', 'Kode Verifikasi Anda'))}</b></p>
+          <p class="panel-hint">Email pengirim harus terverifikasi di Brevo (menu Senders).</p>
+        </fieldset>
+      </div>
+      <div class="form-actions">
+        <button class="btn btn-primary btn-small" type="submit" name="action" value="save">Simpan pengaturan email</button>
+        <button class="btn btn-ghost btn-small" type="submit" name="action" value="test">Test kirim ke email pengirim</button>
+      </div>
     </form>
   </section>
 
@@ -4089,6 +6343,17 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
     </div>
   </section>
 
+  <section class="panel admin-panel accounts-panel">
+    <div class="panel-head"><div><span class="mini-label">USER TERDAFTAR</span><h2>Akun member</h2></div><span class="panel-hint">Verifikasi manual jika email tidak terkirim.</span></div>
+    {mail_notice}
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Email</th><th>Status</th><th>Login terakhir</th><th></th></tr></thead>
+        <tbody>{user_rows}</tbody>
+      </table>
+    </div>
+  </section>
+
   <section class="panel admin-panel">
     <div class="panel-head"><div><span class="mini-label">AUDIT</span><h2>Aktivitas terakhir</h2></div></div>
     <ul class="audit-list">{audit_rows}</ul>
@@ -4105,7 +6370,7 @@ def render_check_invoice(form_token: str, error: str = "", code: str = "") -> st
   <div class="invoice-head check-head">
     <div class="eyebrow"><span class="dot"></span> CEK INVOICE / RIWAYAT</div>
     <h1>Buka lagi<br>pesanan Anda.</h1>
-    <p class="page-hero-lead">Masukkan kode invoice yang tampil setelah pembelian. Tidak perlu login, tidak perlu email.</p>
+    <p class="page-hero-lead">Masukkan kode invoice. Invoice baru tersimpan di dashboard member; invoice lama tetap bisa dibuka dengan kodenya.</p>
   </div>
   <div class="check-layout">
     <div class="panel check-page-card">
@@ -4204,7 +6469,7 @@ def render_invoice(row: sqlite3.Row, new: bool = False) -> str:
 <dialog class="invoice-dialog" id="invoice-dialog">
   <div class="dialog-icon">{icon('shield')}</div>
   <h2>Salin kode invoice sekarang.</h2>
-  <p>Kode ini satu-satunya cara membuka kembali pesanan tanpa login. Jangan tutup halaman sebelum menyimpannya.</p>
+  <p>Kode ini juga tersimpan di dashboard member. Jangan tutup halaman sebelum menyimpannya.</p>
   <div class="dialog-code"><code>{e(row['invoice'])}</code><button type="button" class="btn btn-small btn-dark" data-copy="{e(row['invoice'])}">Salin</button></div>
   <div class="dialog-warning">Saya sudah menyalin kode invoice</div>
   <button type="button" class="btn btn-primary btn-block" id="invoice-dialog-close">Saya sudah menyimpan</button>
@@ -4312,6 +6577,11 @@ def main() -> int:
         return 0
 
     threading.Thread(target=payment_daemon, name="gopay-poller", daemon=True).start()
+    try:
+        usage_snapshot_once()
+    except Exception:
+        logger.warning("snapshot awal usage gagal: %s", traceback.format_exc())
+    threading.Thread(target=usage_snapshot_loop, name="usage-snapshot", daemon=True).start()
 
     if not Path(SSH_SCRIPT).exists():
         logger.warning("script %s tidak ditemukan", SSH_SCRIPT)

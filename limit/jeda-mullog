@@ -28,6 +28,7 @@ import urllib.request
 CONF = "/etc/kyt/jeda-mullog.conf"
 STATE_DIR = "/etc/kyt/jeda-mullog/state"
 RESTORED_DIR = "/etc/kyt/jeda-mullog/restored"
+HISTORY_FILE = "/etc/kyt/jeda-mullog/history.jsonl"
 LOCK_FILE = "/run/jeda-mullog.lock"
 XRAY_CFG = "/etc/xray/config.json"
 NOLOGIN = "/usr/sbin/nologin" if os.path.exists("/usr/sbin/nologin") else "/bin/false"
@@ -214,6 +215,19 @@ def last_restore(kind, user, proto=None):
         return 0
 
 
+def append_history(event, **fields):
+    """Simpan riwayat mullog untuk dashboard user. Tidak boleh menggagalkan suspend."""
+    try:
+        obj = {"event": event, "ts": int(time.time())}
+        obj.update(fields)
+        os.makedirs(os.path.dirname(HISTORY_FILE), mode=0o700, exist_ok=True)
+        with open(HISTORY_FILE, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(obj, ensure_ascii=False, separators=(",", ":")) + "\n")
+        os.chmod(HISTORY_FILE, 0o600)
+    except Exception as exc:
+        log("gagal menulis history mullog: %s" % exc)
+
+
 def atomic_write(path, lines, mode=None):
     directory = os.path.dirname(path) or "."
     os.makedirs(directory, exist_ok=True)
@@ -329,6 +343,11 @@ def suspend_ssh(user, limit=None, count=None):
     run([pkill, "-KILL", "-u", user])
     log("suspend SSH %s sampai %s (%s menit)" % (
         user, time.strftime("%H:%M:%S", time.localtime(state["until"])), minutes))
+    append_history(
+        "suspend", kind="ssh", user=user, proto="",
+        limit=limit, count=count,
+        created=int(state["created"]), until=int(state["until"]),
+    )
     if notifications_enabled(notify):
         notify_suspend("ssh", user, None, limit, count, minutes, state["until"])
     return 0
@@ -476,6 +495,11 @@ def suspend_xray(proto, user, limit=None, count=None):
     run(["systemctl", "restart", "xray"])
     log("suspend XRAY %s/%s sampai %s (%s menit)" % (
         proto, user, time.strftime("%H:%M:%S", time.localtime(state["until"])), minutes))
+    append_history(
+        "suspend", kind="xray", user=user, proto=proto,
+        limit=limit, count=count,
+        created=int(state["created"]), until=int(state["until"]),
+    )
     if notifications_enabled(notify):
         notify_suspend("xray", user, proto, limit, count, minutes, state["until"])
     return 0
@@ -571,6 +595,11 @@ def restore_all(only_due=False):
                 restore_ssh(state)
                 mark_restored("ssh", state.get("user", ""))
                 os.unlink(path)
+                append_history(
+                    "restore", kind="ssh", user=state.get("user", ""), proto="",
+                    created=int(state.get("created", 0) or 0),
+                    until=int(state.get("until", 0) or 0),
+                )
                 if only_due and notifications_enabled(notify):
                     notify_restore("ssh", state.get("user", ""), None)
             elif state.get("kind") == "xray":
@@ -580,6 +609,11 @@ def restore_all(only_due=False):
                 if ok:
                     mark_restored("xray", state.get("user", ""), state.get("proto"))
                     os.unlink(path)
+                    append_history(
+                        "restore", kind="xray", user=state.get("user", ""), proto=state.get("proto", ""),
+                        created=int(state.get("created", 0) or 0),
+                        until=int(state.get("until", 0) or 0),
+                    )
                     if only_due and notifications_enabled(notify):
                         notify_restore("xray", state.get("user", ""), state.get("proto"))
                 else:

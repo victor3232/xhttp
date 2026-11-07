@@ -227,6 +227,8 @@ fi
 
 # ---------- salin ----------
 echo -e "       -> menyalin data..."
+# Hentikan web agar web.db tidak berubah saat ditimpa.
+systemctl stop kyt-web >/dev/null 2>&1 || true
 DIPULIHKAN=0
 
 salin() {

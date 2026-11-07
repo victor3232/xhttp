@@ -657,4 +657,73 @@
       }
     });
   });
+
+  /* Dashboard: copy config / link and toggle output */
+  document.addEventListener("click", function (event) {
+    var targetButton = event.target.closest ? event.target.closest("[data-copy-target]") : null;
+    if (targetButton) {
+      var target = document.getElementById(targetButton.getAttribute("data-copy-target") || "");
+      if (!target) return;
+      copyText(target.textContent || "").then(function (ok) {
+        var old = targetButton.textContent;
+        targetButton.textContent = ok ? "Tersalin ✓" : "Gagal salin";
+        window.setTimeout(function () { targetButton.textContent = old; }, 1800);
+      });
+      return;
+    }
+    var textButton = event.target.closest ? event.target.closest("[data-copy-text]") : null;
+    if (textButton) {
+      copyText(textButton.getAttribute("data-copy-text") || "").then(function (ok) {
+        var old = textButton.textContent;
+        textButton.textContent = ok ? "Tersalin ✓" : "Gagal salin";
+        window.setTimeout(function () { textButton.textContent = old; }, 1800);
+      });
+      return;
+    }
+    var toggle = event.target.closest ? event.target.closest("[data-output-toggle]") : null;
+    if (toggle) {
+      var output = document.getElementById(toggle.getAttribute("data-output-toggle") || "");
+      if (!output) return;
+      var isHidden = output.hasAttribute("hidden");
+      if (isHidden) output.removeAttribute("hidden"); else output.setAttribute("hidden", "hidden");
+      toggle.textContent = isHidden ? "Sembunyikan config" : "Lihat config";
+    }
+  });
+
+  /* Auth: show/hide password */
+  $$("[data-toggle-pass]").forEach(function (button) {
+    button.addEventListener("click", function () {
+      var wrap = button.closest(".pass-wrap");
+      var input = wrap ? wrap.querySelector("input") : null;
+      if (!input) return;
+      var show = input.type === "password";
+      input.type = show ? "text" : "password";
+      button.textContent = show ? "Sembunyi" : "Lihat";
+    });
+  });
+
+  /* Dashboard: mullog countdown */
+  var countdowns = $$("[data-countdown-until]");
+  if (countdowns.length) {
+    var paintCountdowns = function () {
+      var now = Math.floor(Date.now() / 1000);
+      countdowns.forEach(function (node) {
+        var until = parseInt(node.getAttribute("data-countdown-until") || "0", 10);
+        if (!until) return;
+        var left = until - now;
+        if (left <= 0) {
+          node.textContent = "Sudah bisa digunakan";
+          node.classList.add("is-done");
+          return;
+        }
+        var h = Math.floor(left / 3600);
+        var m = Math.floor((left % 3600) / 60);
+        var s = left % 60;
+        var pad = function (n) { return n < 10 ? "0" + n : String(n); };
+        node.textContent = "Pulih dalam " + pad(h) + ":" + pad(m) + ":" + pad(s);
+      });
+    };
+    paintCountdowns();
+    window.setInterval(paintCountdowns, 1000);
+  }
 })();
