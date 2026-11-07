@@ -6187,7 +6187,7 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
 <meta name="theme-color" content="{UI_THEME_COLORS.get(b['theme'], '#fffaf2')}">
 {robots}
 {favicon}
-<link rel="stylesheet" href="/static/style.css?v=20261107popup2">
+<link rel="stylesheet" href="/static/style.css?v=20261107hero1">
 {turnstile_script}
 </head>
 <body>
@@ -6195,7 +6195,7 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
 {body}
 {footer}
 {popup_html}
-<script src="/static/app.js?v=20261107popup2" defer></script>
+<script src="/static/app.js?v=20261107hero1" defer></script>
 </body>
 </html>"""
 
@@ -6423,10 +6423,11 @@ def render_home(form_token: str, settings: dict[str, str]) -> str:
       <div class="eyebrow"><span class="dot"></span> FREE &amp; PREMIUM · MEMBER AREA</div>
       <h1>{e(hero_title)}<br><em>{e(hero_title_accent)}</em></h1>
       <p class="hero-lead">{e(hero_lead)}</p>
-      <div class="hero-actions">
-        <a class="btn btn-primary" href="/gratis">Buat akun gratis <span aria-hidden="true">↘</span></a>
-        <a class="btn btn-ghost" href="/premium">Beli akun premium</a>
-      </div>
+      <a class="hero-scroll" href="#layanan">
+        <span class="hero-scroll-line" aria-hidden="true"></span>
+        <span>Lihat layanan</span>
+        <span class="hero-scroll-arrow" aria-hidden="true">↓</span>
+      </a>
       <div class="hero-stats">
         <div><strong>{total_slots}</strong><span>slot gratis / hari</span></div>
         <div><strong>{premium_price}</strong><span>mulai premium</span></div>
