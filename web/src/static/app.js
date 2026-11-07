@@ -873,3 +873,44 @@
     }
   }, false);
 })();
+
+/* Popup informasi: tampil sekali per versi, bisa ditutup. */
+(function () {
+  var popup = document.getElementById("info-popup");
+  if (!popup) return;
+  var version = popup.getAttribute("data-popup-version") || "1";
+  var mode = popup.getAttribute("data-popup-mode") || "once";
+  var key = "hits_info_popup_" + version;
+  var storage = null;
+  try { storage = window.localStorage; } catch (e) { storage = null; }
+
+  function alreadyDismissed() {
+    if (!storage || mode === "always") return false;
+    try { return storage.getItem(key) === "1"; } catch (e) { return false; }
+  }
+  if (alreadyDismissed()) return;
+
+  var lastFocus = document.activeElement;
+  function closePopup() {
+    popup.hidden = true;
+    if (storage) {
+      try { storage.setItem(key, "1"); } catch (e) {}
+    }
+    if (lastFocus && typeof lastFocus.focus === "function") {
+      try { lastFocus.focus({ preventScroll: true }); } catch (e) { lastFocus.focus(); }
+    }
+  }
+
+  Array.prototype.forEach.call(
+    popup.querySelectorAll("[data-popup-close]"),
+    function (button) { button.addEventListener("click", closePopup); }
+  );
+  document.addEventListener("keydown", function (event) {
+    if (event.key === "Escape" && !popup.hidden) closePopup();
+  });
+  popup.hidden = false;
+  var closeButton = popup.querySelector(".info-popup-close");
+  if (closeButton) {
+    try { closeButton.focus({ preventScroll: true }); } catch (e) { closeButton.focus(); }
+  }
+})();

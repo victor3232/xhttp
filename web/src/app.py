@@ -342,6 +342,13 @@ DEFAULTS = {
     "payg_xray_ip_limit": "2",
     "payg_xray_quota_gb": "0",
     "payg_idle_minutes": "15",
+    "popup_enabled": "0",
+    "popup_title": "Informasi Penting",
+    "popup_message": "",
+    "popup_button_text": "",
+    "popup_button_url": "",
+    "popup_mode": "once",
+    "popup_version": "1",
 }
 
 INT_SETTINGS = {
@@ -750,6 +757,66 @@ def branding() -> dict[str, str]:
         "logo": (settings.get("brand_logo") or "").strip(),
         "logo_version": (settings.get("brand_logo_version") or "").strip(),
     }
+
+
+def popup_config(settings: dict[str, str] | None = None) -> dict[str, str] | None:
+    """Ambil isi popup informasi. None berarti popup tidak ditampilkan."""
+    try:
+        settings = settings or get_settings()
+    except Exception:
+        return None
+    if settings.get("popup_enabled", "0") != "1":
+        return None
+    title = (settings.get("popup_title") or "Informasi Penting").strip()[:80]
+    message = (settings.get("popup_message") or "").strip()
+    if not message:
+        return None
+    button_text = (settings.get("popup_button_text") or "").strip()[:40]
+    button_url = (settings.get("popup_button_url") or "").strip()[:500]
+    if button_url and not (
+        (button_url.startswith("/") and not button_url.startswith("//"))
+        or button_url.startswith("https://")
+        or button_url.startswith("http://")
+    ):
+        button_url = ""
+    mode = (settings.get("popup_mode") or "once").strip()
+    if mode not in ("once", "always"):
+        mode = "once"
+    version = (settings.get("popup_version") or "1").strip()[:24] or "1"
+    return {
+        "title": title,
+        "message": message[:2000],
+        "button_text": button_text,
+        "button_url": button_url,
+        "mode": mode,
+        "version": version,
+    }
+
+
+def render_popup(settings: dict[str, str] | None = None) -> str:
+    cfg = popup_config(settings)
+    if not cfg:
+        return ""
+    button = ""
+    if cfg["button_text"] and cfg["button_url"]:
+        target = ' target="_blank" rel="noopener"' if cfg["button_url"].startswith("http") else ""
+        button = (
+            f'<a class="info-popup-cta" href="{e(cfg["button_url"])}"{target}>'
+            f'{e(cfg["button_text"])}</a>'
+        )
+    return f"""
+<div class="info-popup" id="info-popup" hidden data-popup-version="{e(cfg['version'])}" data-popup-mode="{e(cfg['mode'])}" role="dialog" aria-labelledby="info-popup-title">
+  <div class="info-popup-card">
+    <button class="info-popup-close" type="button" data-popup-close aria-label="Tutup informasi">×</button>
+    <span class="info-popup-kicker">INFORMASI</span>
+    <h2 id="info-popup-title">{e(cfg['title'])}</h2>
+    <p class="info-popup-message">{e(cfg['message'])}</p>
+    <div class="info-popup-actions">
+      {button}
+      <button class="info-popup-dismiss" type="button" data-popup-close>Mengerti</button>
+    </div>
+  </div>
+</div>"""
 
 
 def flag_emoji(code: str) -> str:
@@ -4717,6 +4784,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/admin/settings":
                 self.admin_settings()
                 return
+            if path == "/admin/popup":
+                self.admin_popup()
+                return
             if path == "/admin/delete":
                 self.admin_delete()
                 return
@@ -5652,6 +5722,42 @@ class Handler(BaseHTTPRequestHandler):
         audit("settings", json.dumps(values, sort_keys=True), self.client_ip())
         self.redirect("/admin?msg=settings")
 
+    def admin_popup(self) -> None:
+        body = self.parse_body()
+        session = self.require_admin(body.get("_csrf", ""))
+        if not session:
+            return
+        title = body.get("popup_title", "").strip()[:80] or "Informasi Penting"
+        message = body.get("popup_message", "").strip()[:2000]
+        button_text = body.get("popup_button_text", "").strip()[:40]
+        button_url = body.get("popup_button_url", "").strip()[:500]
+        if button_url and not (
+            (button_url.startswith("/") and not button_url.startswith("//"))
+            or button_url.startswith("https://")
+            or button_url.startswith("http://")
+        ):
+            button_url = ""
+        mode = body.get("popup_mode", "once").strip()
+        if mode not in ("once", "always"):
+            mode = "once"
+        enabled = body.get("popup_enabled") == "1"
+        if enabled and not message:
+            self.redirect("/admin?msg=popupfail")
+            return
+        values = {
+            "popup_enabled": "1" if enabled else "0",
+            "popup_title": title,
+            "popup_message": message,
+            "popup_button_text": button_text,
+            "popup_button_url": button_url,
+            "popup_mode": mode,
+            # Versi baru membuat popup tampil lagi di browser yang sudah menutupnya.
+            "popup_version": str(int(time.time() * 1000)),
+        }
+        set_settings(values)
+        audit("popup", f"enabled={values['popup_enabled']} mode={mode}", self.client_ip())
+        self.redirect("/admin?msg=popup")
+
     def admin_branding(self) -> None:
         body = self.parse_body()
         session = self.require_admin(body.get("_csrf", ""))
@@ -5965,6 +6071,7 @@ def favicon_svg() -> str:
 
 def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False, active: str = "", turnstile: bool = False) -> str:
     b = branding()
+    popup_html = "" if admin else render_popup()
     cu = current_user()
     brand_name = b["name"]
     brand_html = brand_word_html(brand_name, b["accent"])
@@ -6080,14 +6187,15 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
 <meta name="theme-color" content="{UI_THEME_COLORS.get(b['theme'], '#fffaf2')}">
 {robots}
 {favicon}
-<link rel="stylesheet" href="/static/style.css?v=20261107payg5">
+<link rel="stylesheet" href="/static/style.css?v=20261107popup1">
 {turnstile_script}
 </head>
 <body>
 {header}
 {body}
 {footer}
-<script src="/static/app.js?v=20261107payg5" defer></script>
+{popup_html}
+<script src="/static/app.js?v=20261107popup1" defer></script>
 </body>
 </html>"""
 
@@ -7723,6 +7831,8 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
 
     messages = {
         "settings": ("ok", "Pengaturan disimpan."),
+        "popup": ("ok", "Popup informasi disimpan dan langsung aktif sesuai pengaturan."),
+        "popupfail": ("error", "Popup belum bisa diaktifkan karena isi pesan masih kosong."),
         "deleted": ("ok", "Akun website berhasil dihapus."),
         "notfound": ("error", "Akun tidak ditemukan atau sudah dihapus."),
         "deletefail": ("error", "Akun gagal dihapus. Cek log server."),
@@ -8068,6 +8178,37 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
         </fieldset>
       </div>
       <div class="form-actions"><button class="btn btn-primary btn-small" type="submit" name="action" value="save">Simpan info server</button></div>
+    </form>
+  </section>
+
+  <section class="panel admin-panel popup-admin-panel">
+    <div class="panel-head"><div><span class="mini-label">POPUP INFORMASI</span><h2>Pesan penting untuk pengunjung</h2></div><span class="badge {'badge-ok' if settings.get('popup_enabled', '0') == '1' and settings.get('popup_message', '').strip() else 'badge-muted'}">{'Aktif' if settings.get('popup_enabled', '0') == '1' and settings.get('popup_message', '').strip() else 'Nonaktif'}</span></div>
+    <form method="post" action="/admin/popup" class="server-form">
+      <input type="hidden" name="_csrf" value="{e(session['csrf'])}">
+      <div class="settings-grid">
+        <fieldset>
+          <legend>Isi popup</legend>
+          <label>Judul<input type="text" name="popup_title" value="{e(settings.get('popup_title', 'Informasi Penting'))}" maxlength="80" placeholder="Informasi Penting"></label>
+          <label>Pesan<textarea name="popup_message" rows="5" maxlength="2000" placeholder="Contoh: Server Singapura sedang maintenance. Akun yang sudah ada tetap aman.">{e(settings.get('popup_message', ''))}</textarea><small>Baris baru tetap tampil. Maksimal 2.000 karakter.</small></label>
+          <label>Teks tombol (opsional)<input type="text" name="popup_button_text" value="{e(settings.get('popup_button_text', ''))}" maxlength="40" placeholder="Lihat info"></label>
+          <label>Link tombol (opsional)<input type="text" name="popup_button_url" value="{e(settings.get('popup_button_url', ''))}" maxlength="500" placeholder="/kontak atau https://t.me/..."></label>
+        </fieldset>
+        <fieldset>
+          <legend>Perilaku</legend>
+          <label class="switch"><input type="checkbox" name="popup_enabled" value="1" {'checked' if settings.get('popup_enabled', '0') == '1' else ''}><span>Aktifkan popup informasi</span></label>
+          <label>Tampilkan<select name="popup_mode">
+            <option value="once" {'selected' if settings.get('popup_mode', 'once') == 'once' else ''}>Sekali per browser (sampai isi diubah)</option>
+            <option value="always" {'selected' if settings.get('popup_mode', 'once') == 'always' else ''}>Setiap halaman dibuka</option>
+          </select></label>
+          <p class="panel-hint">Popup muncul kecil di kanan bawah dan bisa ditutup. Menyimpan perubahan menaikkan versi agar browser yang sudah menutup popup melihatnya lagi.</p>
+          <div class="info-popup-preview" aria-hidden="true">
+            <span class="info-popup-kicker">INFORMASI</span>
+            <b>{e(settings.get('popup_title', 'Informasi Penting'))}</b>
+            <p>{e(settings.get('popup_message', '') or 'Belum ada isi popup.')}</p>
+          </div>
+        </fieldset>
+      </div>
+      <div class="form-actions"><button class="btn btn-primary btn-small" type="submit">Simpan popup</button></div>
     </form>
   </section>
 

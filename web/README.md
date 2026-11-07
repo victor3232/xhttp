@@ -60,4 +60,5 @@ Saat ON pertama, `setting-web` meminta domain dengan default
 - Kategori premium multi-durasi: harga, masa aktif, limit IP, dan kuota per paket.
 - Checkout tanpa login, QRIS GoPay, kode unik nominal, invoice privat.
 - Cek invoice, download detail akun `.txt`, dan riwayat transaksi admin.
+- Popup informasi (server/domain/maintenance) yang bisa diatur dan di-ON/OFF-kan dari Dashboard Admin.
 - Login admin memakai token bot Telegram.
