@@ -341,6 +341,7 @@ DEFAULTS = {
     "payg_ssh_quota_gb": "0",
     "payg_xray_ip_limit": "2",
     "payg_xray_quota_gb": "0",
+    "payg_idle_minutes": "15",
 }
 
 INT_SETTINGS = {
@@ -363,6 +364,7 @@ INT_SETTINGS = {
     "payg_ssh_quota_gb": (0, 10000),
     "payg_xray_ip_limit": (0, 100),
     "payg_xray_quota_gb": (0, 10000),
+    "payg_idle_minutes": (1, 1440),
 }
 
 USER_RE = re.compile(r"^[a-z][a-z0-9]{7,14}$")
@@ -637,6 +639,7 @@ def init_db() -> None:
                 started_at INTEGER,
                 stopped_at INTEGER,
                 last_billed_at INTEGER,
+                last_seen_at INTEGER NOT NULL DEFAULT 0,
                 bill_remainder_num INTEGER NOT NULL DEFAULT 0,
                 spent_milli INTEGER NOT NULL DEFAULT 0,
                 total_seconds INTEGER NOT NULL DEFAULT 0,
@@ -652,6 +655,7 @@ def init_db() -> None:
         _ensure_column(conn, "orders", "user_id", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "user_tokens", "code_hash", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "users", "balance_milli", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "payg_accounts", "last_seen_at", "INTEGER NOT NULL DEFAULT 0")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_accounts_user ON accounts(user_id, created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id, created_at)")
         for k, v in DEFAULTS.items():
@@ -1441,6 +1445,70 @@ def xray_live_has_user(protocol: str, username: str) -> bool | None:
         time.sleep(0.6)
     return None
 
+def xray_online_count(username: str) -> int | None:
+    """Jumlah sesi online user di Xray. None = API tidak bisa dipakai."""
+    try:
+        proc = subprocess.run(
+            [XRAY_BIN, "api", "statsonline", "-s", XRAY_API, f"-email={username}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=8,
+        )
+    except Exception:
+        return None
+    if proc.returncode == 0:
+        try:
+            data = json.loads(proc.stdout or "{}")
+            stat = data.get("stat") or {}
+            return max(0, int(stat.get("value") or 0))
+        except Exception:
+            return None
+    if "not found" in (proc.stderr or "").lower():
+        return 0
+    return None
+
+def ssh_active_session_count(username: str) -> int | None:
+    """Jumlah koneksi SSH aktif user saat ini (bukan histori auth.log)."""
+    try:
+        proc = subprocess.run(
+            ["ss", "-tnpH"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=8,
+        )
+    except Exception:
+        return None
+    ports = _ssh_listener_ports()
+    count = 0
+    for line in proc.stdout.splitlines():
+        if "ESTAB" not in line:
+            continue
+        if "sshd" not in line and "dropbear" not in line:
+            continue
+        fields = line.split()
+        if len(fields) < 5:
+            continue
+        local_port = fields[3].rsplit(":", 1)[-1]
+        if ports and local_port not in ports:
+            continue
+        pid_match = re.search(r"pid=(\d+)", line)
+        if not pid_match:
+            continue
+        if _pid_user(int(pid_match.group(1))) == username:
+            count += 1
+    if count == 0:
+        try:
+            who = subprocess.run(
+                ["who"], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=True, timeout=5,
+            ).stdout
+            count = sum(1 for line in who.splitlines() if line.split()[:1] == [username])
+        except Exception:
+            pass
+    return count
+
 def payg_account_is_blocked(service: str, protocol: str, username: str) -> tuple[bool, str]:
     """Cek nyata: akun benar-benar tidak ada di config + Xray live / terkunci di sistem."""
     if service == "ssh":
@@ -1660,8 +1728,8 @@ def payg_start(payg_id: int, user_id: int) -> sqlite3.Row:
     try:
         conn.execute(
             "UPDATE payg_accounts SET state=?, started_at=?, stopped_at=NULL, last_billed_at=?,"
-            " bill_remainder_num=0, last_error='' WHERE id=? AND user_id=?",
-            (PAYG_RUNNING, now, now, int(payg_id), int(user_id)),
+            " last_seen_at=?, bill_remainder_num=0, last_error='' WHERE id=? AND user_id=?",
+            (PAYG_RUNNING, now, now, now, int(payg_id), int(user_id)),
         )
         conn.commit()
     finally:
@@ -1683,7 +1751,7 @@ def payg_stop(payg_id: int, user_id: int) -> sqlite3.Row:
     conn = db_connect()
     try:
         conn.execute(
-            "UPDATE payg_accounts SET state=?, stopped_at=?, last_billed_at=? WHERE id=? AND user_id=?",
+            "UPDATE payg_accounts SET state=?, stopped_at=?, last_billed_at=?, last_seen_at=0 WHERE id=? AND user_id=?",
             (new_state, int(time.time()), int(time.time()), int(payg_id), int(user_id)),
         )
         conn.commit()
@@ -1787,6 +1855,84 @@ def payg_enforce_holds() -> None:
         finally:
             conn.close()
 
+def payg_idle_check(now: int | None = None) -> None:
+    """Matikan PAYG yang tidak punya sesi/login aktif selama batas idle."""
+    now = int(now or time.time())
+    settings = get_settings()
+    try:
+        idle_minutes = max(1, min(1440, int(settings.get("payg_idle_minutes", "15"))))
+    except (TypeError, ValueError):
+        idle_minutes = 15
+    threshold = idle_minutes * 60
+    conn = db_connect()
+    try:
+        rows = conn.execute(
+            "SELECT id,user_id,service,protocol,username,last_seen_at FROM payg_accounts WHERE state=?",
+            (PAYG_RUNNING,),
+        ).fetchall()
+    finally:
+        conn.close()
+    for row in rows:
+        try:
+            if row["service"] == "ssh":
+                active = ssh_active_session_count(row["username"])
+            else:
+                active = xray_online_count(row["username"])
+            if active is None:
+                conn = db_connect()
+                try:
+                    conn.execute(
+                        "UPDATE payg_accounts SET last_error=? WHERE id=?",
+                        ("deteksi sesi online gagal", int(row["id"])),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+                continue
+            if active > 0:
+                conn = db_connect()
+                try:
+                    conn.execute(
+                        "UPDATE payg_accounts SET last_seen_at=?, last_error='' WHERE id=?",
+                        (now, int(row["id"])),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+                continue
+            last_seen = int(row["last_seen_at"] or 0)
+            if last_seen <= 0:
+                conn = db_connect()
+                try:
+                    conn.execute(
+                        "UPDATE payg_accounts SET last_seen_at=? WHERE id=?",
+                        (now, int(row["id"])),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+                continue
+            if now - last_seen < threshold:
+                continue
+            payg_stop(int(row["id"]), int(row["user_id"]))
+            conn = db_connect()
+            try:
+                conn.execute(
+                    "UPDATE payg_accounts SET last_seen_at=0, last_error='' WHERE id=?",
+                    (int(row["id"]),),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            audit(
+                "payg_idle_stop",
+                f"{row['service']}/{row['protocol'] or '-'} {row['username']} idle={idle_minutes}m",
+                "",
+            )
+            logger.info("payg idle stop %s (%s menit tanpa sesi)", row["username"], idle_minutes)
+        except Exception:
+            logger.warning("payg idle check %s: %s", row["id"], traceback.format_exc())
+
 def payg_tick_all() -> None:
     settings = get_settings()
     if settings.get("payg_enabled", "1") != "1":
@@ -1801,6 +1947,10 @@ def payg_tick_all() -> None:
             payg_bill_one(int(row["id"]))
         except Exception:
             logger.warning("payg billing %s: %s", row["id"], traceback.format_exc())
+    try:
+        payg_idle_check()
+    except Exception:
+        logger.warning("payg idle check: %s", traceback.format_exc())
     try:
         payg_enforce_holds()
     except Exception:
@@ -4053,6 +4203,7 @@ def user_accounts(user_id: int) -> list[dict]:
         if item.get("source") == "payg":
             item["balance_milli"] = balance_milli
             item["payg_min_balance_milli"] = min_balance_milli
+            item["payg_idle_minutes"] = _setting_int(payg_settings, "payg_idle_minutes", 15)
     accounts.sort(key=lambda item: item["created_at"], reverse=True)
     online = collect_online_ips(accounts)
     for item in accounts:
@@ -4085,6 +4236,7 @@ def dashboard_data(user_id: int) -> dict:
             "enabled": settings.get("payg_enabled", "1") == "1",
             "min_balance_milli": _setting_int(settings, "payg_min_balance", 1000) * 1000,
             "min_topup": _setting_int(settings, "payg_min_topup", 5000),
+            "idle_minutes": _setting_int(settings, "payg_idle_minutes", 15),
             "rates_ssh": payg_rates("ssh", settings),
             "rates_xray": payg_rates("xray", settings),
         },
@@ -5644,6 +5796,7 @@ class Handler(BaseHTTPRequestHandler):
             "payg_min_balance", "payg_min_topup", "payg_max_topup",
             "payg_ssh_ip_limit", "payg_ssh_quota_gb",
             "payg_xray_ip_limit", "payg_xray_quota_gb",
+            "payg_idle_minutes",
         ):
             low, high = INT_SETTINGS[key]
             try:
@@ -6777,7 +6930,8 @@ def _payg_html(account: dict) -> str:
     payg_id = int(account.get("payg_id") or 0)
     if state == PAYG_RUNNING:
         label = "Argo berjalan"
-        note = "Saldo dipotong per menit selama akun ON. Tekan Stop untuk menghentikan."
+        idle_min = int(account.get("payg_idle_minutes") or 15)
+        note = f"Saldo dipotong per menit selama ON. Auto-off jika tidak ada login {idle_min} menit. Tekan Stop untuk berhenti."
         action = (
             f'<form method="post" action="/dashboard/payg/stop" class="inline-form">'
             f'<input type="hidden" name="_csrf" value="{e(csrf)}">'
@@ -7967,6 +8121,7 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
           <label>Minimal saldo untuk Start (Rp)<input type="number" name="payg_min_balance" min="100" max="1000000" value="{e(settings.get('payg_min_balance', '1000'))}"></label>
           <label>Minimal top up (Rp)<input type="number" name="payg_min_topup" min="1000" max="10000000" value="{e(settings.get('payg_min_topup', '5000'))}"></label>
           <label>Maksimal top up (Rp)<input type="number" name="payg_max_topup" min="1000" max="100000000" value="{e(settings.get('payg_max_topup', '1000000'))}"></label>
+          <label>Auto-off jika tidak ada login (menit)<input type="number" name="payg_idle_minutes" min="1" max="1440" value="{e(settings.get('payg_idle_minutes', '15'))}"><small>Akun OFF otomatis jika tidak ada sesi aktif selama ini.</small></label>
           <label class="switch"><input type="checkbox" name="payg_enabled" value="1" {'checked' if settings.get('payg_enabled', '1') == '1' else ''}><span>Buka Pay As You Go</span></label>
         </fieldset>
       </div>

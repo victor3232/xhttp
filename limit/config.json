@@ -19,6 +19,7 @@
         "handshake": 2,
         "connIdle": 128,
         "statsUserUplink": true,
+        "statsUserOnline": true,
         "statsUserDownlink": true
         }
        }
@@ -550,7 +551,8 @@
     "levels": {
       "0": {
         "statsUserDownlink": true,
-        "statsUserUplink": true
+        "statsUserUplink": true,
+        "statsUserOnline": true
       }
     },
     "system": {
