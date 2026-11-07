@@ -4181,7 +4181,7 @@ html, body {
 .info-popup-cta {
   border: 1px solid var(--terracotta);
   background: var(--terracotta);
-  color: var(--white);
+  color: var(--on-accent);
 }
 .info-popup-cta:hover { background: var(--terracotta-deep); border-color: var(--terracotta-deep); }
 .info-popup-dismiss {

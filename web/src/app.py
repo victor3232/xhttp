@@ -6187,7 +6187,7 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
 <meta name="theme-color" content="{UI_THEME_COLORS.get(b['theme'], '#fffaf2')}">
 {robots}
 {favicon}
-<link rel="stylesheet" href="/static/style.css?v=20261107popup1">
+<link rel="stylesheet" href="/static/style.css?v=20261107popup2">
 {turnstile_script}
 </head>
 <body>
@@ -6195,7 +6195,7 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
 {body}
 {footer}
 {popup_html}
-<script src="/static/app.js?v=20261107popup1" defer></script>
+<script src="/static/app.js?v=20261107popup2" defer></script>
 </body>
 </html>"""
 
