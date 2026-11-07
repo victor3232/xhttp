@@ -329,6 +329,131 @@
   var firstPremium = $(".premium-service");
   if (firstPremium) firstPremium.click();
 
+  function moneyMilli(milli) {
+    var value = Number(milli || 0) / 1000;
+    var text = value.toLocaleString("id-ID", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    return "Rp " + text.replace(/\.00$/, "");
+  }
+
+  var paygForm = $("#payg-form");
+  var paygButton = $("#payg-button");
+  var paygService = $("#payg-service");
+  var paygProtocol = $("#payg-protocol");
+  var paygCanCreate = paygForm ? paygForm.getAttribute("data-can-create") === "1" : false;
+
+  function choosePayg(button) {
+    if (!button) return;
+    $$(".payg-service-card").forEach(function (node) { node.classList.remove("selected"); });
+    button.classList.add("selected");
+    var service = button.getAttribute("data-payg-service") || "";
+    var protocol = button.getAttribute("data-payg-protocol") || "";
+    var existing = button.getAttribute("data-payg-existing") === "1";
+    if (paygService) paygService.value = service;
+    if (paygProtocol) paygProtocol.value = protocol;
+    var label = $("#payg-selected-label");
+    if (label) label.textContent = button.getAttribute("data-payg-label") || "—";
+    var minute = $("#payg-rate-minute");
+    var hour = $("#payg-rate-hour");
+    var day = $("#payg-rate-day");
+    if (minute) minute.textContent = button.getAttribute("data-payg-minute") || "—";
+    if (hour) hour.textContent = button.getAttribute("data-payg-hour") || "—";
+    if (day) day.textContent = button.getAttribute("data-payg-day") || "—";
+    if (paygButton) {
+      if (existing) {
+        paygButton.disabled = true;
+        paygButton.textContent = "Sudah punya akun — buka dashboard";
+      } else if (!paygCanCreate) {
+        paygButton.disabled = true;
+        paygButton.textContent = "Saldo belum cukup — deposit dulu";
+      } else {
+        paygButton.disabled = false;
+        paygButton.textContent = "Buat akun Pay As You Go ↗";
+      }
+    }
+  }
+
+  $$(".payg-service-card").forEach(function (button) {
+    button.addEventListener("click", function () { choosePayg(button); });
+  });
+  if (paygForm) {
+    var paygDefault = null;
+    $$(".payg-service-card").forEach(function (button) {
+      if (!paygDefault && button.getAttribute("data-payg-existing") !== "1") paygDefault = button;
+    });
+    var paygFirst = paygDefault || $(".payg-service-card");
+    if (paygFirst) choosePayg(paygFirst);
+    paygForm.addEventListener("submit", function (event) {
+      if (!paygService || !paygService.value || (paygButton && paygButton.disabled)) {
+        event.preventDefault();
+        return;
+      }
+      if (paygButton) {
+        paygButton.disabled = true;
+        paygButton.innerHTML = '<span class="spinner"></span> Membuat akun PAYG…';
+      }
+    });
+  }
+
+  $$(".amount-pill").forEach(function (button) {
+    button.addEventListener("click", function () {
+      var amount = $("#deposit-amount");
+      if (amount) {
+        amount.value = button.getAttribute("data-amount") || amount.value;
+        $$(".amount-pill").forEach(function (node) { node.classList.remove("selected"); });
+        button.classList.add("selected");
+      }
+    });
+  });
+
+  var depositData = readJson("deposit-data");
+  if (depositData && depositData.invoice) {
+    var depositCountdown = $("#deposit-countdown");
+    if (depositCountdown) {
+      var depositExpires = Number(depositCountdown.getAttribute("data-expires")) * 1000;
+      var updateDepositCountdown = function () {
+        var diff = Math.max(0, depositExpires - Date.now());
+        var total = Math.floor(diff / 1000);
+        var m = Math.floor(total / 60);
+        var s = total % 60;
+        depositCountdown.textContent = diff > 0 ? ("Sisa " + String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0")) : "Waktu habis";
+      };
+      updateDepositCountdown();
+      window.setInterval(updateDepositCountdown, 1000);
+    }
+    if (["PENDING", "EXPIRED"].indexOf(depositData.status) >= 0) {
+      var depositPoll = window.setInterval(function () {
+        fetch("/api/deposit/" + encodeURIComponent(depositData.invoice), { cache: "no-store" })
+          .then(function (r) { return r.json(); })
+          .then(function (data) {
+            if (!data || !data.ok) return;
+            if (data.status !== depositData.status) {
+              window.clearInterval(depositPoll);
+              window.location.reload();
+            }
+          })
+          .catch(function () {});
+      }, 5000);
+    }
+  }
+
+  $$("[data-argo-start]").forEach(function (node) {
+    var started = Number(node.getAttribute("data-argo-start") || 0) * 1000;
+    var rate = Number(node.getAttribute("data-argo-rate-milli") || 0);
+    var clock = node.querySelector("[data-argo-clock]");
+    var cost = node.querySelector("[data-argo-cost]");
+    if (!started || !clock) return;
+    var tickArgo = function () {
+      var seconds = Math.max(0, Math.floor((Date.now() - started) / 1000));
+      var h = Math.floor(seconds / 3600);
+      var m = Math.floor((seconds % 3600) / 60);
+      var s = seconds % 60;
+      clock.textContent = String(h).padStart(2, "0") + ":" + String(m).padStart(2, "0") + ":" + String(s).padStart(2, "0");
+      if (cost) cost.textContent = moneyMilli(rate * seconds / 60);
+    };
+    tickArgo();
+    window.setInterval(tickArgo, 1000);
+  });
+
   var countdown = $("#reset-countdown");
   if (countdown && quota && quota.reset_at) {
     var resetAt = Number(quota.reset_at) * 1000;

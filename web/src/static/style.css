@@ -3773,3 +3773,205 @@ input[type="email"] {
 @media (max-width: 700px) {
   .mail-status-grid { grid-template-columns: 1fr; }
 }
+
+/* ------------------------------------------------------------------
+   Wallet, deposit, and Pay As You Go
+   ------------------------------------------------------------------ */
+.nav-balance-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 8px 11px;
+  border: 1px solid var(--line-strong);
+  border-radius: 99px;
+  background: var(--accent-bg);
+  color: var(--terracotta-deep);
+  font-size: 10.5px; font-weight: 700;
+}
+.nav-balance-chip svg { width: 15px; height: 15px; }
+.nav-balance-chip b { font-family: var(--font-mono); font-size: 10px; }
+.nav-balance-chip:hover { border-color: var(--terracotta); background: var(--accent-bg-2); }
+
+.wallet-band { padding-top: 10px; }
+.wallet-promo {
+  display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(260px, .8fr);
+  gap: 28px; align-items: center;
+  padding: 30px;
+  border: 1.5px solid var(--line-strong);
+  background: var(--surface-2);
+  overflow: hidden;
+  position: relative;
+}
+.wallet-promo::after {
+  content: ""; position: absolute; right: -70px; top: -90px;
+  width: 260px; height: 260px; border-radius: 50%;
+  border: 1px dashed var(--line-strong); opacity: .6; pointer-events: none;
+}
+.wallet-promo-copy h2 {
+  margin: 10px 0 10px; font-family: var(--font-display);
+  font-size: clamp(34px, 4.4vw, 56px); line-height: .92; text-transform: uppercase;
+}
+.wallet-promo-copy h2 em { color: var(--terracotta); font-style: normal; }
+.wallet-promo-copy p { max-width: 620px; color: var(--muted); font-size: 12px; line-height: 1.7; }
+.wallet-promo-actions { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 16px; }
+.wallet-promo-note { display: block; margin-top: 11px; color: var(--muted-2); font-size: 10px; }
+.wallet-promo-card {
+  position: relative; z-index: 1;
+  padding: 21px;
+  border: 1.5px solid var(--line-strong);
+  border-radius: 18px;
+  background: var(--invert-bg);
+  color: var(--invert-fg);
+  box-shadow: var(--shadow-soft);
+}
+.wallet-promo-card .mini-label { color: var(--invert-muted-2); }
+.wallet-promo-amount { display: block; margin: 8px 0 3px; font-family: var(--font-display); font-size: clamp(36px, 4vw, 52px); line-height: .9; color: var(--invert-accent); overflow-wrap: anywhere; }
+.wallet-promo-card > small { display: block; color: var(--invert-muted); font-size: 10px; line-height: 1.5; }
+.wallet-promo-rates { display: grid; gap: 7px; margin: 15px 0; padding-top: 13px; border-top: 1px dashed rgba(255,255,255,.18); }
+.wallet-promo-rates div { display: flex; justify-content: space-between; gap: 10px; font-size: 10px; }
+.wallet-promo-rates span { color: var(--invert-muted-2); }
+.wallet-promo-rates b { font-family: var(--font-mono); font-size: 9.5px; color: var(--invert-fg); }
+
+.scheme-tabs { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 18px; }
+.scheme-tab {
+  flex: 1 1 230px;
+  display: grid; gap: 2px;
+  padding: 14px 16px;
+  border: 1.5px solid var(--line);
+  border-radius: 14px;
+  background: var(--surface-2);
+  color: var(--ink-soft);
+  transition: border-color .16s ease, background .16s ease;
+}
+.scheme-tab b { font-size: 13px; }
+.scheme-tab small { color: var(--muted-2); font-size: 9.5px; }
+.scheme-tab:hover { border-color: var(--line-strong); }
+.scheme-tab.active { border-color: var(--terracotta); background: var(--accent-bg); color: var(--terracotta-deep); box-shadow: 0 0 0 3px var(--accent-ring); }
+.scheme-tab.active small { color: var(--terracotta); }
+
+.payg-service-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; margin-top: 10px; }
+.payg-service-card {
+  position: relative;
+  display: grid; grid-template-columns: 34px minmax(0, 1fr); grid-template-rows: auto auto auto;
+  column-gap: 10px; align-items: center;
+  padding: 13px 14px;
+  border: 1.5px solid var(--line);
+  border-radius: 14px;
+  background: var(--surface-1);
+  color: var(--text);
+  text-align: left; cursor: pointer;
+  transition: border-color .16s ease, background .16s ease, transform .16s ease;
+}
+.payg-service-card:hover { border-color: var(--line-strong); transform: translateY(-1px); }
+.payg-service-card.selected { border-color: var(--terracotta); background: var(--accent-bg-2); box-shadow: 0 0 0 3px var(--accent-ring); }
+.payg-service-card.is-existing { opacity: .72; }
+.payg-service-icon { grid-row: 1 / span 3; width: 30px; height: 30px; color: var(--terracotta); }
+.payg-service-icon svg { width: 100%; height: 100%; }
+.payg-service-card b { font-size: 12px; }
+.payg-service-card small { color: var(--muted-2); font-size: 9.5px; }
+.payg-service-card em { color: var(--terracotta); font-family: var(--font-mono); font-size: 9px; font-style: normal; }
+.payg-existing-tag {
+  position: absolute; right: 9px; top: 8px;
+  padding: 2px 6px; border-radius: 99px;
+  background: var(--badge-warn-bg); color: var(--badge-warn-text);
+  font-size: 7.5px; font-weight: 700; text-transform: uppercase;
+}
+.payg-rate-box { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-top: 10px; }
+.payg-rate-box > div { padding: 11px 12px; border: 1px solid var(--line); border-radius: 11px; background: var(--surface-3); }
+.payg-rate-box span { display: block; color: var(--muted-2); font-size: 9px; text-transform: uppercase; letter-spacing: .04em; }
+.payg-rate-box b { display: block; margin-top: 4px; font-family: var(--font-mono); font-size: 10.5px; }
+.payg-rate-box.compact { grid-template-columns: 1fr 1fr; }
+.payg-summary { margin-top: 14px; }
+
+.payg-panel {
+  margin-top: 13px; padding: 14px;
+  border: 1.5px solid var(--line-strong);
+  border-radius: 15px;
+  background: var(--accent-bg);
+}
+.payg-panel-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.payg-panel-head b { display: block; margin-top: 3px; font-size: 13px; }
+.payg-panel-head small { display: block; margin-top: 3px; color: var(--muted); font-size: 10px; line-height: 1.5; }
+.payg-metrics { display: grid; grid-template-columns: repeat(4, 1fr); gap: 7px; margin-top: 12px; }
+.payg-metrics > div { padding: 9px 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-1); }
+.payg-metrics span { display: block; color: var(--muted-2); font-size: 8.5px; text-transform: uppercase; letter-spacing: .04em; }
+.payg-metrics b { display: block; margin-top: 4px; font-family: var(--font-mono); font-size: 10px; }
+.payg-live { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; margin-top: 10px; padding: 9px 11px; border-radius: 10px; background: var(--invert-bg); color: var(--invert-fg); }
+.payg-live b { font-family: var(--font-mono); font-size: 12px; letter-spacing: .04em; }
+.payg-live small { color: var(--invert-muted); font-size: 9.5px; }
+.payg-dot { width: 8px; height: 8px; border-radius: 50%; background: #62d17a; box-shadow: 0 0 0 4px rgba(98,209,122,.18); animation: paygPulse 1.6s ease infinite; }
+@keyframes paygPulse { 0%,100%{opacity:1} 50%{opacity:.45} }
+.payg-actions { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 11px; }
+.payg-foot { display: block; margin-top: 9px; color: var(--muted-2); font-size: 9.5px; }
+
+.wallet-stat > b { color: var(--terracotta-deep); }
+.wallet-stat small a { color: var(--terracotta); font-weight: 700; }
+.dash-summary.four { grid-template-columns: repeat(4, 1fr); }
+.dash-quick.four { grid-template-columns: repeat(4, 1fr); }
+
+.wallet-hero {
+  display: flex; align-items: center; justify-content: space-between; gap: 22px;
+  padding: 24px;
+  border: 1.5px solid var(--line-strong);
+  background: var(--invert-bg);
+  color: var(--invert-fg);
+}
+.wallet-hero-copy .mini-label { color: var(--invert-muted-2); }
+.wallet-hero-copy > b { display: block; margin: 8px 0 4px; font-family: var(--font-display); font-size: clamp(38px, 5vw, 62px); line-height: .9; color: var(--invert-accent); overflow-wrap: anywhere; }
+.wallet-hero-copy small { color: var(--invert-muted); font-size: 10px; }
+.wallet-hero-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.wallet-hero-actions .btn-ghost { border-color: rgba(255,255,255,.3); color: var(--invert-fg); }
+.wallet-hero-actions .btn-ghost:hover { border-color: var(--invert-fg); background: rgba(255,255,255,.08); }
+
+.payg-rate-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.payg-rate-card { padding: 16px; border: 1.5px solid var(--line); border-radius: 15px; background: var(--surface-2); }
+.payg-rate-card > b { display: block; margin: 5px 0 10px; font-family: var(--font-mono); font-size: 13px; }
+.payg-rate-card > div { display: flex; justify-content: space-between; gap: 10px; padding: 6px 0; border-top: 1px dashed var(--line); font-size: 10.5px; }
+.payg-rate-card > div span { color: var(--muted-2); }
+.payg-rate-card > div b { font-family: var(--font-mono); font-size: 10px; }
+.admin-rate-grid { margin: 14px 0; }
+
+.ledger-plus { color: var(--ok-text); font-family: var(--font-mono); }
+.ledger-minus { color: var(--red); font-family: var(--font-mono); }
+
+.deposit-main { padding: 50px 0 70px; }
+.deposit-head { max-width: 760px; margin-bottom: 22px; }
+.deposit-head h1 { margin: 11px 0 9px; font-family: var(--font-display); font-size: clamp(38px, 5vw, 62px); line-height: .92; text-transform: uppercase; }
+.deposit-head h1 em { color: var(--terracotta); font-style: normal; }
+.deposit-head p { color: var(--muted); font-size: 12px; line-height: 1.7; }
+.deposit-layout { display: grid; grid-template-columns: minmax(0, 1.1fr) minmax(260px, .7fr); gap: 16px; align-items: start; }
+.deposit-form-card { padding: 24px; }
+.wallet-balance-box { padding: 18px; border: 1.5px solid var(--line-strong); border-radius: 15px; background: var(--accent-bg); margin-bottom: 18px; }
+.wallet-balance-box > b { display: block; margin: 7px 0 3px; font-family: var(--font-display); font-size: clamp(34px, 4.5vw, 52px); line-height: .9; color: var(--terracotta-deep); overflow-wrap: anywhere; }
+.wallet-balance-box small { color: var(--muted); font-size: 10px; }
+.amount-pills { display: flex; flex-wrap: wrap; gap: 7px; margin: 4px 0 8px; }
+.amount-pill { padding: 8px 12px; border: 1.5px solid var(--line); border-radius: 99px; background: var(--surface-1); color: var(--ink-soft); font-family: var(--font-mono); font-size: 10px; font-weight: 700; cursor: pointer; }
+.amount-pill:hover { border-color: var(--terracotta); color: var(--terracotta); }
+.amount-pill.selected { border-color: var(--terracotta); background: var(--accent-bg); color: var(--terracotta-deep); }
+.deposit-side { display: grid; gap: 12px; }
+.deposit-history { margin-top: 26px; }
+.wallet-invoice-balance { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 16px 28px; border-top: 1px dashed var(--line); }
+.wallet-invoice-balance span { color: var(--muted-2); font-size: 10px; text-transform: uppercase; letter-spacing: .05em; }
+.wallet-invoice-balance b { font-family: var(--font-display); font-size: 30px; line-height: 1; color: var(--terracotta-deep); }
+.payg-admin-panel .settings-grid { margin-bottom: 4px; }
+
+@media (max-width: 980px) {
+  .wallet-promo { grid-template-columns: 1fr; }
+  .dash-summary.four { grid-template-columns: 1fr 1fr; }
+  .dash-quick.four { grid-template-columns: 1fr 1fr; }
+  .deposit-layout { grid-template-columns: 1fr; }
+  .dash-bottom { grid-template-columns: repeat(7, 1fr); }
+  .dash-bottom-link small { font-size: 7px; }
+  .dash-bottom-link span { width: 16px; height: 16px; }
+}
+@media (max-width: 620px) {
+  .wallet-promo { padding: 22px; }
+  .wallet-promo-card { padding: 17px; }
+  .scheme-tabs { flex-direction: column; }
+  .payg-service-grid { grid-template-columns: 1fr; }
+  .payg-rate-box { grid-template-columns: 1fr; }
+  .payg-metrics { grid-template-columns: 1fr 1fr; }
+  .payg-rate-grid { grid-template-columns: 1fr; }
+  .dash-summary.four { grid-template-columns: 1fr; }
+  .dash-quick.four { grid-template-columns: 1fr; }
+  .wallet-hero { flex-direction: column; align-items: flex-start; }
+  .deposit-head h1 { font-size: 38px; }
+}

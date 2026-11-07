@@ -301,9 +301,9 @@ def ssh_is_locked(user):
         return False
 
 
-def suspend_ssh(user, limit=None, count=None):
+def suspend_ssh(user, limit=None, count=None, hold=False):
     enabled, minutes, notify = load_conf()
-    if not enabled:
+    if not enabled and not hold:
         return 2
     if user == "root":
         return 4
@@ -322,7 +322,8 @@ def suspend_ssh(user, limit=None, count=None):
         "kind": "ssh",
         "user": user,
         "created": time.time(),
-        "until": time.time() + minutes * 60,
+        "until": 0 if hold else time.time() + minutes * 60,
+        "hold": bool(hold),
         "shell": pw.pw_shell or "/bin/bash",
         "was_locked": ssh_is_locked(user),
         "limit": limit,
@@ -341,15 +342,23 @@ def suspend_ssh(user, limit=None, count=None):
     run([pkill, "-TERM", "-u", user, "-f", "(sshd|dropbear)"])
     time.sleep(1)
     run([pkill, "-KILL", "-u", user])
-    log("suspend SSH %s sampai %s (%s menit)" % (
-        user, time.strftime("%H:%M:%S", time.localtime(state["until"])), minutes))
-    append_history(
-        "suspend", kind="ssh", user=user, proto="",
-        limit=limit, count=count,
-        created=int(state["created"]), until=int(state["until"]),
-    )
-    if notifications_enabled(notify):
-        notify_suspend("ssh", user, None, limit, count, minutes, state["until"])
+    if hold:
+        log("hold SSH %s (PAYG, tanpa timer)" % user)
+        append_history(
+            "hold", kind="ssh", user=user, proto="",
+            limit=limit, count=count,
+            created=int(state["created"]), until=0,
+        )
+    else:
+        log("suspend SSH %s sampai %s (%s menit)" % (
+            user, time.strftime("%H:%M:%S", time.localtime(state["until"])), minutes))
+        append_history(
+            "suspend", kind="ssh", user=user, proto="",
+            limit=limit, count=count,
+            created=int(state["created"]), until=int(state["until"]),
+        )
+        if notifications_enabled(notify):
+            notify_suspend("ssh", user, None, limit, count, minutes, state["until"])
     return 0
 
 
@@ -454,9 +463,9 @@ def xray_apply_remove(data):
             pass
 
 
-def suspend_xray(proto, user, limit=None, count=None):
+def suspend_xray(proto, user, limit=None, count=None, hold=False):
     enabled, minutes, notify = load_conf()
-    if not enabled:
+    if not enabled and not hold:
         return 2
     if proto not in PROTO:
         return 4
@@ -474,7 +483,8 @@ def suspend_xray(proto, user, limit=None, count=None):
         "proto": proto,
         "user": user,
         "created": time.time(),
-        "until": time.time() + minutes * 60,
+        "until": 0 if hold else time.time() + minutes * 60,
+        "hold": bool(hold),
         "blocks": prepared["blocks"],
         "db": prepared["db"],
         "dblines": prepared["dblines"],
@@ -493,15 +503,23 @@ def suspend_xray(proto, user, limit=None, count=None):
         return 4
 
     run(["systemctl", "restart", "xray"])
-    log("suspend XRAY %s/%s sampai %s (%s menit)" % (
-        proto, user, time.strftime("%H:%M:%S", time.localtime(state["until"])), minutes))
-    append_history(
-        "suspend", kind="xray", user=user, proto=proto,
-        limit=limit, count=count,
-        created=int(state["created"]), until=int(state["until"]),
-    )
-    if notifications_enabled(notify):
-        notify_suspend("xray", user, proto, limit, count, minutes, state["until"])
+    if hold:
+        log("hold XRAY %s/%s (PAYG, tanpa timer)" % (proto, user))
+        append_history(
+            "hold", kind="xray", user=user, proto=proto,
+            limit=limit, count=count,
+            created=int(state["created"]), until=0,
+        )
+    else:
+        log("suspend XRAY %s/%s sampai %s (%s menit)" % (
+            proto, user, time.strftime("%H:%M:%S", time.localtime(state["until"])), minutes))
+        append_history(
+            "suspend", kind="xray", user=user, proto=proto,
+            limit=limit, count=count,
+            created=int(state["created"]), until=int(state["until"]),
+        )
+        if notifications_enabled(notify):
+            notify_suspend("xray", user, proto, limit, count, minutes, state["until"])
     return 0
 
 
@@ -570,6 +588,48 @@ def xray_restore(state):
 # Scheduler
 # ---------------------------------------------------------------------------
 
+def release_one(kind, user, proto=None):
+    """Lepas hold/suspend tertentu sekarang juga. Return 0 sukses, 4 gagal."""
+    if kind == "ssh":
+        path = state_path("ssh", user)
+    elif kind == "xray" and proto:
+        path = state_path("xray", user, proto)
+    else:
+        return 64
+    if not os.path.exists(path):
+        return 0
+    try:
+        state = read_state(path)
+    except Exception:
+        return 4
+    try:
+        if state.get("kind") == "ssh":
+            restore_ssh(state)
+            mark_restored("ssh", state.get("user", ""))
+            os.unlink(path)
+            append_history(
+                "release", kind="ssh", user=state.get("user", ""), proto="",
+                created=int(state.get("created", 0) or 0), until=int(state.get("until", 0) or 0),
+            )
+            return 0
+        if state.get("kind") == "xray":
+            changed, ok = xray_restore(state)
+            if not ok:
+                return 4
+            if changed:
+                run(["systemctl", "restart", "xray"])
+            mark_restored("xray", state.get("user", ""), state.get("proto"))
+            os.unlink(path)
+            append_history(
+                "release", kind="xray", user=state.get("user", ""), proto=state.get("proto", ""),
+                created=int(state.get("created", 0) or 0), until=int(state.get("until", 0) or 0),
+            )
+            return 0
+    except Exception as exc:
+        log("gagal release %s/%s: %s" % (kind, user, exc))
+        return 4
+    return 4
+
 def restore_all(only_due=False):
     ensure_dirs()
     now = time.time()
@@ -587,6 +647,8 @@ def restore_all(only_due=False):
         try:
             state = read_state(path)
         except Exception:
+            continue
+        if only_due and state.get("hold"):
             continue
         if only_due and float(state.get("until", 0)) > now:
             continue
@@ -666,6 +728,8 @@ def main():
         print("usage: jeda-mullog {daemon|status|list|restore-all|notify-test|"
               "suspend ssh USER [LIMIT] [COUNT]|"
               "suspend xray PROTO USER [LIMIT] [COUNT]|"
+              "hold ssh USER|hold xray PROTO USER|"
+              "release ssh USER|release xray PROTO USER|"
               "is-suspended ssh USER|is-suspended xray PROTO USER|"
               "last-restore ssh USER|last-restore xray PROTO USER}", file=sys.stderr)
         return 64
@@ -737,6 +801,28 @@ def main():
             count = sys.argv[6] if len(sys.argv) > 6 else None
             with Lock():
                 return suspend_xray(proto, user, limit, count)
+    if cmd == "hold":
+        if len(sys.argv) < 4:
+            return 64
+        kind = sys.argv[2]
+        if kind == "ssh":
+            with Lock():
+                return suspend_ssh(sys.argv[3], hold=True)
+        if kind == "xray" and len(sys.argv) >= 5:
+            with Lock():
+                return suspend_xray(sys.argv[3], sys.argv[4], hold=True)
+        return 64
+    if cmd == "release":
+        if len(sys.argv) < 4:
+            return 64
+        kind = sys.argv[2]
+        if kind == "ssh":
+            with Lock():
+                return release_one("ssh", sys.argv[3])
+        if kind == "xray" and len(sys.argv) >= 5:
+            with Lock():
+                return release_one("xray", sys.argv[4], sys.argv[3])
+        return 64
     print("perintah tidak dikenal", file=sys.stderr)
     return 64
 

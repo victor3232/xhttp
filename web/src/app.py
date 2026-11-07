@@ -16,6 +16,7 @@ import argparse
 import base64
 import collections
 import datetime as dt
+import decimal
 import fcntl
 import hashlib
 import hmac
@@ -172,6 +173,16 @@ SSH_SCRIPT = "/usr/local/sbin/addssh"
 XRAY_CONFIG = Path("/etc/xray/config.json")
 HTML_DIR = Path("/var/www/html")
 MIHOMO_STATE = Path("/etc/kyt/jeda-mullog")
+MIHOMO_BIN = Path("/usr/local/sbin/jeda-mullog")
+MIHOMO_STATE_DIR = MIHOMO_STATE / "state"
+
+# Pay As You Go: tarif dihitung dari harga patokan 30 hari.
+PAYG_SECONDS_30D = 30 * 86400
+PAYG_RUNNING = "RUNNING"
+PAYG_PAUSED = "PAUSED"
+PAYG_SUSPENDED = "SUSPENDED"
+PAYG_LOCK = threading.Lock()
+WALLET_LOCK = threading.Lock()
 
 COUNTRY_NAMES = {
     "AD": "Andorra", "AE": "Uni Emirat Arab", "AF": "Afganistan", "AL": "Albania",
@@ -312,6 +323,12 @@ DEFAULTS = {
     "mail_smtp_port": "2525",
     "mail_verify_subject": "Kode Verifikasi Anda",
     "mail_reset_subject": "Reset Password — HITS SSH",
+    "payg_enabled": "1",
+    "payg_base_ssh_30d": "10000",
+    "payg_base_xray_30d": "10000",
+    "payg_min_balance": "1000",
+    "payg_min_topup": "5000",
+    "payg_max_topup": "1000000",
 }
 
 INT_SETTINGS = {
@@ -325,6 +342,11 @@ INT_SETTINGS = {
     "xray_daily_7": (0, 1000),
     "per_ip_daily": (0, 1000),
     "premium_expiry_min": (5, 120),
+    "payg_base_ssh_30d": (1000, 10000000),
+    "payg_base_xray_30d": (1000, 10000000),
+    "payg_min_balance": (100, 1000000),
+    "payg_min_topup": (1000, 10000000),
+    "payg_max_topup": (1000, 100000000),
 }
 
 USER_RE = re.compile(r"^[a-z][a-z0-9]{7,14}$")
@@ -555,11 +577,65 @@ def init_db() -> None:
                 start_bytes INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(username, day)
             );
+            CREATE TABLE IF NOT EXISTS deposits (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                invoice TEXT UNIQUE NOT NULL,
+                user_id INTEGER NOT NULL,
+                amount INTEGER NOT NULL,
+                unique_code INTEGER NOT NULL,
+                total INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'PENDING',
+                qr_string TEXT NOT NULL DEFAULT '',
+                buyer_ip TEXT NOT NULL DEFAULT '',
+                user_agent TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                paid_at INTEGER,
+                reference TEXT NOT NULL DEFAULT '',
+                credited_milli INTEGER NOT NULL DEFAULT 0,
+                notified INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_deposits_user ON deposits(user_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_deposits_status ON deposits(status, created_at);
+            CREATE INDEX IF NOT EXISTS idx_deposits_reference ON deposits(reference);
+            CREATE TABLE IF NOT EXISTS wallet_ledger (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                at INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                amount_milli INTEGER NOT NULL,
+                balance_after_milli INTEGER NOT NULL,
+                ref TEXT NOT NULL DEFAULT '',
+                note TEXT NOT NULL DEFAULT ''
+            );
+            CREATE INDEX IF NOT EXISTS idx_wallet_ledger_user ON wallet_ledger(user_id, id);
+            CREATE TABLE IF NOT EXISTS payg_accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                account_id INTEGER NOT NULL UNIQUE,
+                service TEXT NOT NULL,
+                protocol TEXT NOT NULL DEFAULT '',
+                username TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'PAUSED',
+                created_at INTEGER NOT NULL,
+                started_at INTEGER,
+                stopped_at INTEGER,
+                last_billed_at INTEGER,
+                bill_remainder_num INTEGER NOT NULL DEFAULT 0,
+                spent_milli INTEGER NOT NULL DEFAULT 0,
+                total_seconds INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT '',
+                UNIQUE(user_id, service, protocol)
+            );
+            CREATE INDEX IF NOT EXISTS idx_payg_user ON payg_accounts(user_id);
+            CREATE INDEX IF NOT EXISTS idx_payg_state ON payg_accounts(state);
             """
         )
         _ensure_column(conn, "accounts", "user_id", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "accounts", "kind", "TEXT NOT NULL DEFAULT 'free'")
         _ensure_column(conn, "orders", "user_id", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(conn, "user_tokens", "code_hash", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "users", "balance_milli", "INTEGER NOT NULL DEFAULT 0")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_accounts_user ON accounts(user_id, created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_user ON orders(user_id, created_at)")
         for k, v in DEFAULTS.items():
@@ -843,7 +919,7 @@ def quota_state(settings: dict[str, str] | None = None) -> dict:
                 limit = int(settings.get(f"{service}_daily_{days}", "0") or 0)
                 used = conn.execute(
                     "SELECT COUNT(*) AS n FROM accounts "
-                    "WHERE created_day=? AND service=? AND days=? AND status='active'",
+                    "WHERE created_day=? AND service=? AND days=? AND status='active' AND kind='free'",
                     (day, service, days),
                 ).fetchone()["n"]
                 data[service][str(days)] = {
@@ -862,7 +938,7 @@ def per_ip_used(ip: str, service: str) -> int:
         return int(
             conn.execute(
                 "SELECT COUNT(*) AS n FROM accounts "
-                "WHERE created_day=? AND service=? AND ip=? AND status='active'",
+                "WHERE created_day=? AND service=? AND ip=? AND status='active' AND kind='free'",
                 (today_key(), service, ip),
             ).fetchone()["n"]
         )
@@ -1117,7 +1193,7 @@ def get_user_session(token: str | None) -> sqlite3.Row | None:
     try:
         return conn.execute(
             "SELECT s.*, u.email, u.status AS user_status, u.created_at AS user_created_at, "
-            "u.verified_at, u.last_login_at FROM user_sessions s "
+            "u.verified_at, u.last_login_at, u.balance_milli FROM user_sessions s "
             "JOIN users u ON u.id=s.user_id "
             "WHERE s.token_hash=? AND s.expires_at>=? AND u.status='active'",
             (token_hash(token), int(time.time())),
@@ -1181,6 +1257,651 @@ def audit_user(user_id: int, action: str, detail: str = "", ip: str = "") -> Non
     user = user_by_id(user_id)
     email = user["email"] if user else str(user_id)
     audit(action, f"user={email} {detail}".strip(), ip)
+
+# ---------------------------------------------------------------------------
+# Wallet, deposit, and Pay As You Go
+# ---------------------------------------------------------------------------
+
+def _setting_int(settings: dict[str, str], key: str, default: int = 0) -> int:
+    try:
+        return int(str(settings.get(key, default)).strip())
+    except (TypeError, ValueError):
+        return int(default)
+
+def payg_base_price(service: str, settings: dict[str, str] | None = None) -> int:
+    settings = settings or get_settings()
+    key = "payg_base_ssh_30d" if service == "ssh" else "payg_base_xray_30d"
+    return max(1000, _setting_int(settings, key, 10000))
+
+def payg_rates(service: str, settings: dict[str, str] | None = None) -> dict:
+    base = payg_base_price(service, settings)
+    return {
+        "base": base,
+        "day_milli": decimal.Decimal(base) * 1000 / decimal.Decimal(30),
+        "hour_milli": decimal.Decimal(base) * 1000 / decimal.Decimal(720),
+        "minute_milli": decimal.Decimal(base) * 1000 / decimal.Decimal(43200),
+    }
+
+def rupiah_milli(value, decimals: int = 2, strip: bool = False) -> str:
+    try:
+        amount = decimal.Decimal(str(value)) / decimal.Decimal(1000)
+        quant = decimal.Decimal(1).scaleb(-max(0, int(decimals)))
+        amount = amount.quantize(quant, rounding=decimal.ROUND_HALF_UP)
+    except Exception:
+        amount = decimal.Decimal(0)
+    text = f"{amount:,.{max(0, int(decimals))}f}"
+    text = text.replace(",", "X").replace(".", ",").replace("X", ".")
+    if strip and decimals > 0:
+        text = text.rstrip("0").rstrip(",")
+    return "Rp " + (text or "0")
+
+def wallet_balance_milli(user_id: int) -> int:
+    conn = db_connect()
+    try:
+        row = conn.execute("SELECT balance_milli FROM users WHERE id=?", (int(user_id),)).fetchone()
+        return int(row["balance_milli"] or 0) if row else 0
+    finally:
+        conn.close()
+
+def _wallet_write(user_id: int, amount_milli: int, kind: str, ref: str = "", note: str = "") -> tuple[int, int]:
+    """Tambah/kurangi saldo secara atomik. Return (perubahan aktual, saldo akhir)."""
+    amount_milli = int(amount_milli)
+    with WALLET_LOCK:
+        conn = db_connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute("SELECT balance_milli FROM users WHERE id=?", (int(user_id),)).fetchone()
+            if not row:
+                conn.rollback()
+                return 0, 0
+            old = int(row["balance_milli"] or 0)
+            new = old + amount_milli
+            if new < 0:
+                new = 0
+            actual = new - old
+            conn.execute(
+                "UPDATE users SET balance_milli=?, updated_at=? WHERE id=?",
+                (new, int(time.time()), int(user_id)),
+            )
+            conn.execute(
+                "INSERT INTO wallet_ledger(user_id,at,kind,amount_milli,balance_after_milli,ref,note)"
+                " VALUES(?,?,?,?,?,?,?)",
+                (int(user_id), int(time.time()), kind[:30], actual, new, ref[:120], note[:240]),
+            )
+            conn.commit()
+            return actual, new
+        except Exception:
+            conn.rollback()
+            logger.error("wallet write: %s", traceback.format_exc())
+            return 0, 0
+        finally:
+            conn.close()
+
+def wallet_add(user_id: int, amount_milli: int, kind: str, ref: str = "", note: str = "") -> int:
+    _actual, new = _wallet_write(user_id, abs(int(amount_milli)), kind, ref, note)
+    return new
+
+def wallet_deduct(user_id: int, amount_milli: int, kind: str, ref: str = "", note: str = "") -> tuple[int, int]:
+    return _wallet_write(user_id, -abs(int(amount_milli)), kind, ref, note)
+
+def wallet_ledger(user_id: int, limit: int = 50) -> list[sqlite3.Row]:
+    conn = db_connect()
+    try:
+        return conn.execute(
+            "SELECT * FROM wallet_ledger WHERE user_id=? ORDER BY id DESC LIMIT ?",
+            (int(user_id), max(1, int(limit))),
+        ).fetchall()
+    finally:
+        conn.close()
+
+def _jeda_call(*args: str, timeout: int = 40) -> tuple[int, str]:
+    if not MIHOMO_BIN.exists():
+        return 127, "jeda-mullog tidak ditemukan"
+    try:
+        proc = subprocess.run(
+            [str(MIHOMO_BIN), *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=timeout,
+        )
+        return int(proc.returncode), (proc.stdout or "")[-2000:]
+    except Exception as exc:
+        logger.warning("jeda-mullog %s: %s", " ".join(args), exc)
+        return 1, str(exc)
+
+def _jeda_args(action: str, service: str, protocol: str, username: str) -> list[str]:
+    if service == "ssh":
+        return [action, "ssh", username]
+    return [action, "xray", protocol, username]
+
+def payg_jeda_state(service: str, protocol: str, username: str) -> dict | None:
+    safe_user = re.sub(r"[^A-Za-z0-9_.-]", "_", str(username))
+    if service == "ssh":
+        name = f"ssh-{safe_user}.json"
+    else:
+        safe_proto = re.sub(r"[^A-Za-z0-9_.-]", "_", str(protocol))
+        name = f"xray-{safe_proto}-{safe_user}.json"
+    path = MIHOMO_STATE_DIR / name
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def payg_hold_account(service: str, protocol: str, username: str) -> tuple[bool, str]:
+    """Kunci akun tanpa timer otomatis. Hold milik PAYG menang atas timer mullog."""
+    state = payg_jeda_state(service, protocol, username)
+    if state and not state.get("hold"):
+        _jeda_call(*_jeda_args("release", service, protocol, username))
+    rc, out = _jeda_call(*_jeda_args("hold", service, protocol, username))
+    if rc in (0, 3):
+        return True, ""
+    return False, out or f"exit {rc}"
+
+def payg_release_account(service: str, protocol: str, username: str) -> tuple[bool, str]:
+    rc, out = _jeda_call(*_jeda_args("release", service, protocol, username))
+    if rc in (0, 3):
+        return True, ""
+    return False, out or f"exit {rc}"
+
+def payg_rows_for_user(user_id: int) -> list[sqlite3.Row]:
+    conn = db_connect()
+    try:
+        return conn.execute(
+            "SELECT p.*, a.token, a.status AS account_status FROM payg_accounts p "
+            "JOIN accounts a ON a.id=p.account_id WHERE p.user_id=? ORDER BY p.id DESC",
+            (int(user_id),),
+        ).fetchall()
+    finally:
+        conn.close()
+
+def payg_row_by_id(payg_id: int, user_id: int | None = None) -> sqlite3.Row | None:
+    conn = db_connect()
+    try:
+        if user_id is None:
+            return conn.execute(
+                "SELECT p.*, a.token, a.status AS account_status FROM payg_accounts p "
+                "JOIN accounts a ON a.id=p.account_id WHERE p.id=?",
+                (int(payg_id),),
+            ).fetchone()
+        return conn.execute(
+            "SELECT p.*, a.token, a.status AS account_status FROM payg_accounts p "
+            "JOIN accounts a ON a.id=p.account_id WHERE p.id=? AND p.user_id=?",
+            (int(payg_id), int(user_id)),
+        ).fetchone()
+    finally:
+        conn.close()
+
+def payg_existing(user_id: int, service: str, protocol: str) -> sqlite3.Row | None:
+    conn = db_connect()
+    try:
+        return conn.execute(
+            "SELECT * FROM payg_accounts WHERE user_id=? AND service=? AND protocol=?",
+            (int(user_id), service, protocol),
+        ).fetchone()
+    finally:
+        conn.close()
+
+def payg_create_account(user_id: int, service: str, protocol: str, ip: str, user_agent: str) -> sqlite3.Row:
+    settings = get_settings()
+    if settings.get("maintenance") == "1":
+        raise ValueError("Website sedang dalam perawatan. Silakan coba lagi nanti.")
+    if settings.get("payg_enabled", "1") != "1":
+        raise ValueError("Pay As You Go sedang ditutup admin.")
+    if service not in SERVICES:
+        raise ValueError("Layanan tidak valid.")
+    if service == "xray" and protocol not in PROTOCOLS:
+        raise ValueError("Pilih protokol Xray terlebih dahulu.")
+    if service == "ssh":
+        protocol = ""
+    if settings.get(f"{service}_enabled", "1") != "1":
+        raise ValueError(f"Layanan {SERVICES[service]['label']} sedang dinonaktifkan admin.")
+    if service == "xray" and settings.get(f"{protocol}_enabled", "1") != "1":
+        raise ValueError(f"Protokol {PROTOCOLS[protocol]['label']} sedang ditutup admin.")
+    if payg_existing(int(user_id), service, protocol):
+        raise ValueError("Anda sudah punya akun Pay As You Go untuk layanan ini. Kelola dari dashboard.")
+    min_balance = _setting_int(settings, "payg_min_balance", 1000) * 1000
+    if wallet_balance_milli(int(user_id)) < min_balance:
+        raise ValueError(f"Saldo minimal {rupiah_milli(min_balance)} untuk membuat akun Pay As You Go.")
+
+    ip_limit = _setting_int(settings, f"{service}_ip_limit", 2)
+    quota_gb = _setting_int(settings, f"{service}_quota_gb", 0)
+    username = make_username(service, protocol)
+    password = make_password() if service == "ssh" else ""
+    account_id = 0
+    with CREATE_LOCK:
+        if service == "ssh":
+            ok, output, log = create_ssh_account(username, password, 3650, ip_limit, quota_gb)
+        else:
+            ok, output, log = create_xray_account(protocol, username, 3650, ip_limit, quota_gb)
+        if not ok:
+            raise ValueError(output or "Gagal membuat akun VPN. Coba lagi.")
+        now = int(time.time())
+        token = secrets.token_urlsafe(24)
+        conn = db_connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(
+                "INSERT INTO accounts(token,username,service,protocol,days,ip,created_at,created_day,"
+                "expires_at,status,output,error,user_agent,user_id,kind) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'payg')",
+                (
+                    token, username, service, protocol, 0, ip, now, today_key(),
+                    now + 3650 * 86400, "active", output, "", (user_agent or "")[:300], int(user_id),
+                ),
+            )
+            account_id = int(cur.lastrowid)
+            conn.execute(
+                "INSERT INTO payg_accounts(user_id,account_id,service,protocol,username,state,created_at)"
+                " VALUES(?,?,?,?,?,?,?)",
+                (int(user_id), account_id, service, protocol, username, PAYG_PAUSED, now),
+            )
+            conn.commit()
+        except Exception as exc:
+            conn.rollback()
+            try:
+                remove_ssh_account(username) if service == "ssh" else remove_xray_account(protocol, username)
+            except Exception:
+                logger.warning("gagal hapus akun PAYG setelah insert gagal: %s", traceback.format_exc())
+            if isinstance(exc, sqlite3.IntegrityError):
+                raise ValueError("Anda sudah punya akun Pay As You Go untuk layanan ini. Kelola dari dashboard.")
+            raise
+        finally:
+            conn.close()
+    held, err = payg_hold_account(service, protocol, username)
+    if not held:
+        try:
+            remove_ssh_account(username) if service == "ssh" else remove_xray_account(protocol, username)
+        except Exception:
+            logger.warning("gagal hapus akun PAYG setelah hold gagal: %s", traceback.format_exc())
+        conn = db_connect()
+        try:
+            conn.execute("DELETE FROM payg_accounts WHERE account_id=?", (account_id,))
+            conn.execute("DELETE FROM accounts WHERE id=?", (account_id,))
+            conn.commit()
+        finally:
+            conn.close()
+        raise ValueError("Gagal mengunci akun Pay As You Go. Hubungi admin.")
+    audit_user(int(user_id), "payg_create", f"{service}/{protocol or '-'} {username}", ip)
+    return payg_existing(int(user_id), service, protocol)
+
+def payg_start(payg_id: int, user_id: int) -> sqlite3.Row:
+    row = payg_row_by_id(payg_id, user_id)
+    if not row:
+        raise ValueError("Akun Pay As You Go tidak ditemukan.")
+    if row["state"] == PAYG_RUNNING:
+        return row
+    settings = get_settings()
+    min_balance = _setting_int(settings, "payg_min_balance", 1000) * 1000
+    if wallet_balance_milli(int(user_id)) < min_balance:
+        raise ValueError(f"Saldo minimal {rupiah_milli(min_balance)} untuk menyalakan akun.")
+    state = payg_jeda_state(row["service"], row["protocol"], row["username"])
+    if state and not state.get("hold"):
+        raise ValueError("Akun sedang dibekukan mullog. Tunggu sampai pulih lalu coba lagi.")
+    ok, err = payg_release_account(row["service"], row["protocol"], row["username"])
+    if not ok:
+        raise ValueError("Gagal menyalakan akun. Coba lagi atau hubungi admin.")
+    now = int(time.time())
+    conn = db_connect()
+    try:
+        conn.execute(
+            "UPDATE payg_accounts SET state=?, started_at=?, stopped_at=NULL, last_billed_at=?,"
+            " bill_remainder_num=0, last_error='' WHERE id=? AND user_id=?",
+            (PAYG_RUNNING, now, now, int(payg_id), int(user_id)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    audit_user(int(user_id), "payg_start", f"{row['service']}/{row['protocol'] or '-'} {row['username']}")
+    return payg_row_by_id(payg_id, user_id)
+
+def payg_stop(payg_id: int, user_id: int) -> sqlite3.Row:
+    row = payg_row_by_id(payg_id, user_id)
+    if not row:
+        raise ValueError("Akun Pay As You Go tidak ditemukan.")
+    if row["state"] == PAYG_RUNNING:
+        payg_bill_one(int(payg_id), int(time.time()))
+        row = payg_row_by_id(payg_id, user_id)
+    ok, err = payg_hold_account(row["service"], row["protocol"], row["username"])
+    if not ok:
+        raise ValueError("Gagal menghentikan akun. Coba lagi atau hubungi admin.")
+    new_state = PAYG_SUSPENDED if wallet_balance_milli(int(user_id)) <= 0 else PAYG_PAUSED
+    conn = db_connect()
+    try:
+        conn.execute(
+            "UPDATE payg_accounts SET state=?, stopped_at=?, last_billed_at=? WHERE id=? AND user_id=?",
+            (new_state, int(time.time()), int(time.time()), int(payg_id), int(user_id)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    audit_user(int(user_id), "payg_stop", f"{row['service']}/{row['protocol'] or '-'} {row['username']} {new_state}")
+    return payg_row_by_id(payg_id, user_id)
+
+def payg_bill_one(payg_id: int, now: int | None = None) -> None:
+    now = int(now or time.time())
+    with PAYG_LOCK:
+        row = payg_row_by_id(payg_id)
+        if not row or row["state"] != PAYG_RUNNING:
+            return
+        if payg_jeda_state(row["service"], row["protocol"], row["username"]):
+            conn = db_connect()
+            try:
+                conn.execute("UPDATE payg_accounts SET last_billed_at=? WHERE id=?", (now, int(payg_id)))
+                conn.commit()
+            finally:
+                conn.close()
+            return
+        last = int(row["last_billed_at"] or now)
+        elapsed = max(0, now - last)
+        if elapsed <= 0:
+            return
+        settings = get_settings()
+        base = payg_base_price(row["service"], settings)
+        numerator = elapsed * base * 1000 + int(row["bill_remainder_num"] or 0)
+        cost_milli = numerator // PAYG_SECONDS_30D
+        remainder = numerator % PAYG_SECONDS_30D
+        if cost_milli > 0:
+            actual, new_balance = wallet_deduct(
+                int(row["user_id"]),
+                cost_milli,
+                "payg",
+                ref=f"payg:{payg_id}",
+                note=f"{row['username']} {elapsed}s @ {rupiah(base)}/30h",
+            )
+        else:
+            actual = 0
+            new_balance = wallet_balance_milli(int(row["user_id"]))
+        state = row["state"]
+        stopped = row["stopped_at"]
+        last_error = row["last_error"] or ""
+        if new_balance <= 0:
+            state = PAYG_SUSPENDED
+            stopped = now
+            remainder = 0
+            last_error = "Saldo habis"
+        conn = db_connect()
+        try:
+            conn.execute(
+                "UPDATE payg_accounts SET state=?, stopped_at=?, last_billed_at=?, bill_remainder_num=?,"
+                " spent_milli=spent_milli+?, total_seconds=total_seconds+?, last_error=? WHERE id=?",
+                (state, stopped, now, remainder, abs(int(actual)), elapsed, last_error[:240], int(payg_id)),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        if state == PAYG_SUSPENDED:
+            ok, err = payg_hold_account(row["service"], row["protocol"], row["username"])
+            if not ok:
+                conn = db_connect()
+                try:
+                    conn.execute("UPDATE payg_accounts SET last_error=? WHERE id=?", (err[:240], int(payg_id)))
+                    conn.commit()
+                finally:
+                    conn.close()
+            telegram_send(
+                f"<b>⛔ PAY AS YOU GO BERHENTI</b>\n"
+                f"Akun   : <code>{e(row['username'])}</code>\n"
+                f"Layanan: <code>{e(row['service'])}/{e(row['protocol'] or '-')}</code>\n"
+                f"Alasan : <code>saldo habis</code>\n"
+                f"Sisa   : <code>{rupiah_milli(new_balance)}</code>"
+            )
+            audit("payg_suspend", f"{row['username']} saldo=0", "")
+
+def payg_enforce_holds() -> None:
+    conn = db_connect()
+    try:
+        rows = conn.execute(
+            "SELECT id, service, protocol, username, state FROM payg_accounts WHERE state IN (?,?)",
+            (PAYG_PAUSED, PAYG_SUSPENDED),
+        ).fetchall()
+    finally:
+        conn.close()
+    for row in rows:
+        state = payg_jeda_state(row["service"], row["protocol"], row["username"])
+        if state and state.get("hold"):
+            continue
+        ok, err = payg_hold_account(row["service"], row["protocol"], row["username"])
+        if not ok:
+            conn = db_connect()
+            try:
+                conn.execute("UPDATE payg_accounts SET last_error=? WHERE id=?", (err[:240], int(row["id"])))
+                conn.commit()
+            finally:
+                conn.close()
+
+def payg_tick_all() -> None:
+    settings = get_settings()
+    if settings.get("payg_enabled", "1") != "1":
+        return
+    conn = db_connect()
+    try:
+        rows = conn.execute("SELECT id FROM payg_accounts WHERE state=?", (PAYG_RUNNING,)).fetchall()
+    finally:
+        conn.close()
+    for row in rows:
+        try:
+            payg_bill_one(int(row["id"]))
+        except Exception:
+            logger.warning("payg billing %s: %s", row["id"], traceback.format_exc())
+    try:
+        payg_enforce_holds()
+    except Exception:
+        logger.warning("payg enforce holds: %s", traceback.format_exc())
+
+def payg_settle_all() -> None:
+    conn = db_connect()
+    try:
+        rows = conn.execute("SELECT id FROM payg_accounts WHERE state=?", (PAYG_RUNNING,)).fetchall()
+    finally:
+        conn.close()
+    for row in rows:
+        try:
+            payg_bill_one(int(row["id"]))
+        except Exception:
+            logger.warning("payg settle %s: %s", row["id"], traceback.format_exc())
+
+def payg_stop_all() -> None:
+    conn = db_connect()
+    try:
+        rows = conn.execute("SELECT id, user_id FROM payg_accounts WHERE state=?", (PAYG_RUNNING,)).fetchall()
+    finally:
+        conn.close()
+    for row in rows:
+        try:
+            payg_stop(int(row["id"]), int(row["user_id"]))
+        except Exception:
+            logger.warning("payg stop all %s: %s", row["id"], traceback.format_exc())
+
+def payg_daemon() -> None:
+    time.sleep(10)
+    while True:
+        try:
+            payg_tick_all()
+        except Exception:
+            logger.error("payg daemon: %s", traceback.format_exc())
+        time.sleep(30)
+
+def _deposit_code() -> str:
+    alphabet = string.ascii_uppercase + string.digits
+    for _ in range(30):
+        code = "TOP-" + now_jkt().strftime("%y%m%d") + "-" + "".join(secrets.choice(alphabet) for _ in range(8))
+        conn = db_connect()
+        try:
+            if not conn.execute("SELECT 1 FROM deposits WHERE invoice=?", (code,)).fetchone():
+                return code
+        finally:
+            conn.close()
+    raise RuntimeError("gagal membuat kode deposit")
+
+def deposit_by_invoice(invoice: str) -> sqlite3.Row | None:
+    conn = db_connect()
+    try:
+        return conn.execute("SELECT * FROM deposits WHERE invoice=?", ((invoice or "").strip().upper(),)).fetchone()
+    finally:
+        conn.close()
+
+def create_deposit(user_id: int, amount: int, ip: str, user_agent: str) -> sqlite3.Row:
+    settings = get_settings()
+    if settings.get("maintenance") == "1":
+        raise ValueError("Website sedang dalam perawatan. Silakan coba lagi nanti.")
+    min_topup = _setting_int(settings, "payg_min_topup", 5000)
+    max_topup = _setting_int(settings, "payg_max_topup", 1000000)
+    amount = int(amount)
+    if amount < min_topup:
+        raise ValueError(f"Minimal deposit {rupiah(min_topup)}.")
+    if amount > max_topup:
+        raise ValueError(f"Maksimal deposit {rupiah(max_topup)} per transaksi.")
+    conn = db_connect()
+    try:
+        active = conn.execute(
+            "SELECT COUNT(*) n FROM deposits WHERE user_id=? AND status IN ('PENDING','PAID') AND created_at>=?",
+            (int(user_id), int(time.time()) - 3600),
+        ).fetchone()["n"]
+    finally:
+        conn.close()
+    if int(active) >= 3:
+        raise ValueError("Terlalu banyak invoice deposit aktif. Selesaikan atau tunggu invoice lama kedaluwarsa.")
+    unique_code, total = _allocate_total(amount)
+    try:
+        qr = gopay_build_qris(total)
+        if not qr:
+            raise ValueError("Gagal membuat QRIS GoPay. Hubungi admin.")
+        invoice = _deposit_code()
+        now = int(time.time())
+        expires = now + int(settings.get("premium_expiry_min", "15")) * 60
+        conn = db_connect()
+        try:
+            conn.execute(
+                "INSERT INTO deposits(invoice,user_id,amount,unique_code,total,status,qr_string,"
+                "buyer_ip,user_agent,created_at,expires_at) VALUES(?,?,?,?,?,'PENDING',?,?,?,?,?)",
+                (invoice, int(user_id), amount, unique_code, total, qr, ip, (user_agent or "")[:300], now, expires),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    finally:
+        _release_total(total)
+    audit_user(int(user_id), "deposit_invoice", f"{invoice} amount={amount} total={total}", ip)
+    return deposit_by_invoice(invoice)
+
+def expire_deposits() -> int:
+    conn = db_connect()
+    try:
+        cur = conn.execute(
+            "UPDATE deposits SET status='EXPIRED' WHERE status='PENDING' AND expires_at<?",
+            (int(time.time()),),
+        )
+        conn.commit()
+        return int(cur.rowcount or 0)
+    finally:
+        conn.close()
+
+def _deposit_references() -> set[str]:
+    conn = db_connect()
+    try:
+        return {
+            str(r[0])
+            for r in conn.execute(
+                "SELECT reference FROM deposits WHERE reference IS NOT NULL AND reference!=''"
+            )
+        }
+    finally:
+        conn.close()
+
+def _credit_deposit(invoice: str, reference: str) -> bool:
+    now = int(time.time())
+    conn = db_connect()
+    user = None
+    row = None
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute("SELECT * FROM deposits WHERE invoice=?", (invoice,)).fetchone()
+        if not row or row["status"] == "PAID":
+            conn.rollback()
+            return False
+        amount_milli = int(row["amount"]) * 1000
+        user = conn.execute("SELECT balance_milli,email FROM users WHERE id=?", (int(row["user_id"]),)).fetchone()
+        if not user:
+            conn.rollback()
+            return False
+        new_balance = int(user["balance_milli"] or 0) + amount_milli
+        conn.execute(
+            "UPDATE deposits SET status='PAID', reference=?, paid_at=?, credited_milli=?, notified=1 WHERE invoice=?",
+            (reference[:120], now, amount_milli, invoice),
+        )
+        conn.execute(
+            "UPDATE users SET balance_milli=?, updated_at=? WHERE id=?",
+            (new_balance, now, int(row["user_id"])),
+        )
+        conn.execute(
+            "INSERT INTO wallet_ledger(user_id,at,kind,amount_milli,balance_after_milli,ref,note)"
+            " VALUES(?,?,?,?,?,?,?)",
+            (int(row["user_id"]), now, "deposit", amount_milli, new_balance, invoice, "Top up saldo"),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        logger.error("credit deposit %s: %s", invoice, traceback.format_exc())
+        return False
+    finally:
+        conn.close()
+    audit("deposit_paid", f"{invoice} user={row['user_id']} amount={row['amount']} ref={reference}", row["buyer_ip"])
+    telegram_send(
+        f"<b>💰 DEPOSIT SALDO MASUK</b>\n"
+        f"Invoice : <code>{e(invoice)}</code>\n"
+        f"User    : <code>{e(user['email'])}</code>\n"
+        f"Nominal : <code>{rupiah(int(row['amount']))}</code>\n"
+        f"Saldo   : <code>{rupiah_milli(new_balance)}</code>"
+    )
+    return True
+
+def poll_deposits() -> None:
+    expire_deposits()
+    conn = db_connect()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM deposits WHERE status IN ('PENDING','EXPIRED') AND created_at>=? ORDER BY created_at ASC",
+            (int(time.time()) - 48 * 86400,),
+        ).fetchall()
+        refs = {
+            str(r["reference"])
+            for r in conn.execute("SELECT reference FROM orders WHERE reference IS NOT NULL AND reference!=''")
+        }
+    finally:
+        conn.close()
+    pending = _pending_matchable(rows)
+    if not pending:
+        return
+    ready, reason = gopay_ready()
+    if not ready:
+        pay_state_set("gopay_error", reason)
+        return
+    used = refs | _bot_paid_references() | _deposit_references()
+    matched = 0
+    for row in pending:
+        txid = gopay_match(int(row["total"]), int(row["created_at"]), used)
+        if not txid:
+            continue
+        used.add(txid)
+        if _credit_deposit(row["invoice"], txid):
+            matched += 1
+            logger.info("deposit paid %s ref=%s", row["invoice"], txid)
+    if matched:
+        pay_state_set("gopay_last_match", str(int(time.time())))
+
+def deposit_history(user_id: int, limit: int = 50) -> list[sqlite3.Row]:
+    conn = db_connect()
+    try:
+        return conn.execute(
+            "SELECT * FROM deposits WHERE user_id=? ORDER BY id DESC LIMIT ?",
+            (int(user_id), max(1, int(limit))),
+        ).fetchall()
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------
@@ -2264,6 +2985,15 @@ def _allocate_total(price: int) -> tuple[int, int]:
                     (now - PREMIUM_EXPIRED_GRACE,),
                 )
             }
+            used |= {
+                int(r["total"])
+                for r in conn.execute(
+                    "SELECT total FROM deposits "
+                    "WHERE status IN ('PENDING','PAID') "
+                    "OR (status='EXPIRED' AND expires_at>=?)",
+                    (now - PREMIUM_EXPIRED_GRACE,),
+                )
+            }
         finally:
             conn.close()
         used |= RESERVED_TOTALS
@@ -2539,7 +3269,7 @@ def poll_premium_orders() -> None:
     if not history:
         pay_state_set("gopay_pending", str(len(pending)))
         return
-    used = set(refs) | _bot_paid_references()
+    used = set(refs) | _bot_paid_references() | _deposit_references()
     matched = 0
     for row in pending:
         txid = gopay_match(int(row["total"]), int(row["created_at"]), used)
@@ -2568,6 +3298,7 @@ def payment_daemon() -> None:
     while True:
         try:
             poll_premium_orders()
+            poll_deposits()
         except Exception:
             logger.error("payment daemon: %s", traceback.format_exc())
         time.sleep(10)
@@ -2966,11 +3697,20 @@ def user_accounts(user_id: int) -> list[dict]:
     conn = db_connect()
     try:
         free_rows = conn.execute(
-            "SELECT * FROM accounts WHERE user_id=? AND status IN ('active','failed') ORDER BY id DESC",
+            "SELECT * FROM accounts WHERE user_id=? AND status IN ('active','failed') AND kind='free' ORDER BY id DESC",
             (int(user_id),),
         ).fetchall()
         order_rows = conn.execute(
             "SELECT * FROM orders WHERE user_id=? AND status='COMPLETED' ORDER BY id DESC",
+            (int(user_id),),
+        ).fetchall()
+        payg_rows = conn.execute(
+            "SELECT a.*, p.id AS payg_id, p.state AS payg_state, p.started_at AS payg_started_at,"
+            " p.stopped_at AS payg_stopped_at, p.last_billed_at AS payg_last_billed_at,"
+            " p.spent_milli AS payg_spent_milli, p.total_seconds AS payg_total_seconds,"
+            " p.last_error AS payg_last_error"
+            " FROM accounts a JOIN payg_accounts p ON p.account_id=a.id"
+            " WHERE a.user_id=? ORDER BY a.id DESC",
             (int(user_id),),
         ).fetchall()
     finally:
@@ -3043,6 +3783,50 @@ def user_accounts(user_id: int) -> list[dict]:
             "expired": expires < now,
         })
 
+    for row in payg_rows:
+        username = row["username"]
+        paths = account_paths(row["service"], row["protocol"], username)
+        quota = _int_file(paths["quota"])
+        usage = _int_file(paths["usage"])
+        ip_limit = _int_file(paths["ip"])
+        state = mullog_state_for(states, username, row["protocol"] if row["service"] == "xray" else "")
+        expires = int(row["expires_at"] or 0)
+        payg_state = str(row["payg_state"] or PAYG_PAUSED)
+        accounts.append({
+            "source": "payg",
+            "username": username,
+            "service": row["service"],
+            "protocol": row["protocol"] or "",
+            "days": 0,
+            "created_at": int(row["created_at"] or 0),
+            "expires_at": expires,
+            "output": row["output"] or "",
+            "error": row["error"] or "",
+            "row_status": row["status"],
+            "token": row["token"],
+            "invoice": "",
+            "quota_bytes": quota,
+            "usage_bytes": usage,
+            "today_bytes": usage_today(username, usage, int(row["created_at"] or 0)),
+            "ip_limit": ip_limit,
+            "suspended": state,
+            "expired": expires < now,
+            "payg_id": int(row["payg_id"]),
+            "payg_state": payg_state,
+            "payg_started_at": int(row["payg_started_at"] or 0),
+            "payg_spent_milli": int(row["payg_spent_milli"] or 0),
+            "payg_total_seconds": int(row["payg_total_seconds"] or 0),
+            "payg_last_error": row["payg_last_error"] or "",
+            "payg_rate": payg_rates(row["service"]),
+        })
+
+    balance_milli = wallet_balance_milli(user_id)
+    payg_settings = get_settings()
+    min_balance_milli = _setting_int(payg_settings, "payg_min_balance", 1000) * 1000
+    for item in accounts:
+        if item.get("source") == "payg":
+            item["balance_milli"] = balance_milli
+            item["payg_min_balance_milli"] = min_balance_milli
     accounts.sort(key=lambda item: item["created_at"], reverse=True)
     online = collect_online_ips(accounts)
     for item in accounts:
@@ -3057,6 +3841,8 @@ def dashboard_data(user_id: int) -> dict:
     expired = [a for a in accounts if a["expired"]]
     today_total = sum(int(a["today_bytes"]) for a in accounts)
     usage_total = sum(int(a["usage_bytes"]) for a in accounts)
+    payg = [a for a in accounts if a["source"] == "payg"]
+    settings = get_settings()
     return {
         "accounts": accounts,
         "active": active,
@@ -3066,6 +3852,17 @@ def dashboard_data(user_id: int) -> dict:
         "usage_total": usage_total,
         "orders": user_orders(user_id),
         "security_ok": not suspended,
+        "balance_milli": wallet_balance_milli(user_id),
+        "payg": payg,
+        "payg_running": [a for a in payg if a.get("payg_state") == PAYG_RUNNING],
+        "payg_settings": {
+            "enabled": settings.get("payg_enabled", "1") == "1",
+            "min_balance_milli": _setting_int(settings, "payg_min_balance", 1000) * 1000,
+            "min_topup": _setting_int(settings, "payg_min_topup", 5000),
+            "rates_ssh": payg_rates("ssh", settings),
+            "rates_xray": payg_rates("xray", settings),
+        },
+        "deposits": deposit_history(user_id, 20),
     }
 
 
@@ -3303,7 +4100,28 @@ class Handler(BaseHTTPRequestHandler):
                     self.redirect("/login?next=/premium")
                     return
                 token, cookie = self.public_form_token()
-                self.html(200, render_premium_page(token, get_settings()), cookies=[cookie] if cookie else None, head_only=head_only)
+                scheme = (query.get("scheme", ["duration"])[0] or "duration").strip().lower()
+                self.html(200, render_premium_page(token, get_settings(), scheme), cookies=[cookie] if cookie else None, head_only=head_only)
+                return
+            if path == "/deposit" or path == "/deposit/":
+                if not self.user_session():
+                    self.redirect("/login?next=/deposit")
+                    return
+                token, cookie = self.public_form_token()
+                msg = (query.get("msg", [""])[0] or "")[:30]
+                self.html(
+                    200,
+                    render_deposit_page(token, get_settings(), int(self.user_session()["user_id"]), msg),
+                    cookies=[cookie] if cookie else None,
+                    extra_headers={"Cache-Control": "no-store", "X-Robots-Tag": "noindex, nofollow"},
+                    head_only=head_only,
+                )
+                return
+            if path.startswith("/deposit/"):
+                self.deposit_invoice_page(path[len("/deposit/"):], head_only)
+                return
+            if path.startswith("/api/deposit/"):
+                self.api_deposit(path.split("/", 3)[3])
                 return
             if path == "/kontak" or path == "/kontak/":
                 self.html(200, render_contact_page(get_settings()), head_only=head_only)
@@ -3491,6 +4309,18 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/premium/buy":
                 self.premium_buy()
                 return
+            if path == "/deposit":
+                self.deposit_post()
+                return
+            if path == "/payg/create":
+                self.payg_create_post()
+                return
+            if path == "/dashboard/payg/start":
+                self.payg_start_post()
+                return
+            if path == "/dashboard/payg/stop":
+                self.payg_stop_post()
+                return
             if path == "/cek-invoice":
                 self.check_invoice_post()
                 return
@@ -3538,6 +4368,15 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/admin/mail":
                 self.admin_mail()
+                return
+            if path == "/admin/payg":
+                self.admin_payg()
+                return
+            if path == "/admin/wallet":
+                self.admin_wallet()
+                return
+            if path == "/admin/deposit":
+                self.admin_deposit()
                 return
             self.html(404, render_not_found())
         except ValueError as exc:
@@ -3635,6 +4474,182 @@ class Handler(BaseHTTPRequestHandler):
             self.html(500, render_error("Gagal membuat invoice. Silakan coba lagi atau hubungi admin.", retry=True))
             return
         self.redirect(f"/invoice/{order['invoice']}?new=1")
+
+    def deposit_post(self) -> None:
+        session = self.user_session()
+        if not session:
+            self.redirect("/login?next=/deposit")
+            return
+        body = self.parse_body()
+        token_cookie = self.cookie(FORM_COOKIE)
+        if not token_cookie or not hmac.compare_digest(body.get("_form", ""), token_cookie):
+            self.html(400, render_error("Sesi formulir kedaluwarsa. Muat ulang halaman lalu coba lagi."))
+            return
+        if not rate_ok("deposit:" + self.client_ip(), 6, 600):
+            self.html(429, render_error("Terlalu banyak percobaan. Tunggu beberapa menit lalu coba lagi."))
+            return
+        ts_ok, ts_msg = verify_turnstile(body.get("cf-turnstile-response", ""), self.client_ip())
+        if not ts_ok:
+            self.html(400, render_error(ts_msg, retry=True))
+            return
+        try:
+            amount = int(body.get("amount", "0"))
+        except ValueError:
+            amount = 0
+        try:
+            row = create_deposit(int(session["user_id"]), amount, self.client_ip(), self.headers.get("User-Agent", ""))
+        except ValueError as exc:
+            text = str(exc)
+            if "Minimal deposit" in text or "Maksimal deposit" in text:
+                self.redirect("/deposit?msg=amount")
+            elif "Terlalu banyak" in text:
+                self.redirect("/deposit?msg=limit")
+            else:
+                self.redirect("/deposit?msg=fail")
+            return
+        except Exception:
+            logger.error("deposit post: %s", traceback.format_exc())
+            self.redirect("/deposit?msg=fail")
+            return
+        self.redirect(f"/deposit/{row['invoice']}?new=1")
+
+    def payg_create_post(self) -> None:
+        session = self.user_session()
+        if not session:
+            self.redirect("/login?next=%2Fpremium%3Fscheme%3Dpayg")
+            return
+        body = self.parse_body()
+        token_cookie = self.cookie(FORM_COOKIE)
+        if not token_cookie or not hmac.compare_digest(body.get("_form", ""), token_cookie):
+            self.html(400, render_error("Sesi formulir kedaluwarsa. Muat ulang halaman lalu coba lagi."))
+            return
+        if not rate_ok("payg:" + self.client_ip(), 6, 600):
+            self.html(429, render_error("Terlalu banyak percobaan. Tunggu beberapa menit lalu coba lagi."))
+            return
+        ts_ok, ts_msg = verify_turnstile(body.get("cf-turnstile-response", ""), self.client_ip())
+        if not ts_ok:
+            self.html(400, render_error(ts_msg, retry=True))
+            return
+        service = body.get("service", "")
+        protocol = body.get("protocol", "")
+        try:
+            payg_create_account(
+                int(session["user_id"]),
+                service,
+                protocol,
+                self.client_ip(),
+                self.headers.get("User-Agent", ""),
+            )
+        except ValueError as exc:
+            text = str(exc)
+            if "Saldo minimal" in text:
+                self.redirect("/dashboard?msg=payg-nobalance")
+            else:
+                self.redirect("/dashboard?msg=payg-fail")
+            return
+        except Exception:
+            logger.error("payg create: %s", traceback.format_exc())
+            self.redirect("/dashboard?msg=payg-fail")
+            return
+        self.redirect("/dashboard/akun?msg=payg-created")
+
+    def payg_start_post(self) -> None:
+        body = self.parse_body()
+        session = self.require_user(body.get("_csrf", ""))
+        if not session:
+            return
+        try:
+            payg_id = int(body.get("payg_id", "0"))
+        except ValueError:
+            payg_id = 0
+        try:
+            payg_start(payg_id, int(session["user_id"]))
+        except ValueError as exc:
+            text = str(exc)
+            if "Saldo minimal" in text:
+                self.redirect("/dashboard/akun?msg=payg-nobalance")
+            elif "mullog" in text.lower():
+                self.redirect("/dashboard/akun?msg=payg-mullog")
+            else:
+                self.redirect("/dashboard/akun?msg=payg-fail")
+            return
+        except Exception:
+            logger.error("payg start: %s", traceback.format_exc())
+            self.redirect("/dashboard/akun?msg=payg-fail")
+            return
+        self.redirect("/dashboard/akun?msg=payg-started")
+
+    def payg_stop_post(self) -> None:
+        body = self.parse_body()
+        session = self.require_user(body.get("_csrf", ""))
+        if not session:
+            return
+        try:
+            payg_id = int(body.get("payg_id", "0"))
+        except ValueError:
+            payg_id = 0
+        try:
+            payg_stop(payg_id, int(session["user_id"]))
+        except Exception:
+            logger.error("payg stop: %s", traceback.format_exc())
+            self.redirect("/dashboard/akun?msg=payg-fail")
+            return
+        self.redirect("/dashboard/akun?msg=payg-stopped")
+
+    def deposit_invoice_page(self, suffix: str, head_only: bool = False) -> None:
+        qr = suffix.endswith("/qr.svg")
+        code = suffix[:-7] if qr else suffix
+        code = (code or "").strip().upper()
+        if not re.fullmatch(r"TOP-\d{6}-[A-Z0-9]{8}", code):
+            self.html(404, render_not_found(), head_only=head_only)
+            return
+        row = deposit_by_invoice(code)
+        if not row:
+            self.html(404, render_not_found(), head_only=head_only)
+            return
+        session = self.user_session()
+        if not session:
+            self.redirect("/login?next=" + urllib.parse.quote(self.path[:300], safe="/"))
+            return
+        if int(session["user_id"]) != int(row["user_id"]):
+            self.html(404, render_not_found(), head_only=head_only)
+            return
+        if qr:
+            svg = gopay_qr_svg(row["qr_string"])
+            if not svg:
+                self._send(404, b"QR unavailable", content_type="text/plain")
+                return
+            self._send(200, svg, content_type="image/svg+xml", extra_headers={"Cache-Control": "no-store"}, head_only=head_only)
+            return
+        self.html(
+            200,
+            render_deposit_invoice(row, new=("new=1" in self.path)),
+            extra_headers={"Cache-Control": "no-store", "X-Robots-Tag": "noindex, nofollow"},
+            head_only=head_only,
+        )
+
+    def api_deposit(self, code: str) -> None:
+        code = (code or "").strip().upper()
+        if not re.fullmatch(r"TOP-\d{6}-[A-Z0-9]{8}", code):
+            self.json(404, {"ok": False, "error": "not found"})
+            return
+        row = deposit_by_invoice(code)
+        if not row:
+            self.json(404, {"ok": False, "error": "not found"})
+            return
+        session = self.user_session()
+        if not session or int(session["user_id"]) != int(row["user_id"]):
+            self.json(403, {"ok": False, "error": "forbidden"})
+            return
+        self.json(200, {
+            "ok": True,
+            "invoice": row["invoice"],
+            "status": row["status"],
+            "amount": int(row["amount"]),
+            "total": int(row["total"]),
+            "paid_at": row["paid_at"],
+            "balance_milli": wallet_balance_milli(int(row["user_id"])),
+        })
 
     def check_invoice_page(self, query: dict, head_only: bool = False) -> None:
         code = (query.get("code", [""])[0] or "").strip().upper()[:80]
@@ -3858,7 +4873,7 @@ class Handler(BaseHTTPRequestHandler):
         if not session:
             return
         section = path[len("/dashboard"):].strip("/").split("/")[0] or "overview"
-        if section not in ("overview", "akun", "mullog", "invoice", "profil"):
+        if section not in ("overview", "akun", "saldo", "mullog", "invoice", "profil"):
             self.html(404, render_not_found(), head_only=head_only)
             return
         msg = (query.get("msg", [""])[0] or "").strip()[:40]
@@ -4237,6 +5252,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         values = {}
         for key, (low, high) in INT_SETTINGS.items():
+            if key.startswith("payg_"):
+                continue
             raw = body.get(key, "0").strip()
             try:
                 num = int(raw)
@@ -4389,6 +5406,72 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.redirect("/admin?msg=mail")
 
+    def admin_payg(self) -> None:
+        body = self.parse_body()
+        session = self.require_admin(body.get("_csrf", ""))
+        if not session:
+            return
+        enabled = "1" if body.get("payg_enabled") == "1" else "0"
+        values = {"payg_enabled": enabled}
+        for key in ("payg_base_ssh_30d", "payg_base_xray_30d", "payg_min_balance", "payg_min_topup", "payg_max_topup"):
+            low, high = INT_SETTINGS[key]
+            try:
+                num = int(body.get(key, "0"))
+            except ValueError:
+                num = 0
+            values[key] = str(max(low, min(high, num)))
+        if int(values["payg_max_topup"]) < int(values["payg_min_topup"]):
+            values["payg_max_topup"] = values["payg_min_topup"]
+        if enabled != "1":
+            payg_stop_all()
+        else:
+            payg_settle_all()
+        set_settings(values)
+        audit("payg_settings", json.dumps(values, sort_keys=True), self.client_ip())
+        self.redirect("/admin?msg=payg")
+
+    def admin_wallet(self) -> None:
+        body = self.parse_body()
+        session = self.require_admin(body.get("_csrf", ""))
+        if not session:
+            return
+        email = normalize_email(body.get("email", ""))
+        user = user_by_email(email)
+        if not user:
+            self.redirect("/admin?msg=walletfail")
+            return
+        try:
+            amount = abs(int(body.get("amount", "0")))
+        except ValueError:
+            amount = 0
+        if amount <= 0:
+            self.redirect("/admin?msg=walletfail")
+            return
+        action = body.get("action", "add")
+        note = body.get("note", "").strip()[:200]
+        if action == "subtract":
+            wallet_deduct(int(user["id"]), amount * 1000, "admin", ref="admin", note=note or "Penyesuaian admin")
+        else:
+            wallet_add(int(user["id"]), amount * 1000, "admin", ref="admin", note=note or "Penyesuaian admin")
+        audit("wallet_adjust", f"user={email} {action} {amount}", self.client_ip())
+        self.redirect("/admin?msg=wallet")
+
+    def admin_deposit(self) -> None:
+        body = self.parse_body()
+        session = self.require_admin(body.get("_csrf", ""))
+        if not session:
+            return
+        invoice = body.get("invoice", "").strip().upper()
+        row = deposit_by_invoice(invoice)
+        if not row:
+            self.redirect("/admin?msg=depositfail")
+            return
+        if row["status"] == "PAID":
+            self.redirect("/admin?msg=depositpaid")
+            return
+        ok = _credit_deposit(invoice, "MANUAL-ADMIN")
+        self.redirect("/admin?msg=depositok" if ok else "/admin?msg=depositfail")
+
     def admin_delete(self) -> None:
         body = self.parse_body()
         session = self.require_admin(body.get("_csrf", ""))
@@ -4397,7 +5480,7 @@ class Handler(BaseHTTPRequestHandler):
         account_id = body.get("id", "")
         conn = db_connect()
         try:
-            row = conn.execute("SELECT * FROM accounts WHERE id=? AND status='active'", (account_id,)).fetchone()
+            row = conn.execute("SELECT * FROM accounts WHERE id=? AND status='active' AND kind='free'", (account_id,)).fetchone()
         finally:
             conn.close()
         if not row:
@@ -4531,6 +5614,7 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
             ("home", "/", "Beranda"),
             ("premium", "/premium", "Beli Akun"),
             ("free", "/gratis", "Buat Akun"),
+            ("deposit", "/deposit", "Deposit"),
             ("invoice", "/cek-invoice", "Cek Invoice"),
             ("contact", "/kontak", "Kontak"),
         ]
@@ -4543,15 +5627,24 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
             menu_parts.append(f'<a href="{href}" class="{cls}"{aria}>{label}</a>')
         menu = "".join(menu_parts)
         if cu:
+            try:
+                cu_balance = int(cu["balance_milli"] or 0)
+            except Exception:
+                cu_balance = 0
             auth_menu = f"""
+      <a class="nav-link nav-balance-chip" href="/deposit">{icon('wallet')}<span>Saldo <b>{rupiah_milli(cu_balance, strip=True)}</b></span></a>
       <a class="nav-link nav-user-chip" href="/dashboard/profil"><span class="nav-avatar">{e((cu['email'][:1] or 'M').upper())}</span><span class="nav-email">{e(cu['email'])}</span></a>
       <form method="post" action="/logout" class="nav-logout"><input type="hidden" name="_csrf" value="{e(cu['csrf'])}"><button class="nav-link nav-logout-btn" type="submit">Keluar</button></form>"""
-            drawer_cta = '<a class="nav-drawer-cta" href="/dashboard">Buka dashboard <span aria-hidden="true">↗</span></a>'
+            drawer_cta = (
+                '<a class="nav-drawer-cta" href="/dashboard">Buka dashboard <span aria-hidden="true">↗</span></a>'
+                '<a class="nav-drawer-cta" href="/deposit">Deposit / top up saldo <span aria-hidden="true">↗</span></a>'
+            )
         else:
             auth_menu = ""
             drawer_cta = (
                 '<a class="nav-drawer-cta" href="/login">Login <span aria-hidden="true">↗</span></a>'
                 '<a class="nav-drawer-cta" href="/register">Daftar gratis <span aria-hidden="true">↗</span></a>'
+                '<a class="nav-drawer-cta" href="/deposit">Deposit / top up saldo <span aria-hidden="true">↗</span></a>'
             )
         header = f"""
 <header class="nav nav-public">
@@ -4584,6 +5677,7 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
       <a href="/">Beranda</a>
       <a href="/gratis">Akun gratis</a>
       <a href="/premium">Premium</a>
+      <a href="/deposit">Deposit Saldo</a>
       <a href="/dashboard">Dashboard</a>
       <a href="/cek-invoice">Cek Invoice</a>
       <a href="/kontak">Kontak</a>
@@ -4602,14 +5696,14 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
 <meta name="theme-color" content="{UI_THEME_COLORS.get(b['theme'], '#fffaf2')}">
 {robots}
 {favicon}
-<link rel="stylesheet" href="/static/style.css?v=20261107themes6">
+<link rel="stylesheet" href="/static/style.css?v=20261107payg1">
 {turnstile_script}
 </head>
 <body>
 {header}
 {body}
 {footer}
-<script src="/static/app.js?v=20261107themes6" defer></script>
+<script src="/static/app.js?v=20261107payg1" defer></script>
 </body>
 </html>"""
 
@@ -4630,6 +5724,7 @@ def icon(name: str) -> str:
         "shield": '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 2.5 20 6v6.2c0 5.1-3.3 8.7-8 10.3-4.7-1.6-8-5.2-8-10.3V6l8-3.5Z" fill="none" stroke="currentColor" stroke-width="2"/><path d="m8.5 12 2.3 2.3 4.7-4.8" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
         "download": '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v12m0 0 4-4m-4 4-4-4M5 20h14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>',
         "copy": '<svg viewBox="0 0 24 24" aria-hidden="true"><rect x="8" y="8" width="11" height="12" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M16 8V6a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v10a2 2 0 0 0 2 2h2" fill="none" stroke="currentColor" stroke-width="2"/></svg>',
+        "wallet": '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7.5A2.5 2.5 0 0 1 6.5 5H18a2 2 0 0 1 2 2v1.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><rect x="3" y="7.5" width="18" height="12" rx="2.5" fill="none" stroke="currentColor" stroke-width="2"/><path d="M16 13.5h2.5" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>',
     }
     return icons.get(name, "")
 
@@ -4747,6 +5842,28 @@ def _premium_context(settings: dict[str, str]) -> dict:
         notice = '<div class="notice notice-warn"><strong>Premium sedang ditutup.</strong> Admin belum membuka paket jualan.</div>'
 
     cheapest_all = min((int(row["price"]) for row in rows), default=0)
+    cu = current_user()
+    payg_rows = []
+    payg_on = settings.get("payg_enabled", "1") == "1" and not maintenance
+    if payg_on:
+        for proto in ("ssh", "vmess", "vless", "trojan"):
+            service = "ssh" if proto == "ssh" else "xray"
+            if service == "ssh" and not ssh_global:
+                continue
+            if service == "xray" and (not xray_global or not proto_on.get(proto, False)):
+                continue
+            existing = payg_existing(int(cu["user_id"]), service, "") if cu and service == "ssh" else (
+                payg_existing(int(cu["user_id"]), service, proto) if cu else None
+            )
+            payg_rows.append({
+                "protocol": proto,
+                "service": service,
+                "label": "SSH" if proto == "ssh" else PROTOCOLS[proto]["label"],
+                "sub": SERVICES[service]["sub"],
+                "rates": payg_rates(service, settings),
+                "existing": existing,
+            })
+    balance_milli = wallet_balance_milli(int(cu["user_id"])) if cu else 0
     return {
         "premium_on": premium_on,
         "rows": rows,
@@ -4759,6 +5876,11 @@ def _premium_context(settings: dict[str, str]) -> dict:
         "xray_global": xray_global,
         "proto_on": proto_on,
         "cheapest": cheapest_all,
+        "payg_on": payg_on,
+        "payg_rows": payg_rows,
+        "payg_balance_milli": balance_milli,
+        "payg_min_balance_milli": _setting_int(settings, "payg_min_balance", 1000) * 1000,
+        "payg_min_topup": _setting_int(settings, "payg_min_topup", 5000),
     }
 
 
@@ -4793,6 +5915,15 @@ def render_home(form_token: str, settings: dict[str, str]) -> str:
     premium_price = rupiah(pc["cheapest"]) if pc["cheapest"] else "—"
     free_note = "" if fc["free_on"] else '<div class="notice notice-error"><strong>Kategori gratis sedang ditutup.</strong></div>'
     premium_note = "" if pc["premium_on"] else '<div class="notice notice-warn"><strong>Premium sedang ditutup.</strong></div>'
+    cu = current_user()
+    balance_milli = wallet_balance_milli(int(cu["user_id"])) if cu else 0
+    payg_on = settings.get("payg_enabled", "1") == "1" and settings.get("maintenance") != "1"
+    rates_ssh = payg_rates("ssh", settings)
+    rates_xray = payg_rates("xray", settings)
+    payg_hour_min = min(rates_ssh["hour_milli"], rates_xray["hour_milli"])
+    wallet_balance_text = rupiah_milli(balance_milli, strip=True) if cu else "Rp 0"
+    deposit_cta = "/deposit" if cu else "/login?next=/deposit"
+    payg_off_note = "" if payg_on else '<div class="notice notice-warn compact-notice"><b>Pay As You Go sedang ditutup.</b> Deposit tetap bisa dilakukan.</div>'
     body = f"""
 <main>
   <section class="hero wrap">
@@ -4842,6 +5973,32 @@ def render_home(form_token: str, settings: dict[str, str]) -> str:
     </div>
   </section>
 
+  <section class="section wrap wallet-band" id="saldo">
+    <div class="wallet-promo panel">
+      <div class="wallet-promo-copy">
+        <div class="eyebrow"><span class="dot"></span> SALDO &amp; PAY AS YOU GO</div>
+        <h2>Isi saldo.<br><em>Nyalakan saat butuh.</em></h2>
+        <p>Beli paket durasi seperti biasa, atau pakai Pay As You Go: saldo hanya terpotong saat akun Anda ON. Tarif otomatis mengikuti harga patokan admin.</p>
+        {payg_off_note}
+        <div class="wallet-promo-actions">
+          <a class="btn btn-primary" href="{deposit_cta}">{icon('wallet')} Deposit saldo</a>
+          <a class="btn btn-ghost" href="/premium?scheme=payg">Lihat tarif PAYG</a>
+        </div>
+        <small class="wallet-promo-note">Minimal top up {rupiah(_setting_int(settings, "payg_min_topup", 5000))} · saldo aktif di semua akun PAYG.</small>
+      </div>
+      <div class="wallet-promo-card">
+        <span class="mini-label">{'SALDO ANDA' if cu else 'MULAI DARI'}</span>
+        <b class="wallet-promo-amount">{wallet_balance_text if cu else rupiah_milli(payg_hour_min)}</b>
+        <small>{'Siap dipakai untuk akun Pay As You Go.' if cu else 'per jam, tarif PAYG termurah'}</small>
+        <div class="wallet-promo-rates">
+          <div><span>SSH</span><b>{rupiah_milli(rates_ssh['hour_milli'])} / jam</b></div>
+          <div><span>Xray</span><b>{rupiah_milli(rates_xray['hour_milli'])} / jam</b></div>
+        </div>
+        <a class="btn btn-dark btn-block" href="{deposit_cta}">Top up sekarang <span aria-hidden="true">↗</span></a>
+      </div>
+    </div>
+  </section>
+
   <section class="section wrap category-section" id="layanan">
     <div class="section-head">
       <div>
@@ -4870,10 +6027,10 @@ def render_home(form_token: str, settings: dict[str, str]) -> str:
         <h3>Akun premium</h3>
         <p>Masa aktif lebih panjang, limit IP dan kuota per paket, tanpa kuota pembelian harian.</p>
         <ul>
-          <li>Multi-durasi 3 / 7 / 30 hari</li>
+          <li>Paket durasi 3 / 7 / 30 hari</li>
+          <li>Atau Pay As You Go dari saldo</li>
           <li>SSH, VMess, VLESS, Trojan</li>
           <li>Bayar QRIS GoPay</li>
-          <li>Invoice bisa dicek ulang</li>
         </ul>
         <a class="btn btn-dark btn-block" href="/premium">Beli akun premium <span aria-hidden="true">↗</span></a>
       </article>
@@ -5017,9 +6174,10 @@ def render_free_page(form_token: str, settings: dict[str, str]) -> str:
     return page_shell("Buat Akun Gratis", body, active="free", turnstile=ts_on)
 
 
-def render_premium_page(form_token: str, settings: dict[str, str]) -> str:
+def render_premium_page(form_token: str, settings: dict[str, str], scheme: str = "duration") -> str:
     pc = _premium_context(settings)
     b = branding()
+    scheme = "payg" if scheme == "payg" else "duration"
     premium_json = json.dumps(pc["data"], ensure_ascii=False).replace("</", "<\\/")
     ts_site, _ts_secret, ts_on = turnstile_config()
     server_strip = server_strip_html()
@@ -5031,24 +6189,102 @@ def render_premium_page(form_token: str, settings: dict[str, str]) -> str:
         if ts_on
         else ""
     )
+    tabs = f"""
+    <div class="scheme-tabs" role="tablist" aria-label="Skema pembelian">
+      <a class="scheme-tab{' active' if scheme == 'duration' else ''}" href="/premium" role="tab" aria-selected="{'true' if scheme == 'duration' else 'false'}">
+        <b>Paket Durasi</b><small>Bayar di awal, 3 / 7 / 30 hari</small>
+      </a>
+      <a class="scheme-tab{' active' if scheme == 'payg' else ''}" href="/premium?scheme=payg" role="tab" aria-selected="{'true' if scheme == 'payg' else 'false'}">
+        <b>Pay As You Go</b><small>Saldo terpotong saat akun ON</small>
+      </a>
+    </div>"""
     chips = (
         f'<span class="page-chip">Mulai {rupiah(pc["cheapest"])}</span>'
         f'<span class="page-chip">Invoice {e(settings.get("premium_expiry_min", "15"))} menit</span>'
         '<span class="page-chip">QRIS GoPay</span>'
+        f'<span class="page-chip">Saldo {rupiah_milli(pc["payg_balance_milli"], strip=True)}</span>'
     )
-    hero = _page_hero(
-        e(b["name"].upper()) + " PREMIUM",
-        "Beli sekali.<br><em>Khusus member.</em>",
-        "Pilih layanan dan masa aktif, bayar QRIS GoPay, lalu simpan invoice. Akun dibuat otomatis setelah pembayaran terdeteksi.",
-        chips,
-    )
-    body = f"""
-<main>
-{hero}
-  <section class="section wrap premium-section page-section" id="premium">
-    {pc['notice']}
-    <div class="premium-layout">
-      <div class="premium-picker panel">
+    if scheme == "payg":
+        hero = _page_hero(
+            e(b["name"].upper()) + " PAY AS YOU GO",
+            "Bayar per menit.<br><em>Saat dipakai saja.</em>",
+            "Isi saldo sekali, lalu nyalakan akun saat butuh. Argo berjalan hanya ketika akun ON dan berhenti otomatis saat saldo habis.",
+            chips,
+        )
+    else:
+        hero = _page_hero(
+            e(b["name"].upper()) + " PREMIUM",
+            "Beli sekali.<br><em>Khusus member.</em>",
+            "Pilih layanan dan masa aktif, bayar QRIS GoPay, lalu simpan invoice. Akun dibuat otomatis setelah pembayaran terdeteksi.",
+            chips,
+        )
+
+    payg_cards = []
+    first_payg = None
+    for item in pc["payg_rows"]:
+        rates = item["rates"]
+        existing = item["existing"]
+        if existing is None and first_payg is None:
+            first_payg = item
+        existing_tag = '<span class="payg-existing-tag">Sudah punya</span>' if existing else ""
+        payg_cards.append(
+            f'<button class="payg-service-card{" is-existing" if existing else ""}" type="button"'
+            f' data-payg-service="{e(item["service"])}" data-payg-protocol="{e(item["protocol"])}"'
+            f' data-payg-label="{e(item["label"])}" data-payg-existing="{1 if existing else 0}"'
+            f' data-payg-minute="{e(rupiah_milli(rates["minute_milli"]))}"'
+            f' data-payg-hour="{e(rupiah_milli(rates["hour_milli"]))}"'
+            f' data-payg-day="{e(rupiah_milli(rates["day_milli"]))}">'
+            f'<span class="payg-service-icon">{icon("terminal" if item["service"] == "ssh" else "bolt")}</span>'
+            f'<b>{e(item["label"])}</b>'
+            f'<small>{rupiah_milli(rates["hour_milli"])} / jam</small>'
+            f'<em>{rupiah_milli(rates["minute_milli"])} / menit</em>'
+            f'{existing_tag}'
+            f'</button>'
+        )
+    payg_cards_html = "".join(payg_cards) or '<p class="premium-hint">Pay As You Go belum dibuka admin.</p>'
+    default_service = first_payg["service"] if first_payg else ""
+    default_protocol = first_payg["protocol"] if first_payg else ""
+    payg_can_create = bool(first_payg) and pc["payg_balance_milli"] >= pc["payg_min_balance_milli"]
+    payg_notice = ""
+    if not pc["payg_on"]:
+        payg_notice = '<div class="notice notice-warn"><strong>Pay As You Go sedang ditutup.</strong> Admin belum membuka skema ini.</div>'
+    elif pc["payg_balance_milli"] < pc["payg_min_balance_milli"]:
+        payg_notice = (
+            '<div class="notice notice-warn"><strong>Saldo belum cukup.</strong> '
+            f'Minimal {rupiah_milli(pc["payg_min_balance_milli"])} untuk membuat akun PAYG. '
+            '<a href="/deposit">Top up dulu →</a></div>'
+        )
+    payg_picker = f"""
+        <div class="premium-step">
+          <span class="mini-label">01 · PILIH LAYANAN PAYG</span>
+          <div class="payg-service-grid" id="payg-services">{payg_cards_html}</div>
+        </div>
+        <div class="premium-step">
+          <span class="mini-label">02 · TARIF OTOMATIS</span>
+          <div class="payg-rate-box" id="payg-rate-box">
+            <div><span>Per menit</span><b id="payg-rate-minute">—</b></div>
+            <div><span>Per jam</span><b id="payg-rate-hour">—</b></div>
+            <div><span>Per hari</span><b id="payg-rate-day">—</b></div>
+          </div>
+        </div>
+        {server_strip}
+        <div class="premium-summary payg-summary">
+          <div><span>Saldo Anda</span><b>{rupiah_milli(pc["payg_balance_milli"], strip=True)}</b></div>
+          <div><span>Minimal saldo</span><b>{rupiah_milli(pc["payg_min_balance_milli"])}</b></div>
+          <div><span>Layanan</span><b id="payg-selected-label">—</b></div>
+        </div>
+        <form id="payg-form" method="post" action="/payg/create" data-can-create="{1 if payg_can_create else 0}">
+          <input type="hidden" name="_form" value="{e(form_token)}">
+          <input type="hidden" name="service" id="payg-service" value="{e(default_service)}">
+          <input type="hidden" name="protocol" id="payg-protocol" value="{e(default_protocol)}">
+          {ts_widget}
+          <button class="btn btn-primary btn-block btn-premium" type="submit" id="payg-button" {'disabled' if not payg_can_create else ''}>
+            Buat akun Pay As You Go <span aria-hidden="true">↗</span>
+          </button>
+        </form>
+        <p class="form-note">Saldo <b>tidak dipotong</b> saat akun dibuat. Argo mulai saat Anda menekan <b>Start</b> di dashboard.</p>
+    """
+    duration_picker = f"""
         <div class="premium-step">
           <span class="mini-label">01 · PILIH LAYANAN</span>
           <div class="premium-services" id="premium-services">{pc['cards']}</div>
@@ -5074,34 +6310,45 @@ def render_premium_page(form_token: str, settings: dict[str, str]) -> str:
           </button>
         </form>
         <p class="form-note">Total pembayaran ditambah <b>kode unik Rp1–999</b> agar tidak tertukar dengan pembeli lain. Nominal persis tertera di invoice.</p>
-      </div>
+    """
+    side = f"""
       <aside class="premium-side">
         <div class="panel premium-info">
-          <div class="premium-badge">QRIS GOPAY</div>
-          <h3>Bayar dari mana saja.</h3>
-          <p>Scan QRIS dengan GoPay, OVO, DANA, ShopeePay, atau m-banking. Akun dibuat otomatis setelah transaksi terdeteksi.</p>
+          <div class="premium-badge">{'SALDO PAYG' if scheme == 'payg' else 'QRIS GOPAY'}</div>
+          <h3>{'Argo per menit.' if scheme == 'payg' else 'Bayar dari mana saja.'}</h3>
+          <p>{'Saldo hanya berkurang saat akun berstatus ON. Berhenti otomatis jika saldo habis, dan bisa dinyalakan lagi setelah top up.' if scheme == 'payg' else 'Scan QRIS dengan GoPay, OVO, DANA, ShopeePay, atau m-banking. Akun dibuat otomatis setelah transaksi terdeteksi.'}</p>
           <ul>
             <li>Wajib login, riwayat tersimpan.</li>
-            <li>Invoice {e(settings.get("premium_expiry_min", "15"))} menit dan bisa dicek ulang.</li>
-            <li>Download detail akun <b>.txt</b> setelah lunas.</li>
+            <li>{'Minimal saldo ' + rupiah_milli(pc['payg_min_balance_milli']) + ' untuk Start.' if scheme == 'payg' else 'Invoice ' + e(settings.get('premium_expiry_min', '15')) + ' menit dan bisa dicek ulang.'}</li>
+            <li>{'Tombol Start / Stop ada di dashboard.' if scheme == 'payg' else 'Download detail akun .txt setelah lunas.'}</li>
           </ul>
+          <a class="btn btn-dark btn-block" href="/deposit">{icon('wallet')} Deposit saldo</a>
         </div>
         <div class="panel check-card">
-          <span class="mini-label">SUDAH BELI?</span>
-          <h3>Cek Invoice</h3>
-          <p>Masukkan kode invoice untuk membuka kembali QR, status pembayaran, dan data akun.</p>
-          <a class="btn btn-dark btn-block" href="/cek-invoice">Buka Cek Invoice</a>
+          <span class="mini-label">{'SALDO & RIWAYAT' if scheme == 'payg' else 'SUDAH BELI?'}</span>
+          <h3>{'Cek saldo' if scheme == 'payg' else 'Cek Invoice'}</h3>
+          <p>{'Lihat saldo, riwayat top up, dan pemakaian argo di dashboard.' if scheme == 'payg' else 'Masukkan kode invoice untuk membuka kembali QR, status pembayaran, dan data akun.'}</p>
+          <a class="btn btn-dark btn-block" href="{'/dashboard/saldo' if scheme == 'payg' else '/cek-invoice'}">{'Buka saldo' if scheme == 'payg' else 'Buka Cek Invoice'}</a>
         </div>
         <div class="panel premium-info compact-info">
           <span class="mini-label">ALUR SINGKAT</span>
           <ol class="mini-steps">
-            <li>Pilih paket dan masa aktif.</li>
-            <li>Scan QRIS sesuai nominal.</li>
-            <li>Salin invoice, tunggu akun aktif.</li>
-            <li>Unduh detail akun <b>.txt</b>.</li>
+            {'<li>Isi saldo lewat QRIS.</li><li>Buat akun PAYG.</li><li>Tekan Start saat ingin dipakai.</li><li>Tekan Stop agar saldo berhenti berkurang.</li>' if scheme == 'payg' else '<li>Pilih paket dan masa aktif.</li><li>Scan QRIS sesuai nominal.</li><li>Salin invoice, tunggu akun aktif.</li><li>Unduh detail akun .txt.</li>'}
           </ol>
         </div>
-      </aside>
+      </aside>"""
+    body = f"""
+<main>
+{hero}
+  <section class="section wrap premium-section page-section" id="premium">
+    {tabs}
+    {pc['notice']}
+    {payg_notice if scheme == 'payg' else ''}
+    <div class="premium-layout">
+      <div class="premium-picker panel">
+        {payg_picker if scheme == 'payg' else duration_picker}
+      </div>
+      {side}
     </div>
     <script type="application/json" id="premium-data">{premium_json}</script>
   </section>
@@ -5213,6 +6460,14 @@ def _service_label(service: str, protocol: str) -> str:
 def _account_badge(account: dict) -> tuple[str, str]:
     if account.get("row_status") == "failed":
         return "badge-bad", "Gagal"
+    if account.get("source") == "payg":
+        if account.get("payg_state") == PAYG_SUSPENDED:
+            return "badge-bad", "Saldo habis"
+        if account.get("suspended"):
+            return "badge-bad", "Suspended"
+        if account.get("payg_state") == PAYG_RUNNING:
+            return "badge-ok", "Argo jalan"
+        return "badge-muted", "Paused"
     if account.get("suspended"):
         return "badge-bad", "Suspended"
     if account.get("expired"):
@@ -5267,6 +6522,64 @@ def _online_html(account: dict) -> str:
       </div>"""
 
 
+def _payg_html(account: dict) -> str:
+    if account.get("source") != "payg":
+        return ""
+    state = account.get("payg_state") or PAYG_PAUSED
+    rates = account.get("payg_rate") or payg_rates(account.get("service", "ssh"))
+    balance = int(account.get("balance_milli") or 0)
+    min_balance = int(account.get("payg_min_balance_milli") or 0)
+    spent = int(account.get("payg_spent_milli") or 0)
+    csrf = current_user()["csrf"] if current_user() else ""
+    payg_id = int(account.get("payg_id") or 0)
+    if state == PAYG_RUNNING:
+        label = "Argo berjalan"
+        note = "Saldo dipotong per menit selama akun ON. Tekan Stop untuk menghentikan."
+        action = (
+            f'<form method="post" action="/dashboard/payg/stop" class="inline-form">'
+            f'<input type="hidden" name="_csrf" value="{e(csrf)}">'
+            f'<input type="hidden" name="payg_id" value="{payg_id}">'
+            f'<button class="btn btn-small btn-danger" type="submit">Stop argo</button></form>'
+        )
+        argo = (
+            f'<div class="payg-live" data-argo-start="{int(account.get("payg_started_at") or 0)}"'
+            f' data-argo-rate-milli="{int(rates["minute_milli"])}">'
+            f'<span class="payg-dot"></span><b data-argo-clock>00:00:00</b>'
+            f'<small>± <span data-argo-cost>{rupiah_milli(0)}</span> sesi ini</small></div>'
+        )
+    elif state == PAYG_SUSPENDED:
+        label = "Saldo habis"
+        note = "Akun otomatis dimatikan. Isi saldo lalu tekan Start untuk menyalakan lagi."
+        action = '<a class="btn btn-small btn-primary" href="/deposit">Top up saldo</a>'
+        argo = ""
+    else:
+        label = "Argo berhenti"
+        note = "Saldo tidak berkurang saat Stop. Tekan Start saat akun ingin dipakai."
+        disabled = " disabled" if balance < min_balance else ""
+        action = (
+            f'<form method="post" action="/dashboard/payg/start" class="inline-form">'
+            f'<input type="hidden" name="_csrf" value="{e(csrf)}">'
+            f'<input type="hidden" name="payg_id" value="{payg_id}">'
+            f'<button class="btn btn-small btn-primary" type="submit"{disabled}>Start argo</button></form>'
+        )
+        argo = ""
+    return f"""
+      <div class="payg-panel">
+        <div class="payg-panel-head">
+          <div><span class="mini-label">PAY AS YOU GO</span><b>{e(label)}</b><small>{e(note)}</small></div>
+          <span class="badge {'badge-ok' if state == PAYG_RUNNING else ('badge-bad' if state == PAYG_SUSPENDED else 'badge-muted')}">{e(label)}</span>
+        </div>
+        <div class="payg-metrics">
+          <div><span>Per menit</span><b>{rupiah_milli(rates['minute_milli'])}</b></div>
+          <div><span>Per jam</span><b>{rupiah_milli(rates['hour_milli'])}</b></div>
+          <div><span>Saldo</span><b>{rupiah_milli(balance)}</b></div>
+          <div><span>Sudah terpakai</span><b>{rupiah_milli(spent)}</b></div>
+        </div>
+        {argo}
+        <div class="payg-actions">{action}<a class="btn btn-small btn-ghost" href="/dashboard/saldo">Riwayat saldo</a></div>
+        <small class="payg-foot">Minimal saldo untuk Start: <b>{rupiah_milli(min_balance)}</b> · tarif mengikuti harga patokan admin.</small>
+      </div>"""
+
 def _suspended_html(account: dict) -> str:
     state = account.get("suspended")
     if not state:
@@ -5292,13 +6605,15 @@ def render_account_card(account: dict) -> str:
     expires = int(account.get("expires_at") or 0)
     remaining = max(0, int((expires - time.time()) // 86400) + (1 if expires > time.time() else 0))
     expiry_text = fmt_ts(expires, "%d %b %Y · %H:%M WIB")
-    if account.get("expired"):
+    if account.get("source") == "payg":
+        expiry_text = "Pay As You Go · tanpa masa aktif tetap"
+    elif account.get("expired"):
         expiry_text = "Berakhir " + expiry_text
     else:
         expiry_text = f"{remaining} hari lagi · {expiry_text}"
     download_url = ""
     link_url = ""
-    if account["source"] == "free" and account.get("token"):
+    if account["source"] in ("free", "payg") and account.get("token"):
         download_url = f"/hasil/{account['token']}.txt"
         link_url = f"/hasil/{account['token']}"
     elif account.get("invoice"):
@@ -5325,11 +6640,12 @@ def render_account_card(account: dict) -> str:
           <div class="acct-id">
             <span class="mini-label">{e(_service_label(account['service'], account['protocol']))}</span>
             <b>{e(username)}</b>
-            <small>{e(str(account['days']))} hari · {e('Premium' if account['source'] == 'premium' else 'Gratis')}</small>
+            <small>{e('Pay As You Go · saldo' if account['source'] == 'payg' else (str(account['days']) + ' hari · ' + ('Premium' if account['source'] == 'premium' else 'Gratis')))}</small>
           </div>
           <span class="badge {badge_class}">{badge_text}</span>
         </div>
         {_suspended_html(account)}
+        {_payg_html(account)}
         {error_html}
         <div class="acct-meta">
           <span>{icon('clock')} {e(expiry_text)}</span>
@@ -5482,6 +6798,7 @@ def _dash_nav(active: str) -> str:
     items = [
         ("overview", "/dashboard", "Ringkasan", "globe"),
         ("akun", "/dashboard/akun", "Akun & Monitoring", "terminal"),
+        ("saldo", "/dashboard/saldo", "Saldo & Deposit", "wallet"),
         ("mullog", "/dashboard/mullog", "Cek Mullog", "shield"),
         ("invoice", "/dashboard/invoice", "Riwayat Invoice", "download"),
         ("profil", "/dashboard/profil", "Profil & Password", "clock"),
@@ -5498,6 +6815,7 @@ def _dash_bottom(active: str) -> str:
         ("overview", "/dashboard", "Ringkasan", "globe"),
         ("buat", "/gratis", "Buat", "bolt"),
         ("akun", "/dashboard/akun", "Akun", "terminal"),
+        ("saldo", "/dashboard/saldo", "Saldo", "wallet"),
         ("mullog", "/dashboard/mullog", "Mullog", "shield"),
         ("invoice", "/dashboard/invoice", "Invoice", "download"),
         ("profil", "/dashboard/profil", "Profil", "clock"),
@@ -5515,6 +6833,13 @@ def _dash_alerts(msg: str) -> str:
         "password-wrong": ("error", "Password saat ini salah."),
         "password-short": ("error", "Password baru minimal 8 karakter."),
         "password-mismatch": ("error", "Konfirmasi password baru tidak sama."),
+        "payg-created": ("ok", "Akun Pay As You Go berhasil dibuat. Tekan Start saat ingin dipakai."),
+        "payg-started": ("ok", "Argo Pay As You Go berjalan. Saldo akan dipotong per menit."),
+        "payg-stopped": ("ok", "Argo berhenti. Saldo tidak berkurang sampai Anda menekan Start lagi."),
+        "payg-nobalance": ("error", "Saldo belum cukup. Lakukan deposit lalu tekan Start."),
+        "payg-mullog": ("error", "Akun sedang dibekukan mullog. Tunggu sampai pulih lalu coba lagi."),
+        "payg-fail": ("error", "Aksi Pay As You Go gagal. Coba lagi atau hubungi admin."),
+        "deposit-created": ("ok", "Invoice deposit dibuat. Scan QRIS untuk membayar."),
     }
     if msg in mapping:
         kind, text = mapping[msg]
@@ -5550,13 +6875,28 @@ def render_dashboard_page(session: sqlite3.Row, data: dict, section: str, msg: s
                 for a in data["suspended"]
             )
             suspend_html = f'<div class="notice notice-error"><b>Mullog aktif.</b> Akun berikut sedang dibekukan sementara:<ul class="dash-alert-list">{rows}</ul><a href="/dashboard/mullog">Lihat detail mullog →</a></div>'
+        payg_cards = "".join(render_account_card(a) for a in data["payg"])
+        payg_section = f"""
+        <section class="dash-section">
+          <div class="dash-section-head"><div><span class="mini-label">PAY AS YOU GO</span><h2>Argo &amp; saldo</h2></div><a class="btn btn-ghost btn-small" href="/deposit">Deposit saldo</a></div>
+          <div class="acct-list">{payg_cards}</div>
+        </section>""" if data["payg"] else f"""
+        <section class="dash-section">
+          <div class="dash-section-head"><div><span class="mini-label">PAY AS YOU GO</span><h2>Argo &amp; saldo</h2></div><a class="btn btn-ghost btn-small" href="/premium?scheme=payg">Lihat tarif</a></div>
+          <div class="dash-empty"><b>Belum ada akun Pay As You Go.</b><p>Isi saldo, lalu buat akun yang hanya terpotong saat ON.</p><div class="dash-empty-actions"><a class="btn btn-primary btn-small" href="/deposit">Deposit saldo</a><a class="btn btn-ghost btn-small" href="/premium?scheme=payg">Buat akun PAYG</a></div></div>
+        </section>"""
         content = f"""
         {alerts}
-        <div class="dash-summary">
+        <div class="dash-summary four">
           <article class="dash-stat">
             <span>Total akun aktif</span>
             <b>{len(data['active'])}</b>
             <small>{len(data['expired'])} expired · {len(accounts)} total</small>
+          </article>
+          <article class="dash-stat wallet-stat">
+            <span>Saldo</span>
+            <b>{rupiah_milli(data['balance_milli'], strip=True)}</b>
+            <small><a href="/deposit">Deposit saldo</a> · min {rupiah_milli(data['payg_settings']['min_balance_milli'])}</small>
           </article>
           <article class="dash-stat">
             <span>Pemakaian hari ini</span>
@@ -5570,15 +6910,17 @@ def render_dashboard_page(session: sqlite3.Row, data: dict, section: str, msg: s
           </article>
         </div>
         {suspend_html}
+        {payg_section}
         <section class="dash-section">
           <div class="dash-section-head"><div><span class="mini-label">AKUN TERBARU</span><h2>Akun &amp; monitoring</h2></div><a class="btn btn-ghost btn-small" href="/dashboard/akun">Lihat semua</a></div>
           <div class="acct-list">{recent_html}</div>
         </section>
         <section class="dash-section">
           <div class="dash-section-head"><div><span class="mini-label">AKSES CEPAT</span><h2>Butuh akun baru?</h2></div></div>
-          <div class="dash-quick">
+          <div class="dash-quick four">
             <a class="dash-quick-card" href="/gratis"><span>{icon('terminal')}</span><b>Buat akun gratis</b><small>SSH atau Xray, 3–7 hari.</small></a>
-            <a class="dash-quick-card" href="/premium"><span>{icon('bolt')}</span><b>Beli premium</b><small>QRIS GoPay, masa aktif lebih panjang.</small></a>
+            <a class="dash-quick-card" href="/premium"><span>{icon('bolt')}</span><b>Beli paket durasi</b><small>QRIS GoPay, masa aktif lebih panjang.</small></a>
+            <a class="dash-quick-card" href="/premium?scheme=payg"><span>{icon('wallet')}</span><b>Pay As You Go</b><small>Saldo terpotong hanya saat ON.</small></a>
             <a class="dash-quick-card" href="/dashboard/invoice"><span>{icon('download')}</span><b>Riwayat invoice</b><small>{len(orders)} transaksi tersimpan.</small></a>
           </div>
         </section>"""
@@ -5690,6 +7032,76 @@ def render_dashboard_page(session: sqlite3.Row, data: dict, section: str, msg: s
         </section>
         <div class="dash-note">Invoice lama yang dibuat sebelum fitur akun tetap bisa dibuka lewat <a href="/cek-invoice">Cek Invoice</a> dengan kodenya.</div>"""
         title, subtitle = "Riwayat invoice", "Semua transaksi premium dan file akun tersimpan di sini."
+    elif section == "saldo":
+        balance = int(data["balance_milli"])
+        min_balance = int(data["payg_settings"]["min_balance_milli"])
+        min_topup = int(data["payg_settings"]["min_topup"])
+        rates_ssh = data["payg_settings"]["rates_ssh"]
+        rates_xray = data["payg_settings"]["rates_xray"]
+        dep_rows = ""
+        status_map = {
+            "PENDING": ("badge-warn", "Menunggu"),
+            "PAID": ("badge-ok", "Masuk"),
+            "EXPIRED": ("badge-muted", "Kedaluwarsa"),
+        }
+        for row in data["deposits"]:
+            cls, txt = status_map.get(row["status"], ("badge-muted", row["status"]))
+            dep_rows += (
+                "<tr>"
+                f"<td><a class=\"invoice-link\" href=\"/deposit/{e(row['invoice'])}\"><b>{e(row['invoice'])}</b></a>"
+                f"<small>{e(fmt_ts(row['created_at'], '%d %b %Y · %H:%M'))}</small></td>"
+                f"<td><b>{rupiah(row['amount'])}</b><small>+ kode {rupiah(row['unique_code'])}</small></td>"
+                f"<td><span class=\"badge {cls}\">{txt}</span></td>"
+                "</tr>"
+            )
+        if not dep_rows:
+            dep_rows = '<tr><td colspan="3" class="empty">Belum ada deposit.</td></tr>'
+        ledger_rows = ""
+        kind_labels = {"deposit": "Deposit", "payg": "Pemakaian PAYG", "admin": "Penyesuaian admin", "refund": "Refund"}
+        for row in wallet_ledger(int(session["user_id"]), 40):
+            amount = int(row["amount_milli"])
+            sign = "+" if amount >= 0 else "−"
+            cls = "ledger-plus" if amount >= 0 else "ledger-minus"
+            ledger_rows += (
+                "<tr>"
+                f"<td>{e(fmt_ts(row['at'], '%d %b %Y · %H:%M'))}</td>"
+                f"<td>{e(kind_labels.get(row['kind'], row['kind']))}<small>{e(row['note'] or '')}</small></td>"
+                f"<td class=\"{cls}\">{sign}{rupiah_milli(abs(amount))}</td>"
+                f"<td>{rupiah_milli(row['balance_after_milli'], strip=True)}</td>"
+                "</tr>"
+            )
+        if not ledger_rows:
+            ledger_rows = '<tr><td colspan="4" class="empty">Belum ada mutasi saldo.</td></tr>'
+        content = f"""
+        {alerts}
+        <div class="wallet-hero panel">
+          <div class="wallet-hero-copy">
+            <span class="mini-label">SALDO AKTIF</span>
+            <b>{rupiah_milli(balance, strip=True)}</b>
+            <small>Minimal saldo untuk Start PAYG: {rupiah_milli(min_balance)} · minimal top up {rupiah(min_topup)}.</small>
+          </div>
+          <div class="wallet-hero-actions">
+            <a class="btn btn-primary" href="/deposit">{icon('wallet')} Deposit saldo</a>
+            <a class="btn btn-ghost" href="/premium?scheme=payg">Buat akun PAYG</a>
+          </div>
+        </div>
+        <section class="dash-section">
+          <div class="dash-section-head"><div><span class="mini-label">TARIF OTOMATIS</span><h2>Pay As You Go</h2></div><span class="dash-count">per 30 hari</span></div>
+          <div class="payg-rate-grid">
+            <div class="payg-rate-card"><span class="mini-label">SSH</span><b>{rupiah(rates_ssh['base'])} / 30 hari</b><div><span>Per hari</span><b>{rupiah_milli(rates_ssh['day_milli'])}</b></div><div><span>Per jam</span><b>{rupiah_milli(rates_ssh['hour_milli'])}</b></div><div><span>Per menit</span><b>{rupiah_milli(rates_ssh['minute_milli'])}</b></div></div>
+            <div class="payg-rate-card"><span class="mini-label">XRAY</span><b>{rupiah(rates_xray['base'])} / 30 hari</b><div><span>Per hari</span><b>{rupiah_milli(rates_xray['day_milli'])}</b></div><div><span>Per jam</span><b>{rupiah_milli(rates_xray['hour_milli'])}</b></div><div><span>Per menit</span><b>{rupiah_milli(rates_xray['minute_milli'])}</b></div></div>
+          </div>
+        </section>
+        <section class="dash-section">
+          <div class="dash-section-head"><div><span class="mini-label">TOP UP</span><h2>Riwayat deposit</h2></div><a class="btn btn-ghost btn-small" href="/deposit">Deposit baru</a></div>
+          <div class="dash-table-wrap"><table class="dash-table"><thead><tr><th>Invoice</th><th>Nominal</th><th>Status</th></tr></thead><tbody>{dep_rows}</tbody></table></div>
+        </section>
+        <section class="dash-section">
+          <div class="dash-section-head"><div><span class="mini-label">MUTASI</span><h2>Riwayat saldo</h2></div></div>
+          <div class="dash-table-wrap"><table class="dash-table"><thead><tr><th>Waktu</th><th>Jenis</th><th>Nominal</th><th>Saldo</th></tr></thead><tbody>{ledger_rows}</tbody></table></div>
+        </section>
+        <div class="dash-note">Saldo hanya dipotong saat akun Pay As You Go berstatus <b>ON</b>. Saat saldo habis, akun otomatis dimatikan dan bisa dinyalakan lagi setelah top up.</div>"""
+        title, subtitle = "Saldo & deposit", "Top up, pantau argo, dan lihat semua mutasi saldo."
     else:
         user_created = fmt_ts(session["user_created_at"], "%d %b %Y")
         last_login = fmt_ts(session["last_login_at"], "%d %b %Y · %H:%M WIB") if session["last_login_at"] else "Baru pertama masuk"
@@ -5744,7 +7156,8 @@ def render_dashboard_page(session: sqlite3.Row, data: dict, section: str, msg: s
       </div>
       <nav class="dash-nav" aria-label="Menu dashboard">{nav}</nav>
       <div class="dash-side-cta">
-        <a class="btn btn-primary btn-small btn-block" href="/gratis">Buat akun</a>
+        <a class="btn btn-primary btn-small btn-block" href="/deposit">{icon('wallet')} Deposit saldo</a>
+        <a class="btn btn-ghost btn-small btn-block" href="/gratis">Buat akun</a>
         <a class="btn btn-ghost btn-small btn-block" href="/premium">Beli premium</a>
       </div>
       <form method="post" action="/logout" class="dash-logout">
@@ -5760,8 +7173,8 @@ def render_dashboard_page(session: sqlite3.Row, data: dict, section: str, msg: s
           <p>{e(subtitle)}</p>
         </div>
         <div class="dash-head-actions">
-          <a class="btn btn-ghost btn-small" href="/dashboard/akun">Monitoring</a>
-          <a class="btn btn-primary btn-small" href="/gratis">Buat akun</a>
+          <a class="btn btn-ghost btn-small" href="/dashboard/saldo">Saldo {rupiah_milli(data['balance_milli'], strip=True)}</a>
+          <a class="btn btn-primary btn-small" href="/deposit">Deposit</a>
         </div>
       </header>
       {content}
@@ -5781,13 +7194,23 @@ def render_result(row: sqlite3.Row) -> str:
         raw_output = format_ssh_output(raw_output)
     output = e(raw_output)
     expires = fmt_ts(row["expires_at"], "%d %b %Y · %H:%M WIB")
+    try:
+        is_payg = row["kind"] == "payg"
+    except Exception:
+        is_payg = False
+    if is_payg:
+        detail_line = f"Akun <b>{e(row['username'])}</b> dibuat untuk <b>{label}</b> dengan skema <b>Pay As You Go</b>. Tekan Start di dashboard saat ingin dipakai."
+        tip_last = "Saldo dipotong hanya saat akun berstatus ON. Tekan Stop untuk menghentikan argo."
+    else:
+        detail_line = f"Akun <b>{e(row['username'])}</b> aktif untuk <b>{label}</b> selama <b>{row['days']} hari</b>, sampai {e(expires)}."
+        tip_last = f"Akun berakhir otomatis pada {e(expires)}."
     body = f"""
 <main class="result-main wrap">
   <div class="result-head">
     <div class="success-mark" aria-hidden="true">✓</div>
     <div class="eyebrow"><span class="dot"></span> AKUN BERHASIL DIBUAT</div>
     <h1>Sudah jadi. <em>Simpan sekarang.</em></h1>
-    <p>Akun <b>{e(row['username'])}</b> aktif untuk <b>{label}</b> selama <b>{row['days']} hari</b>, sampai {e(expires)}.</p>
+    <p>{detail_line}</p>
   </div>
   <div class="result-grid">
     <section class="output-card panel">
@@ -5814,7 +7237,7 @@ def render_result(row: sqlite3.Row) -> str:
         <ul>
           <li>Gunakan host dan port yang tertulis di output.</li>
           <li>Jangan bagikan akun ke lebih banyak IP dari batas.</li>
-          <li>Akun berakhir otomatis pada {e(expires)}.</li>
+          <li>{tip_last}</li>
         </ul>
       </div>
       <a class="btn btn-ghost btn-block" href="/">Buat akun lain</a>
@@ -5859,13 +7282,13 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
     like = f"%{q}%"
     conn = db_connect()
     try:
-        total = conn.execute("SELECT COUNT(*) n FROM accounts WHERE status='active'").fetchone()["n"]
+        total = conn.execute("SELECT COUNT(*) n FROM accounts WHERE status='active' AND kind='free'").fetchone()["n"]
         today = conn.execute(
-            "SELECT COUNT(*) n FROM accounts WHERE status='active' AND created_day=?",
+            "SELECT COUNT(*) n FROM accounts WHERE status='active' AND kind='free' AND created_day=?",
             (today_key(),),
         ).fetchone()["n"]
         accounts = conn.execute(
-            "SELECT * FROM accounts WHERE status='active' ORDER BY id DESC LIMIT 60"
+            "SELECT * FROM accounts WHERE status='active' AND kind='free' ORDER BY id DESC LIMIT 60"
         ).fetchall()
         orders = conn.execute(
             "SELECT * FROM orders WHERE (?='' OR invoice LIKE ? OR account_username LIKE ? OR buyer_ip LIKE ?)"
@@ -5874,6 +7297,16 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
         ).fetchall()
         recent_audit = conn.execute("SELECT * FROM audit ORDER BY id DESC LIMIT 10").fetchall()
         users = conn.execute("SELECT * FROM users ORDER BY id DESC LIMIT 50").fetchall()
+        deposits = conn.execute(
+            "SELECT d.*, u.email FROM deposits d LEFT JOIN users u ON u.id=d.user_id ORDER BY d.id DESC LIMIT 80"
+        ).fetchall()
+        payg_list = conn.execute(
+            "SELECT p.*, u.email, u.balance_milli FROM payg_accounts p LEFT JOIN users u ON u.id=p.user_id"
+            " ORDER BY p.id DESC LIMIT 80"
+        ).fetchall()
+        wallet_total = conn.execute("SELECT COALESCE(SUM(balance_milli),0) s FROM users").fetchone()["s"]
+        payg_running = conn.execute("SELECT COUNT(*) n FROM payg_accounts WHERE state='RUNNING'").fetchone()["n"]
+        deposit_paid = conn.execute("SELECT COALESCE(SUM(amount),0) s FROM deposits WHERE status='PAID'").fetchone()["s"]
     finally:
         conn.close()
 
@@ -5905,6 +7338,12 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
         "mailkeybad": ("error", "API key Brevo harus diawali xkeysib- (bukan xsmtpsib- / SMTP key)."),
         "mailtestok": ("ok", "Email percobaan berhasil dikirim. Cek inbox/spam."),
         "mailtestfail": ("error", "Email percobaan gagal. Periksa API key, sender terverifikasi, dan log server."),
+        "payg": ("ok", "Pengaturan Pay As You Go disimpan."),
+        "wallet": ("ok", "Saldo user berhasil disesuaikan."),
+        "walletfail": ("error", "User atau nominal tidak valid."),
+        "depositok": ("ok", "Deposit ditandai lunas dan saldo sudah ditambahkan."),
+        "depositpaid": ("ok", "Deposit ini sudah lunas."),
+        "depositfail": ("error", "Deposit tidak ditemukan atau gagal diproses."),
     }
     notice = ""
     if msg in messages:
@@ -6012,12 +7451,54 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
                 f'<input type="hidden" name="user_id" value="{int(u["id"])}">'
                 f'<button class="btn btn-tiny btn-ghost" type="submit">Verifikasi</button></form>'
             )
+        balance_milli = 0
+        try:
+            balance_milli = int(u["balance_milli"] or 0)
+        except Exception:
+            pass
         user_rows += (
             f"<tr><td><b>{e(u['email'])}</b><small>{e(fmt_ts(u['created_at'], '%d %b %Y'))}</small></td>"
-            f"<td>{badge}</td><td>{e(last)}</td><td>{action}</td></tr>"
+            f"<td>{badge}</td><td><b>{rupiah_milli(balance_milli, strip=True)}</b></td><td>{e(last)}</td><td>{action}</td></tr>"
         )
     if not user_rows:
-        user_rows = '<tr><td colspan="4" class="empty">Belum ada user terdaftar.</td></tr>'
+        user_rows = '<tr><td colspan="5" class="empty">Belum ada user terdaftar.</td></tr>'
+
+    deposit_rows = ""
+    dep_status = {
+        "PENDING": ("badge-warn", "Pending"),
+        "PAID": ("badge-ok", "Lunas"),
+        "EXPIRED": ("badge-muted", "Expired"),
+    }
+    for row in deposits:
+        cls, txt = dep_status.get(row["status"], ("badge-muted", row["status"]))
+        action = ""
+        if row["status"] != "PAID":
+            action = (
+                f'<form method="post" action="/admin/deposit" class="inline-form" data-confirm="Tandai deposit {e(row["invoice"])} lunas dan tambahkan saldo?">'
+                f'<input type="hidden" name="_csrf" value="{e(session["csrf"])}">'
+                f'<input type="hidden" name="invoice" value="{e(row["invoice"])}">'
+                f'<button class="btn btn-tiny btn-dark" type="submit">Mark paid</button></form>'
+            )
+        deposit_rows += (
+            f"<tr><td><b>{e(row['invoice'])}</b><small>{e(row['email'] or '-')} · {e(fmt_ts(row['created_at'], '%d %b %H:%M'))}</small></td>"
+            f"<td><b>{rupiah(row['amount'])}</b><small>+ kode {rupiah(row['unique_code'])}</small></td>"
+            f"<td><span class=\"badge {cls}\">{txt}</span></td><td>{action}</td></tr>"
+        )
+    if not deposit_rows:
+        deposit_rows = '<tr><td colspan="4" class="empty">Belum ada deposit.</td></tr>'
+
+    payg_admin_rows = ""
+    for row in payg_list:
+        state = row["state"]
+        cls = "badge-ok" if state == PAYG_RUNNING else ("badge-bad" if state == PAYG_SUSPENDED else "badge-muted")
+        payg_admin_rows += (
+            f"<tr><td><b>{e(row['username'])}</b><small>{e(row['email'] or '-')} · {e(row['service'])}/{e(row['protocol'] or '-')}</small></td>"
+            f"<td><span class=\"badge {cls}\">{e(state)}</span></td>"
+            f"<td><b>{rupiah_milli(row['spent_milli'], strip=True)}</b><small>terpakai</small></td>"
+            f"<td>{rupiah_milli(row['balance_milli'], strip=True)}</td></tr>"
+        )
+    if not payg_admin_rows:
+        payg_admin_rows = '<tr><td colspan="4" class="empty">Belum ada akun PAYG.</td></tr>'
 
     mail_ok, mail_msg = mail_ready()
     mail_cfg = mail_config()
@@ -6051,6 +7532,8 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
     if gstat["token_invalid"]:
         token_warn = '<div class="notice notice-warn compact-notice">Token GoPay expired. Buka bot Telegram → Store Admin → GoPay → Login OTP, lalu klik Test GoPay.</div>'
     b = branding()
+    rates_ssh = payg_rates("ssh", settings)
+    rates_xray = payg_rates("xray", settings)
     logo_path = brand_logo_path("logo")
     logo_preview_src = f"/branding/logo?v={e(b['logo_version'])}" if logo_path else "/static/favicon.svg"
     logo_label = "Logo kustom aktif" if logo_path else "Belum ada logo kustom"
@@ -6083,6 +7566,11 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
     <div class="stat-card"><span>Invoice premium</span><strong>{pstats['total_paid']}</strong><small>{pstats['pending']} pending · {pstats['failed']} gagal akun</small></div>
     <div class="stat-card accent"><span>Pendapatan premium</span><strong>{rupiah(pstats['revenue'])}</strong><small>transaksi sukses</small></div>
     <div class="stat-card"><span>GoPay gateway</span><strong>{'ON' if gopay_ok else 'OFF'}</strong><small>{e(gstat['base'])}</small></div>
+  </div>
+  <div class="admin-stats">
+    <div class="stat-card"><span>Total saldo user</span><strong>{rupiah_milli(wallet_total, strip=True)}</strong><small>saldo aktif di semua wallet</small></div>
+    <div class="stat-card"><span>Deposit lunas</span><strong>{rupiah(deposit_paid)}</strong><small>{len(deposits)} invoice terbaru</small></div>
+    <div class="stat-card"><span>PAYG berjalan</span><strong>{payg_running}</strong><small>{len(payg_list)} akun PAYG</small></div>
   </div>
 
   <section class="panel admin-panel branding-panel">
@@ -6203,6 +7691,33 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
         <button class="btn btn-primary btn-small" type="submit" name="action" value="save">Simpan pengaturan email</button>
         <button class="btn btn-ghost btn-small" type="submit" name="action" value="test">Test kirim ke email pengirim</button>
       </div>
+    </form>
+  </section>
+
+  <section class="panel admin-panel payg-admin-panel">
+    <div class="panel-head"><div><span class="mini-label">PAY AS YOU GO</span><h2>Harga patokan & saldo</h2></div><span class="badge {'badge-ok' if settings.get('payg_enabled', '1') == '1' else 'badge-bad'}">{'Aktif' if settings.get('payg_enabled', '1') == '1' else 'Nonaktif'}</span></div>
+    <form method="post" action="/admin/payg" class="server-form">
+      <input type="hidden" name="_csrf" value="{e(session['csrf'])}">
+      <div class="settings-grid">
+        <fieldset>
+          <legend>Harga patokan 30 hari</legend>
+          <label>SSH (Rp / 30 hari)<input type="number" name="payg_base_ssh_30d" min="1000" max="10000000" value="{e(settings.get('payg_base_ssh_30d', '10000'))}"></label>
+          <label>Xray (Rp / 30 hari)<input type="number" name="payg_base_xray_30d" min="1000" max="10000000" value="{e(settings.get('payg_base_xray_30d', '10000'))}"></label>
+          <p class="panel-hint">Tarif otomatis: per hari = harga / 30 · per jam = harga / 720 · per menit = harga / 43.200. Perubahan langsung dipakai semua akun PAYG.</p>
+        </fieldset>
+        <fieldset>
+          <legend>Batas saldo & top up</legend>
+          <label>Minimal saldo untuk Start (Rp)<input type="number" name="payg_min_balance" min="100" max="1000000" value="{e(settings.get('payg_min_balance', '1000'))}"></label>
+          <label>Minimal top up (Rp)<input type="number" name="payg_min_topup" min="1000" max="10000000" value="{e(settings.get('payg_min_topup', '5000'))}"></label>
+          <label>Maksimal top up (Rp)<input type="number" name="payg_max_topup" min="1000" max="100000000" value="{e(settings.get('payg_max_topup', '1000000'))}"></label>
+          <label class="switch"><input type="checkbox" name="payg_enabled" value="1" {'checked' if settings.get('payg_enabled', '1') == '1' else ''}><span>Buka Pay As You Go</span></label>
+        </fieldset>
+      </div>
+      <div class="payg-rate-grid admin-rate-grid">
+        <div class="payg-rate-card"><span class="mini-label">SSH</span><b>{rupiah(rates_ssh['base'])} / 30 hari</b><div><span>Per hari</span><b>{rupiah_milli(rates_ssh['day_milli'])}</b></div><div><span>Per jam</span><b>{rupiah_milli(rates_ssh['hour_milli'])}</b></div><div><span>Per menit</span><b>{rupiah_milli(rates_ssh['minute_milli'])}</b></div></div>
+        <div class="payg-rate-card"><span class="mini-label">XRAY</span><b>{rupiah(rates_xray['base'])} / 30 hari</b><div><span>Per hari</span><b>{rupiah_milli(rates_xray['day_milli'])}</b></div><div><span>Per jam</span><b>{rupiah_milli(rates_xray['hour_milli'])}</b></div><div><span>Per menit</span><b>{rupiah_milli(rates_xray['minute_milli'])}</b></div></div>
+      </div>
+      <div class="form-actions"><button class="btn btn-primary btn-small" type="submit">Simpan pengaturan PAYG</button></div>
     </form>
   </section>
 
@@ -6333,6 +7848,37 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
     </div>
   </section>
 
+  <section class="panel admin-panel">
+    <div class="panel-head"><div><span class="mini-label">DEPOSIT SALDO</span><h2>Invoice top up</h2></div><span class="panel-hint">Mark paid untuk kredit manual jika gateway terlambat.</span></div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Invoice</th><th>Nominal</th><th>Status</th><th></th></tr></thead>
+        <tbody>{deposit_rows}</tbody>
+      </table>
+    </div>
+    <details class="add-product">
+      <summary>+ Sesuaikan saldo user</summary>
+      <form method="post" action="/admin/wallet" class="settings-grid add-product-form">
+        <input type="hidden" name="_csrf" value="{e(session['csrf'])}">
+        <label>Email user<input type="email" name="email" placeholder="user@email.com" required></label>
+        <label>Nominal (Rp)<input type="number" name="amount" min="1" max="100000000" value="10000" required></label>
+        <label>Aksi<select name="action"><option value="add">Tambah saldo</option><option value="subtract">Kurangi saldo</option></select></label>
+        <label>Catatan<input type="text" name="note" maxlength="200" placeholder="Contoh: bonus / refund"></label>
+        <div class="form-actions"><button class="btn btn-dark btn-small" type="submit">Simpan saldo</button></div>
+      </form>
+    </details>
+  </section>
+
+  <section class="panel admin-panel">
+    <div class="panel-head"><div><span class="mini-label">PAY AS YOU GO</span><h2>Akun & argo</h2></div><span class="panel-hint">Saldo dan pemakaian per akun.</span></div>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Akun</th><th>State</th><th>Terpakai</th><th>Saldo user</th></tr></thead>
+        <tbody>{payg_admin_rows}</tbody>
+      </table>
+    </div>
+  </section>
+
   <section class="panel admin-panel accounts-panel">
     <div class="panel-head"><div><span class="mini-label">AKUN FREE</span><h2>Akun website terbaru</h2></div><span class="panel-hint">Hanya akun free buatan website.</span></div>
     <div class="table-wrap">
@@ -6348,7 +7894,7 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
     {mail_notice}
     <div class="table-wrap">
       <table>
-        <thead><tr><th>Email</th><th>Status</th><th>Login terakhir</th><th></th></tr></thead>
+        <thead><tr><th>Email</th><th>Status</th><th>Saldo</th><th>Login terakhir</th><th></th></tr></thead>
         <tbody>{user_rows}</tbody>
       </table>
     </div>
@@ -6362,6 +7908,182 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
 """
     return page_shell("Admin Dashboard", body, admin=True, noindex=True)
 
+
+def render_deposit_page(form_token: str, settings: dict[str, str], user_id: int, msg: str = "") -> str:
+    balance = wallet_balance_milli(user_id)
+    min_topup = _setting_int(settings, "payg_min_topup", 5000)
+    max_topup = _setting_int(settings, "payg_max_topup", 1000000)
+    ts_site, _ts_secret, ts_on = turnstile_config()
+    ts_widget = (
+        '<div class="turnstile-box premium-turnstile">'
+        f'<div class="cf-turnstile" data-sitekey="{e(ts_site)}" data-theme="light" data-language="id" data-size="flexible"></div>'
+        '<small class="turnstile-status" data-turnstile-status>Memuat verifikasi keamanan…</small>'
+        '</div>'
+        if ts_on
+        else ""
+    )
+    notice = ""
+    msgs = {
+        "created": ("ok", "Invoice deposit dibuat. Scan QRIS dan bayar sesuai nominal."),
+        "amount": ("error", f"Nominal deposit minimal {rupiah(min_topup)} dan maksimal {rupiah(max_topup)}."),
+        "limit": ("error", "Terlalu banyak invoice deposit aktif. Selesaikan atau tunggu invoice lama kedaluwarsa."),
+        "fail": ("error", "Gagal membuat invoice deposit. Coba lagi beberapa saat."),
+    }
+    if msg in msgs:
+        kind, text = msgs[msg]
+        notice = f'<div class="notice notice-{kind}">{e(text)}</div>'
+    quick = "".join(
+        f'<button type="button" class="amount-pill" data-amount="{amount}">{rupiah(amount)}</button>'
+        for amount in (5000, 10000, 20000, 50000, 100000)
+    )
+    history = deposit_history(user_id, 30)
+    rows = ""
+    status_map = {
+        "PENDING": ("badge-warn", "Menunggu"),
+        "PAID": ("badge-ok", "Masuk"),
+        "EXPIRED": ("badge-muted", "Kedaluwarsa"),
+    }
+    for row in history:
+        cls, txt = status_map.get(row["status"], ("badge-muted", row["status"]))
+        rows += (
+            "<tr>"
+            f"<td><a class=\"invoice-link\" href=\"/deposit/{e(row['invoice'])}\"><b>{e(row['invoice'])}</b></a>"
+            f"<small>{e(fmt_ts(row['created_at'], '%d %b %Y · %H:%M WIB'))}</small></td>"
+            f"<td><b>{rupiah(row['amount'])}</b><small>+ kode {rupiah(row['unique_code'])}</small></td>"
+            f"<td><span class=\"badge {cls}\">{txt}</span></td>"
+            f"<td>{e(fmt_ts(row['paid_at'], '%d %b %H:%M')) if row['paid_at'] else '-'}</td>"
+            "</tr>"
+        )
+    if not rows:
+        rows = '<tr><td colspan="4" class="empty">Belum ada riwayat deposit.</td></tr>'
+    body = f"""
+<main class="deposit-main wrap">
+  <div class="deposit-head">
+    <div class="eyebrow"><span class="dot"></span> SALDO &amp; DEPOSIT</div>
+    <h1>Isi saldo.<br><em>Pakai saat butuh.</em></h1>
+    <p>Saldo dipakai untuk akun Pay As You Go. Top up lewat QRIS GoPay, saldo masuk otomatis setelah pembayaran terdeteksi.</p>
+  </div>
+  {notice}
+  <div class="deposit-layout">
+    <section class="panel deposit-form-card">
+      <div class="wallet-balance-box">
+        <span class="mini-label">SALDO SAAT INI</span>
+        <b>{rupiah_milli(balance, strip=True)}</b>
+        <small>Minimal saldo untuk Start PAYG: {rupiah_milli(_setting_int(settings, 'payg_min_balance', 1000) * 1000)}</small>
+      </div>
+      <form method="post" action="/deposit" class="stack-form deposit-form" id="deposit-form">
+        <input type="hidden" name="_form" value="{e(form_token)}">
+        <label>Nominal deposit
+          <input type="number" name="amount" id="deposit-amount" min="{min_topup}" max="{max_topup}" step="1000" value="{min_topup}" required>
+          <small>Minimal {rupiah(min_topup)} · maksimal {rupiah(max_topup)}.</small>
+        </label>
+        <div class="amount-pills">{quick}</div>
+        {ts_widget}
+        <button class="btn btn-primary btn-block" type="submit">Buat invoice QRIS <span aria-hidden="true">↗</span></button>
+      </form>
+      <p class="form-note">Nominal invoice = deposit + <b>kode unik Rp1–999</b> untuk mencocokkan pembayaran. Saldo yang masuk adalah nominal deposit.</p>
+    </section>
+    <aside class="deposit-side">
+      <div class="panel premium-info">
+        <div class="premium-badge">PAY AS YOU GO</div>
+        <h3>Tarif otomatis.</h3>
+        <p>Tarif mengikuti harga patokan admin. Saldo hanya terpotong saat akun berstatus ON.</p>
+        <div class="payg-rate-box compact">
+          <div><span>SSH / jam</span><b>{rupiah_milli(payg_rates('ssh', settings)['hour_milli'])}</b></div>
+          <div><span>Xray / jam</span><b>{rupiah_milli(payg_rates('xray', settings)['hour_milli'])}</b></div>
+        </div>
+        <a class="btn btn-dark btn-block" href="/dashboard/saldo">Riwayat saldo</a>
+      </div>
+      <div class="panel check-card">
+        <span class="mini-label">BUTUH BANTUAN?</span>
+        <h3>Deposit tidak masuk?</h3>
+        <p>Buka invoice deposit, lalu hubungi admin dengan kode invoice dan bukti pembayaran.</p>
+        <a class="btn btn-ghost btn-block" href="/kontak">Hubungi admin</a>
+      </div>
+    </aside>
+  </div>
+  <section class="dash-section deposit-history">
+    <div class="dash-section-head"><div><span class="mini-label">RIWAYAT</span><h2>Invoice deposit</h2></div><span class="dash-count">{len(history)} transaksi</span></div>
+    <div class="dash-table-wrap"><table class="dash-table"><thead><tr><th>Invoice</th><th>Nominal</th><th>Status</th><th>Dibayar</th></tr></thead><tbody>{rows}</tbody></table></div>
+  </section>
+</main>
+"""
+    return page_shell("Deposit Saldo", body, active="deposit", noindex=True, turnstile=ts_on)
+
+def render_deposit_invoice(row: sqlite3.Row, new: bool = False) -> str:
+    status = row["status"]
+    status_text = {
+        "PENDING": "Menunggu pembayaran",
+        "PAID": "Saldo sudah masuk",
+        "EXPIRED": "Invoice kedaluwarsa",
+    }.get(status, status)
+    status_class = "ok" if status == "PAID" else ("warn" if status == "PENDING" else "bad")
+    total = int(row["total"])
+    amount = int(row["amount"])
+    unique = int(row["unique_code"])
+    expires = fmt_ts(row["expires_at"], "%d %b %Y · %H:%M WIB")
+    paid = fmt_ts(row["paid_at"], "%d %b %Y · %H:%M WIB") if row["paid_at"] else "-"
+    balance = wallet_balance_milli(int(row["user_id"]))
+    if status == "PAID":
+        content = f"""
+    <div class="invoice-done">
+      <div class="success-mark">✓</div>
+      <div><div class="eyebrow"><span class="dot"></span> SALDO MASUK</div><h2>Top up berhasil.</h2><p>Invoice <b>{e(row['invoice'])}</b> · {rupiah(amount)} masuk ke saldo Anda pada {e(paid)}.</p></div>
+      <div class="invoice-actions"><a class="btn btn-small btn-dark" href="/dashboard/saldo">Buka saldo</a><a class="btn btn-small btn-ghost" href="/premium?scheme=payg">Buat akun PAYG</a></div>
+    </div>
+    <div class="wallet-invoice-balance"><span>Saldo sekarang</span><b>{rupiah_milli(balance, strip=True)}</b></div>"""
+    elif status == "PENDING":
+        content = f"""
+    <div class="invoice-pay">
+      <div class="qr-box"><img class="qr-img" src="/deposit/{e(row['invoice'])}/qr.svg" alt="QRIS GoPay" width="260" height="260"><span>Scan dengan aplikasi bank / e-wallet</span></div>
+      <div class="pay-detail">
+        <span class="mini-label">TOTAL PEMBAYARAN</span>
+        <div class="pay-total">{rupiah(total)}</div>
+        <div class="pay-breakdown">{rupiah(amount)} deposit + kode unik {rupiah(unique)}</div>
+        <div class="pay-expiry">Bayar sebelum <b>{e(expires)}</b></div>
+        <div class="pay-countdown" id="deposit-countdown" data-expires="{int(row['expires_at'])}">--:--</div>
+        <div class="notice notice-warn invoice-warning"><b>Saldo masuk: {rupiah(amount)}.</b> Kode unik dipakai untuk mencocokkan pembayaran.</div>
+        <div class="invoice-code-line"><code>{e(row['invoice'])}</code><button type="button" class="btn btn-small btn-ghost" data-copy="{e(row['invoice'])}">Salin invoice</button></div>
+        <div class="pay-status" id="deposit-live-status">Status: <b>{e(status_text)}</b></div>
+      </div>
+    </div>"""
+    else:
+        content = f"""
+    <div class="invoice-expired">
+      <div class="error-code">⌛</div>
+      <div><div class="eyebrow"><span class="dot"></span> INVOICE KEDALUWARSA</div><h2>Waktu pembayaran habis.</h2><p>Invoice ini sudah lewat batas. Silakan buat invoice deposit baru.</p><a class="btn btn-small btn-primary" href="/deposit">Deposit lagi</a></div>
+    </div>"""
+    data = json.dumps({
+        "invoice": row["invoice"],
+        "status": status,
+        "expires_at": int(row["expires_at"]),
+        "total": total,
+        "amount": amount,
+    }, ensure_ascii=False).replace("</", "<\\/")
+    body = f"""
+<main class="invoice-page wrap">
+  <div class="invoice-head">
+    <div class="eyebrow"><span class="dot"></span> INVOICE DEPOSIT</div>
+    <h1>{e(row['invoice'])}</h1>
+    <div class="invoice-meta">
+      <span class="badge badge-{status_class}">{e(status_text)}</span>
+      <span>Deposit {rupiah(amount)}</span>
+      <span>Dibuat {e(fmt_ts(row['created_at'], '%d %b %Y · %H:%M WIB'))}</span>
+    </div>
+  </div>
+  <div class="invoice-shell panel">
+    {content}
+    <div class="invoice-foot">
+      <span>Invoice <b>{e(row['invoice'])}</b></span>
+      <span>Total <b>{rupiah(total)}</b></span>
+      <a href="/deposit">Deposit lagi</a>
+      <a href="/dashboard/saldo">Riwayat saldo</a>
+    </div>
+  </div>
+</main>
+<script type="application/json" id="deposit-data">{data}</script>
+"""
+    return page_shell("Invoice Deposit", body, noindex=True)
 
 def render_check_invoice(form_token: str, error: str = "", code: str = "") -> str:
     err = f'<div class="notice notice-error">{e(error)}</div>' if error else ""
@@ -6577,6 +8299,7 @@ def main() -> int:
         return 0
 
     threading.Thread(target=payment_daemon, name="gopay-poller", daemon=True).start()
+    threading.Thread(target=payg_daemon, name="payg-billing", daemon=True).start()
     try:
         usage_snapshot_once()
     except Exception:
