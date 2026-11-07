@@ -1472,6 +1472,7 @@ def payg_create_account(user_id: int, service: str, protocol: str, ip: str, user
     username = make_username(service, protocol)
     password = make_password() if service == "ssh" else ""
     account_id = 0
+    payg_id = 0
     with CREATE_LOCK:
         if service == "ssh":
             ok, output, log = create_ssh_account(username, password, 3650, ip_limit, quota_gb)
@@ -1494,11 +1495,12 @@ def payg_create_account(user_id: int, service: str, protocol: str, ip: str, user
                 ),
             )
             account_id = int(cur.lastrowid)
-            conn.execute(
+            cur_payg = conn.execute(
                 "INSERT INTO payg_accounts(user_id,account_id,service,protocol,username,state,created_at)"
                 " VALUES(?,?,?,?,?,?,?)",
                 (int(user_id), account_id, service, protocol, username, PAYG_PAUSED, now),
             )
+            payg_id = int(cur_payg.lastrowid)
             conn.commit()
         except Exception as exc:
             conn.rollback()
@@ -1526,7 +1528,7 @@ def payg_create_account(user_id: int, service: str, protocol: str, ip: str, user
             conn.close()
         raise ValueError("Gagal mengunci akun Pay As You Go. Hubungi admin.")
     audit_user(int(user_id), "payg_create", f"{service}/{protocol or '-'} {username}", ip)
-    return payg_existing(int(user_id), service, protocol)
+    return payg_row_by_id(payg_id, int(user_id))
 
 def payg_start(payg_id: int, user_id: int) -> sqlite3.Row:
     row = payg_row_by_id(payg_id, user_id)
@@ -3830,6 +3832,7 @@ def user_accounts(user_id: int) -> list[dict]:
         usage = _int_file(paths["usage"])
         ip_limit = _int_file(paths["ip"])
         state = mullog_state_for(states, username, row["protocol"] if row["service"] == "xray" else "")
+        hold = bool(state.get("hold")) if state else False
         expires = int(row["expires_at"] or 0)
         accounts.append({
             "source": "free",
@@ -3848,7 +3851,8 @@ def user_accounts(user_id: int) -> list[dict]:
             "usage_bytes": usage,
             "today_bytes": usage_today(username, usage, int(row["created_at"] or 0)),
             "ip_limit": ip_limit,
-            "suspended": state,
+            "suspended": None if hold else state,
+            "hold": hold,
             "expired": expires < now,
         })
 
@@ -3868,6 +3872,7 @@ def user_accounts(user_id: int) -> list[dict]:
         base_time = int(row["paid_at"] or row["created_at"] or 0)
         expires = base_time + int(row["days"] or 0) * 86400
         state = mullog_state_for(states, username, row["protocol"] if service == "xray" else "")
+        hold = bool(state.get("hold")) if state else False
         accounts.append({
             "source": "premium",
             "username": username,
@@ -3885,7 +3890,8 @@ def user_accounts(user_id: int) -> list[dict]:
             "usage_bytes": usage,
             "today_bytes": usage_today(username, usage, base_time),
             "ip_limit": ip_limit,
-            "suspended": state,
+            "suspended": None if hold else state,
+            "hold": hold,
             "expired": expires < now,
         })
 
@@ -3896,6 +3902,7 @@ def user_accounts(user_id: int) -> list[dict]:
         usage = _int_file(paths["usage"])
         ip_limit = _int_file(paths["ip"])
         state = mullog_state_for(states, username, row["protocol"] if row["service"] == "xray" else "")
+        hold = bool(state.get("hold")) if state else False
         expires = int(row["expires_at"] or 0)
         payg_state = str(row["payg_state"] or PAYG_PAUSED)
         accounts.append({
@@ -3915,7 +3922,8 @@ def user_accounts(user_id: int) -> list[dict]:
             "usage_bytes": usage,
             "today_bytes": usage_today(username, usage, int(row["created_at"] or 0)),
             "ip_limit": ip_limit,
-            "suspended": state,
+            "suspended": None if hold else state,
+            "hold": hold,
             "expired": expires < now,
             "payg_id": int(row["payg_id"]),
             "payg_state": payg_state,
@@ -4639,7 +4647,7 @@ class Handler(BaseHTTPRequestHandler):
         service = body.get("service", "")
         protocol = body.get("protocol", "")
         try:
-            payg_create_account(
+            row = payg_create_account(
                 int(session["user_id"]),
                 service,
                 protocol,
@@ -4656,6 +4664,10 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             logger.error("payg create: %s", traceback.format_exc())
             self.redirect("/dashboard?msg=payg-fail")
+            return
+        token = str(row["token"] or "") if row is not None else ""
+        if token:
+            self.redirect(f"/hasil/{urllib.parse.quote(token)}?new=1")
             return
         self.redirect("/dashboard/akun?msg=payg-created")
 
@@ -5802,14 +5814,14 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
 <meta name="theme-color" content="{UI_THEME_COLORS.get(b['theme'], '#fffaf2')}">
 {robots}
 {favicon}
-<link rel="stylesheet" href="/static/style.css?v=20261107payg2">
+<link rel="stylesheet" href="/static/style.css?v=20261107payg4">
 {turnstile_script}
 </head>
 <body>
 {header}
 {body}
 {footer}
-<script src="/static/app.js?v=20261107payg2" defer></script>
+<script src="/static/app.js?v=20261107payg4" defer></script>
 </body>
 </html>"""
 
@@ -6751,14 +6763,21 @@ def render_account_card(account: dict) -> str:
         actions.append(f'<a class="btn btn-small btn-dark" href="{e(download_url)}" download>{icon("download")} Unduh .txt</a>')
     if link_url:
         actions.append(f'<button class="btn btn-small btn-ghost" type="button" data-copy-text="{e(base_url() + link_url)}">Salin link</button>')
-    if output:
+    is_payg = account.get("source") == "payg"
+    if output and not is_payg:
         actions.append(f'<button class="btn btn-small btn-ghost" type="button" data-output-toggle="{output_id}">Lihat config</button>')
     error_html = ""
     if account.get("error"):
         error_html = f'<div class="notice notice-error compact-notice">{e(account["error"])}</div>'
     output_html = ""
     if output:
-        output_html = f'<pre class="account-output acct-output" id="{output_id}" hidden>{e(output)}</pre>'
+        if is_payg:
+            output_html = (
+                '<div class="acct-config-label">CONFIG AKUN · salin ke aplikasi</div>'
+                f'<pre class="account-output acct-output" id="{output_id}">{e(output)}</pre>'
+            )
+        else:
+            output_html = f'<pre class="account-output acct-output" id="{output_id}" hidden>{e(output)}</pre>'
     return f"""
       <article class="acct-card">
         <div class="acct-top">
@@ -7324,19 +7343,31 @@ def render_result(row: sqlite3.Row) -> str:
     except Exception:
         is_payg = False
     if is_payg:
-        detail_line = f"Akun <b>{e(row['username'])}</b> dibuat untuk <b>{label}</b> dengan skema <b>Pay As You Go</b>. Tekan Start di dashboard saat ingin dipakai."
+        detail_line = f"Akun <b>{e(row['username'])}</b> dibuat untuk <b>{label}</b> dengan skema <b>Pay As You Go</b>. Salin config di bawah, lalu tekan Start di dashboard saat ingin dipakai."
         tip_last = "Saldo dipotong hanya saat akun berstatus ON. Tekan Stop untuk menghentikan argo."
+        result_eyebrow = "AKUN PAYG BERHASIL DIBUAT"
+        result_title = "Config siap. <em>Salin dulu.</em>"
+        payg_notice = (
+            '<div class="notice notice-warn payg-result-notice"><b>Akun masih OFF.</b> '
+            'Config sudah jadi—salin atau unduh dulu. Setelah itu buka dashboard dan tekan <b>Start</b> agar akun aktif dan argo berjalan.</div>'
+        )
+        start_action = '<a class="btn btn-primary btn-block" href="/dashboard/akun">Buka dashboard &amp; Start <span aria-hidden="true">↗</span></a>'
     else:
         detail_line = f"Akun <b>{e(row['username'])}</b> aktif untuk <b>{label}</b> selama <b>{row['days']} hari</b>, sampai {e(expires)}."
         tip_last = f"Akun berakhir otomatis pada {e(expires)}."
+        result_eyebrow = "AKUN BERHASIL DIBUAT"
+        result_title = "Sudah jadi. <em>Simpan sekarang.</em>"
+        payg_notice = ""
+        start_action = ""
     body = f"""
 <main class="result-main wrap">
   <div class="result-head">
     <div class="success-mark" aria-hidden="true">✓</div>
-    <div class="eyebrow"><span class="dot"></span> AKUN BERHASIL DIBUAT</div>
-    <h1>Sudah jadi. <em>Simpan sekarang.</em></h1>
+    <div class="eyebrow"><span class="dot"></span> {result_eyebrow}</div>
+    <h1>{result_title}</h1>
     <p>{detail_line}</p>
   </div>
+  {payg_notice}
   <div class="result-grid">
     <section class="output-card panel">
       <div class="output-head">
@@ -7350,6 +7381,7 @@ def render_result(row: sqlite3.Row) -> str:
       <div class="copy-status" id="copy-status" role="status"></div>
     </section>
     <aside class="result-side">
+      {start_action}
       <div class="panel save-card">
         <div class="save-icon">{icon('shield')}</div>
         <h3>Jangan tutup dulu.</h3>

@@ -4068,3 +4068,15 @@ input[type="email"] {
   .scheme-tab-copy small { font-size: 9px; }
   .scheme-tab-side { display: none; }
 }
+
+/* Hasil pembuatan akun PAYG */
+.payg-result-notice { margin: 0 0 16px; }
+.result-side > .btn:first-child { margin-bottom: 2px; }
+.acct-config-label {
+  margin-top: 13px;
+  color: var(--muted-2);
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
