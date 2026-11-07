@@ -2769,6 +2769,86 @@ def gopay_ready() -> tuple[bool, str]:
         return False, "Token GoPay belum ada. Login GoPay lewat bot."
     return True, ""
 
+GOPAY_REFRESH_LOCK = threading.Lock()
+_GOPAY_LAST_REFRESH = 0.0
+GOPAY_REFRESH_COOLDOWN = 5 * 60
+
+def _save_gopay_token(token: str, refresh: str = "") -> None:
+    token = (token or "").strip()
+    if not token:
+        return
+    data: dict[str, str] = {}
+    try:
+        with open(GOPAY_TOKEN_FILE, "r", errors="ignore") as fh:
+            existing = json.load(fh) or {}
+            if isinstance(existing, dict):
+                data.update({str(k): str(v) for k, v in existing.items() if v})
+    except Exception:
+        pass
+    data["token"] = token
+    if refresh:
+        data["refresh_token"] = str(refresh).strip()
+    try:
+        tmp = str(GOPAY_TOKEN_FILE) + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, str(GOPAY_TOKEN_FILE))
+    except Exception:
+        logger.warning("gagal menyimpan token GoPay: %s", traceback.format_exc())
+    try:
+        conn = sqlite3.connect(BOT_KYT_DB, timeout=10)
+        try:
+            conn.execute(
+                "INSERT INTO settings(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                ("gomerch_token", token),
+            )
+            if refresh:
+                conn.execute(
+                    "INSERT INTO settings(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                    ("gomerch_refresh_token", str(refresh).strip()),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+    except Exception:
+        logger.warning("gagal menyimpan token GoPay ke database bot: %s", traceback.format_exc())
+
+def gopay_refresh_token(force: bool = False) -> str:
+    """Refresh access token GoPay memakai refresh_token yang tersimpan."""
+    global _GOPAY_LAST_REFRESH
+    with GOPAY_REFRESH_LOCK:
+        if not force and time.time() - _GOPAY_LAST_REFRESH < GOPAY_REFRESH_COOLDOWN:
+            return ""
+        cfg = gopay_config()
+        refresh = (cfg.get("refresh_token") or "").strip()
+        if not refresh:
+            return ""
+        url = cfg["base"] + "/auth/refresh/token?" + urllib.parse.urlencode({"refresh_token": refresh})
+        try:
+            with urllib.request.urlopen(url, timeout=20) as resp:
+                raw = resp.read().decode("utf-8", "replace")
+            data = json.loads(raw)
+        except Exception as exc:
+            logger.warning("gopay refresh error: %s", exc)
+            return ""
+        if not data.get("success"):
+            logger.warning("gopay refresh ditolak: %s", str(data)[:500])
+            return ""
+        item = data.get("data") or {}
+        new_token = item.get("access_token") or item.get("token") or ""
+        new_refresh = item.get("refresh_token") or item.get("refreshToken") or ""
+        if not new_token:
+            logger.warning("gopay refresh tanpa access_token: %s", str(data)[:500])
+            return ""
+        _save_gopay_token(str(new_token), str(new_refresh))
+        _GOPAY_LAST_REFRESH = time.time()
+        pay_state_set("gopay_error", "")
+        pay_state_set("gopay_token_invalid", "")
+        pay_state_set("gopay_last_ok", str(int(time.time())))
+        logger.info("token GoPay berhasil di-refresh")
+        return str(new_token)
+
 
 def _crc16(data: str) -> str:
     crc = 0xFFFF
@@ -2806,22 +2886,48 @@ def gopay_history(force: bool = False) -> list:
         if not cfg["token"]:
             pay_state_set("gopay_error", "Token GoPay kosong")
             return []
-        url = cfg["base"] + "/api/history?" + urllib.parse.urlencode({"token": cfg["token"]})
-        try:
+        def _fetch_history(token: str) -> dict:
+            url = cfg["base"] + "/api/history?" + urllib.parse.urlencode({"token": token})
             with urllib.request.urlopen(url, timeout=20) as resp:
-                raw = resp.read().decode("utf-8", "replace")
-                data = json.loads(raw)
+                return json.loads(resp.read().decode("utf-8", "replace"))
+
+        try:
+            data = _fetch_history(cfg["token"])
         except urllib.error.HTTPError as exc:
-            if exc.code == 429:
+            if exc.code in (400, 401):
+                new_token = gopay_refresh_token()
+                if new_token:
+                    try:
+                        data = _fetch_history(new_token)
+                    except urllib.error.HTTPError as retry_exc:
+                        if retry_exc.code == 429:
+                            _GOPAY_RATE_UNTIL = time.time() + 16 * 60
+                            pay_state_set("gopay_error", "Rate limit GoPay (429), tunggu 16 menit")
+                        elif retry_exc.code in (400, 401):
+                            pay_state_set("gopay_error", "Refresh token GoPay gagal; login OTP lewat bot")
+                            pay_state_set("gopay_token_invalid", str(int(time.time())))
+                        else:
+                            pay_state_set("gopay_error", f"HTTP {retry_exc.code} dari gateway")
+                        logger.warning("gopay history retry HTTP %s", retry_exc.code)
+                        return []
+                    except Exception as retry_exc:
+                        pay_state_set("gopay_error", f"Gagal koneksi gateway: {retry_exc}")
+                        logger.warning("gopay history retry error: %s", retry_exc)
+                        return []
+                else:
+                    pay_state_set("gopay_error", "Token GoPay expired; login OTP lewat bot")
+                    pay_state_set("gopay_token_invalid", str(int(time.time())))
+                    logger.warning("gopay history HTTP %s; refresh token gagal", exc.code)
+                    return []
+            elif exc.code == 429:
                 _GOPAY_RATE_UNTIL = time.time() + 16 * 60
                 pay_state_set("gopay_error", "Rate limit GoPay (429), tunggu 16 menit")
-            elif exc.code in (400, 401):
-                pay_state_set("gopay_error", "Token GoPay expired; refresh lewat bot")
-                pay_state_set("gopay_token_invalid", str(int(time.time())))
+                logger.warning("gopay history HTTP %s", exc.code)
+                return []
             else:
                 pay_state_set("gopay_error", f"HTTP {exc.code} dari gateway")
-            logger.warning("gopay history HTTP %s", exc.code)
-            return []
+                logger.warning("gopay history HTTP %s", exc.code)
+                return []
         except Exception as exc:
             pay_state_set("gopay_error", f"Gagal koneksi gateway: {exc}")
             logger.warning("gopay history error: %s", exc)
