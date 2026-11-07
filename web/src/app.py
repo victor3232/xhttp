@@ -1399,21 +1399,75 @@ def payg_jeda_state(service: str, protocol: str, username: str) -> dict | None:
     except Exception:
         return {}
 
+def payg_account_is_blocked(service: str, protocol: str, username: str) -> tuple[bool, str]:
+    """Cek nyata: akun benar-benar tidak ada di config Xray / terkunci di sistem."""
+    if service == "ssh":
+        try:
+            pw = pwd.getpwnam(username)
+        except KeyError:
+            return True, "user tidak ada"
+        try:
+            out = subprocess.run(
+                ["passwd", "-S", username],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=10,
+            ).stdout.split()
+            status = out[1] if len(out) > 1 else ""
+        except Exception:
+            status = ""
+        shell = pw.pw_shell or ""
+        if status in ("L", "LK") or shell in ("/usr/sbin/nologin", "/sbin/nologin"):
+            return True, ""
+        return False, "password SSH masih aktif"
+    cfg = PROTOCOLS.get(protocol) or {}
+    try:
+        text = XRAY_CONFIG.read_text(errors="ignore")
+    except FileNotFoundError:
+        return True, "config xray tidak ada"
+    marker = rf"(?m)^(?:###|#&|#!)\s+{re.escape(username)}(?:\s|$)"
+    email = rf'"email"\s*:\s*"{re.escape(username)}"'
+    if re.search(marker, text) or re.search(email, text):
+        return False, "masih ada di config xray"
+    db_path = cfg.get("db")
+    if db_path and Path(db_path).exists():
+        try:
+            db_text = Path(db_path).read_text(errors="ignore")
+            if re.search(rf"(?m)^###\s+{re.escape(username)}(?:\s|$)", db_text):
+                return False, "masih ada di database xray"
+        except Exception:
+            pass
+    return True, ""
+
 def payg_hold_account(service: str, protocol: str, username: str) -> tuple[bool, str]:
-    """Kunci akun tanpa timer otomatis. Hold milik PAYG menang atas timer mullog."""
+    """Kunci akun tanpa timer otomatis + verifikasi config benar-benar tercabut."""
     state = payg_jeda_state(service, protocol, username)
     if state and not state.get("hold"):
         _jeda_call(*_jeda_args("release", service, protocol, username))
+    elif state and state.get("hold"):
+        blocked, _reason = payg_account_is_blocked(service, protocol, username)
+        if not blocked:
+            # State hold ada tapi config aktif lagi (mis. dipulihkan manual). Ulang.
+            _jeda_call(*_jeda_args("release", service, protocol, username))
     rc, out = _jeda_call(*_jeda_args("hold", service, protocol, username))
-    if rc in (0, 3):
-        return True, ""
-    return False, out or f"exit {rc}"
+    if rc not in (0, 3):
+        return False, out or f"exit {rc}"
+    blocked, reason = payg_account_is_blocked(service, protocol, username)
+    if not blocked:
+        logger.error("PAYG hold gagal diverifikasi %s/%s %s: %s", service, protocol, username, reason)
+        return False, reason
+    return True, ""
 
 def payg_release_account(service: str, protocol: str, username: str) -> tuple[bool, str]:
     rc, out = _jeda_call(*_jeda_args("release", service, protocol, username))
-    if rc in (0, 3):
-        return True, ""
-    return False, out or f"exit {rc}"
+    if rc not in (0, 3):
+        return False, out or f"exit {rc}"
+    blocked, reason = payg_account_is_blocked(service, protocol, username)
+    if blocked:
+        logger.error("PAYG release gagal diverifikasi %s/%s %s: %s", service, protocol, username, reason)
+        return False, reason
+    return True, ""
 
 def payg_rows_for_user(user_id: int) -> list[sqlite3.Row]:
     conn = db_connect()
@@ -1671,17 +1725,20 @@ def payg_enforce_holds() -> None:
     finally:
         conn.close()
     for row in rows:
-        state = payg_jeda_state(row["service"], row["protocol"], row["username"])
-        if state and state.get("hold"):
+        blocked, _reason = payg_account_is_blocked(row["service"], row["protocol"], row["username"])
+        if blocked:
             continue
         ok, err = payg_hold_account(row["service"], row["protocol"], row["username"])
-        if not ok:
-            conn = db_connect()
-            try:
+        conn = db_connect()
+        try:
+            if ok:
+                conn.execute("UPDATE payg_accounts SET last_error='' WHERE id=?", (int(row["id"]),))
+            else:
                 conn.execute("UPDATE payg_accounts SET last_error=? WHERE id=?", (err[:240], int(row["id"])))
-                conn.commit()
-            finally:
-                conn.close()
+                logger.error("PAYG enforce hold gagal %s: %s", row["username"], err)
+            conn.commit()
+        finally:
+            conn.close()
 
 def payg_tick_all() -> None:
     settings = get_settings()

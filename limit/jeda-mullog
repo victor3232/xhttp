@@ -286,6 +286,11 @@ def run(cmd):
         log("command failed %s: %s" % (" ".join(cmd), exc))
         return 1
 
+def restart_xray():
+    """Restart Xray tanpa terkena start-limit systemd saat Start/Stop cepat."""
+    run(["systemctl", "reset-failed", "xray"])
+    return run(["systemctl", "restart", "xray"])
+
 
 # ---------------------------------------------------------------------------
 # SSH
@@ -502,7 +507,7 @@ def suspend_xray(proto, user, limit=None, count=None, hold=False):
             pass
         return 4
 
-    run(["systemctl", "restart", "xray"])
+    restart_xray()
     if hold:
         log("hold XRAY %s/%s (PAYG, tanpa timer)" % (proto, user))
         append_history(
@@ -617,7 +622,7 @@ def release_one(kind, user, proto=None):
             if not ok:
                 return 4
             if changed:
-                run(["systemctl", "restart", "xray"])
+                restart_xray()
             mark_restored("xray", state.get("user", ""), state.get("proto"))
             os.unlink(path)
             append_history(
@@ -684,7 +689,7 @@ def restore_all(only_due=False):
             log("gagal restore %s: %s" % (name, exc))
 
     if xray_changed:
-        run(["systemctl", "restart", "xray"])
+        restart_xray()
     return 0
 
 
