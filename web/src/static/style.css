@@ -2710,6 +2710,7 @@ td b { font-family: var(--font-mono); font-size: 10.5px; }
   margin-top: 10px;
 }
 .premium-service {
+  position: relative;
   display: flex;
   flex-direction: column;
   align-items: flex-start;
@@ -2717,19 +2718,36 @@ td b { font-family: var(--font-mono); font-size: 10.5px; }
   padding: 14px 12px;
   border: 1.5px solid var(--line);
   border-radius: 14px;
-  background: var(--paper);
+  background: var(--surface-1);
   color: var(--text);
   text-align: left;
   cursor: pointer;
+  transition: border-color .16s ease, background .16s ease, transform .16s ease;
 }
-.premium-service:hover { border-color: var(--line-strong); }
+.premium-service:hover { border-color: var(--line-strong); background: var(--paper); transform: translateY(-1px); }
 .premium-service.selected { border-color: var(--terracotta); background: var(--accent-bg-2); box-shadow: 0 0 0 3px var(--accent-ring); }
+.premium-service.selected::after,
+.premium-duration.selected::after,
+.payg-service-card.selected::after {
+  content: "✓";
+  position: absolute;
+  top: 7px; right: 8px;
+  width: 16px; height: 16px;
+  display: grid; place-items: center;
+  border-radius: 50%;
+  background: var(--terracotta);
+  color: var(--on-accent);
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1;
+}
 .premium-service-icon { color: var(--terracotta); }
 .premium-service-icon svg { width: 19px; height: 19px; }
 .premium-service b { font-size: 12px; }
 .premium-service small { color: var(--muted-2); font-size: 9px; }
 .premium-durations { display: flex; flex-wrap: wrap; gap: 9px; margin-top: 10px; }
 .premium-duration {
+  position: relative;
   min-width: 112px;
   display: flex;
   flex-direction: column;
@@ -2737,14 +2755,16 @@ td b { font-family: var(--font-mono); font-size: 10.5px; }
   padding: 12px 15px;
   border: 1.5px solid var(--line);
   border-radius: 12px;
-  background: var(--paper);
+  background: var(--surface-1);
   color: var(--text);
   text-align: left;
   cursor: pointer;
+  transition: border-color .16s ease, background .16s ease, transform .16s ease;
 }
+.premium-duration:hover { border-color: var(--line-strong); background: var(--paper); transform: translateY(-1px); }
 .premium-duration b { font-size: 13px; }
 .premium-duration span { color: var(--terracotta); font-family: var(--font-mono); font-size: 10px; }
-.premium-duration.selected { border-color: var(--terracotta); background: var(--accent-bg); }
+.premium-duration.selected { border-color: var(--terracotta); background: var(--accent-bg); box-shadow: 0 0 0 3px var(--accent-ring); }
 .premium-hint { color: var(--muted-2); font-size: 11px; }
 .premium-summary {
   display: grid;
@@ -3830,22 +3850,84 @@ input[type="email"] {
 .wallet-promo-rates span { color: var(--invert-muted-2); }
 .wallet-promo-rates b { font-family: var(--font-mono); font-size: 9.5px; color: var(--invert-fg); }
 
-.scheme-tabs { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 18px; }
+.scheme-tabs {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-bottom: 20px;
+}
 .scheme-tab {
-  flex: 1 1 230px;
-  display: grid; gap: 2px;
-  padding: 14px 16px;
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 16px 18px;
   border: 1.5px solid var(--line);
-  border-radius: 14px;
+  border-radius: 16px;
   background: var(--surface-2);
   color: var(--ink-soft);
-  transition: border-color .16s ease, background .16s ease;
+  overflow: hidden;
+  transition: border-color .16s ease, background .16s ease, transform .16s ease, box-shadow .16s ease;
 }
-.scheme-tab b { font-size: 13px; }
-.scheme-tab small { color: var(--muted-2); font-size: 9.5px; }
-.scheme-tab:hover { border-color: var(--line-strong); }
-.scheme-tab.active { border-color: var(--terracotta); background: var(--accent-bg); color: var(--terracotta-deep); box-shadow: 0 0 0 3px var(--accent-ring); }
-.scheme-tab.active small { color: var(--terracotta); }
+.scheme-tab::before {
+  content: "";
+  position: absolute;
+  left: 0; top: 14px; bottom: 14px;
+  width: 3px;
+  border-radius: 99px;
+  background: transparent;
+  transition: background .16s ease;
+}
+.scheme-tab:hover {
+  border-color: var(--line-strong);
+  background: var(--paper);
+  transform: translateY(-1px);
+}
+.scheme-tab.active {
+  border-color: var(--terracotta);
+  background: var(--accent-bg);
+  color: var(--terracotta-deep);
+  box-shadow: 0 0 0 3px var(--accent-ring), var(--shadow-soft);
+}
+.scheme-tab.active::before { background: var(--terracotta); }
+.scheme-tab-icon {
+  width: 40px; height: 40px;
+  flex: 0 0 auto;
+  display: grid; place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--paper);
+  color: var(--terracotta);
+  transition: background .16s ease, color .16s ease, border-color .16s ease;
+}
+.scheme-tab-icon svg { width: 20px; height: 20px; }
+.scheme-tab.active .scheme-tab-icon {
+  border-color: var(--terracotta);
+  background: var(--terracotta);
+  color: var(--on-accent);
+}
+.scheme-tab-copy { display: grid; gap: 2px; min-width: 0; }
+.scheme-tab-copy b { font-size: 13.5px; line-height: 1.15; }
+.scheme-tab-copy small { color: var(--muted-2); font-size: 10px; line-height: 1.35; }
+.scheme-tab.active .scheme-tab-copy small { color: var(--terracotta); }
+.scheme-tab-side {
+  margin-left: auto;
+  flex: 0 0 auto;
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 99px;
+  background: var(--paper);
+  color: var(--muted-2);
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: .05em;
+  text-transform: uppercase;
+}
+.scheme-tab.active .scheme-tab-side {
+  border-color: var(--terracotta);
+  background: var(--terracotta);
+  color: var(--on-accent);
+}
 
 .payg-service-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; margin-top: 10px; }
 .payg-service-card {
@@ -3974,4 +4056,15 @@ input[type="email"] {
   .dash-quick.four { grid-template-columns: 1fr; }
   .wallet-hero { flex-direction: column; align-items: flex-start; }
   .deposit-head h1 { font-size: 38px; }
+}
+
+/* Rapikan selector skema + kartu pilihan */
+.payg-service-card.is-existing.selected::after { display: none; }
+@media (max-width: 620px) {
+  .scheme-tab { padding: 14px; gap: 10px; }
+  .scheme-tab-icon { width: 34px; height: 34px; border-radius: 10px; }
+  .scheme-tab-icon svg { width: 17px; height: 17px; }
+  .scheme-tab-copy b { font-size: 12.5px; }
+  .scheme-tab-copy small { font-size: 9px; }
+  .scheme-tab-side { display: none; }
 }

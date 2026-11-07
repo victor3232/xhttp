@@ -5696,14 +5696,14 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
 <meta name="theme-color" content="{UI_THEME_COLORS.get(b['theme'], '#fffaf2')}">
 {robots}
 {favicon}
-<link rel="stylesheet" href="/static/style.css?v=20261107payg1">
+<link rel="stylesheet" href="/static/style.css?v=20261107payg2">
 {turnstile_script}
 </head>
 <body>
 {header}
 {body}
 {footer}
-<script src="/static/app.js?v=20261107payg1" defer></script>
+<script src="/static/app.js?v=20261107payg2" defer></script>
 </body>
 </html>"""
 
@@ -6192,10 +6192,14 @@ def render_premium_page(form_token: str, settings: dict[str, str], scheme: str =
     tabs = f"""
     <div class="scheme-tabs" role="tablist" aria-label="Skema pembelian">
       <a class="scheme-tab{' active' if scheme == 'duration' else ''}" href="/premium" role="tab" aria-selected="{'true' if scheme == 'duration' else 'false'}">
-        <b>Paket Durasi</b><small>Bayar di awal, 3 / 7 / 30 hari</small>
+        <span class="scheme-tab-icon">{icon('clock')}</span>
+        <span class="scheme-tab-copy"><b>Paket Durasi</b><small>Bayar di awal · 3 / 7 / 30 hari</small></span>
+        <span class="scheme-tab-side">{'Aktif' if scheme == 'duration' else 'Pilih'}</span>
       </a>
       <a class="scheme-tab{' active' if scheme == 'payg' else ''}" href="/premium?scheme=payg" role="tab" aria-selected="{'true' if scheme == 'payg' else 'false'}">
-        <b>Pay As You Go</b><small>Saldo terpotong saat akun ON</small>
+        <span class="scheme-tab-icon">{icon('bolt')}</span>
+        <span class="scheme-tab-copy"><b>Pay As You Go</b><small>Bayar per menit · hanya saat ON</small></span>
+        <span class="scheme-tab-side">{'Aktif' if scheme == 'payg' else 'Pilih'}</span>
       </a>
     </div>"""
     chips = (
