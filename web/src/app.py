@@ -4665,10 +4665,6 @@ class Handler(BaseHTTPRequestHandler):
             logger.error("payg create: %s", traceback.format_exc())
             self.redirect("/dashboard?msg=payg-fail")
             return
-        token = str(row["token"] or "") if row is not None else ""
-        if token:
-            self.redirect(f"/hasil/{urllib.parse.quote(token)}?new=1")
-            return
         self.redirect("/dashboard/akun?msg=payg-created")
 
     def payg_start_post(self) -> None:
@@ -5808,20 +5804,20 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
 <html lang="id" class="theme-{e(b["theme"])}">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <title>{e(title)} — {e(brand_name)}</title>
 <meta name="description" content="{e(b['meta'])}">
 <meta name="theme-color" content="{UI_THEME_COLORS.get(b['theme'], '#fffaf2')}">
 {robots}
 {favicon}
-<link rel="stylesheet" href="/static/style.css?v=20261107payg4">
+<link rel="stylesheet" href="/static/style.css?v=20261107payg5">
 {turnstile_script}
 </head>
 <body>
 {header}
 {body}
 {footer}
-<script src="/static/app.js?v=20261107payg4" defer></script>
+<script src="/static/app.js?v=20261107payg5" defer></script>
 </body>
 </html>"""
 
@@ -6578,6 +6574,12 @@ def _service_label(service: str, protocol: str) -> str:
         base += " · " + PROTOCOLS.get(protocol, {}).get("label", protocol.upper())
     return base
 
+def _copy_label(service: str, protocol: str) -> str:
+    if service == "ssh" or not protocol:
+        return "Salin SSH"
+    label = PROTOCOLS.get(protocol, {}).get("label", "Xray")
+    return "Salin " + label
+
 
 def _account_badge(account: dict) -> tuple[str, str]:
     if account.get("row_status") == "failed":
@@ -6758,26 +6760,20 @@ def render_account_card(account: dict) -> str:
         link_url = f"/invoice/{account['invoice']}"
     actions = []
     if output:
-        actions.append(f'<button class="btn btn-small btn-ghost" type="button" data-copy-target="{output_id}">{icon("copy")} Salin config</button>')
+        copy_label = _copy_label(account["service"], account["protocol"])
+        actions.append(f'<button class="btn btn-small btn-ghost" type="button" data-copy-target="{output_id}">{icon("copy")} {e(copy_label)}</button>')
     if download_url:
         actions.append(f'<a class="btn btn-small btn-dark" href="{e(download_url)}" download>{icon("download")} Unduh .txt</a>')
     if link_url:
         actions.append(f'<button class="btn btn-small btn-ghost" type="button" data-copy-text="{e(base_url() + link_url)}">Salin link</button>')
-    is_payg = account.get("source") == "payg"
-    if output and not is_payg:
+    if output:
         actions.append(f'<button class="btn btn-small btn-ghost" type="button" data-output-toggle="{output_id}">Lihat config</button>')
     error_html = ""
     if account.get("error"):
         error_html = f'<div class="notice notice-error compact-notice">{e(account["error"])}</div>'
     output_html = ""
     if output:
-        if is_payg:
-            output_html = (
-                '<div class="acct-config-label">CONFIG AKUN · salin ke aplikasi</div>'
-                f'<pre class="account-output acct-output" id="{output_id}">{e(output)}</pre>'
-            )
-        else:
-            output_html = f'<pre class="account-output acct-output" id="{output_id}" hidden>{e(output)}</pre>'
+        output_html = f'<pre class="account-output acct-output" id="{output_id}" hidden>{e(output)}</pre>'
     return f"""
       <article class="acct-card">
         <div class="acct-top">
@@ -7343,37 +7339,25 @@ def render_result(row: sqlite3.Row) -> str:
     except Exception:
         is_payg = False
     if is_payg:
-        detail_line = f"Akun <b>{e(row['username'])}</b> dibuat untuk <b>{label}</b> dengan skema <b>Pay As You Go</b>. Salin config di bawah, lalu tekan Start di dashboard saat ingin dipakai."
+        detail_line = f"Akun <b>{e(row['username'])}</b> dibuat untuk <b>{label}</b> dengan skema <b>Pay As You Go</b>. Tekan Start di dashboard saat ingin dipakai."
         tip_last = "Saldo dipotong hanya saat akun berstatus ON. Tekan Stop untuk menghentikan argo."
-        result_eyebrow = "AKUN PAYG BERHASIL DIBUAT"
-        result_title = "Config siap. <em>Salin dulu.</em>"
-        payg_notice = (
-            '<div class="notice notice-warn payg-result-notice"><b>Akun masih OFF.</b> '
-            'Config sudah jadi—salin atau unduh dulu. Setelah itu buka dashboard dan tekan <b>Start</b> agar akun aktif dan argo berjalan.</div>'
-        )
-        start_action = '<a class="btn btn-primary btn-block" href="/dashboard/akun">Buka dashboard &amp; Start <span aria-hidden="true">↗</span></a>'
     else:
         detail_line = f"Akun <b>{e(row['username'])}</b> aktif untuk <b>{label}</b> selama <b>{row['days']} hari</b>, sampai {e(expires)}."
         tip_last = f"Akun berakhir otomatis pada {e(expires)}."
-        result_eyebrow = "AKUN BERHASIL DIBUAT"
-        result_title = "Sudah jadi. <em>Simpan sekarang.</em>"
-        payg_notice = ""
-        start_action = ""
     body = f"""
 <main class="result-main wrap">
   <div class="result-head">
     <div class="success-mark" aria-hidden="true">✓</div>
-    <div class="eyebrow"><span class="dot"></span> {result_eyebrow}</div>
-    <h1>{result_title}</h1>
+    <div class="eyebrow"><span class="dot"></span> AKUN BERHASIL DIBUAT</div>
+    <h1>Sudah jadi. <em>Simpan sekarang.</em></h1>
     <p>{detail_line}</p>
   </div>
-  {payg_notice}
   <div class="result-grid">
     <section class="output-card panel">
       <div class="output-head">
         <div><span class="mini-label">OUTPUT AKUN</span><b>{e(row['username'])}</b></div>
         <div class="output-actions">
-          <button class="btn btn-small btn-ghost" type="button" id="copy-output">{icon('copy')} Salin</button>
+          <button class="btn btn-small btn-ghost" type="button" id="copy-output">{icon('copy')} {e(_copy_label(row['service'], row['protocol']))}</button>
           <a class="btn btn-small btn-dark" href="/hasil/{e(row['token'])}.txt" download>{icon('download')} Unduh .txt</a>
         </div>
       </div>
@@ -7381,7 +7365,6 @@ def render_result(row: sqlite3.Row) -> str:
       <div class="copy-status" id="copy-status" role="status"></div>
     </section>
     <aside class="result-side">
-      {start_action}
       <div class="panel save-card">
         <div class="save-icon">{icon('shield')}</div>
         <h3>Jangan tutup dulu.</h3>

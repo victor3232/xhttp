@@ -852,3 +852,24 @@
     window.setInterval(paintCountdowns, 1000);
   }
 })();
+
+/* Kunci zoom: pinch, gesture Safari, Ctrl+wheel, dan Ctrl +/- */
+(function () {
+  function stopGesture(event) {
+    if (event && typeof event.preventDefault === "function") event.preventDefault();
+  }
+  ["gesturestart", "gesturechange", "gestureend"].forEach(function (name) {
+    document.addEventListener(name, stopGesture, { passive: false });
+  });
+  document.addEventListener("touchmove", function (event) {
+    if (event.touches && event.touches.length > 1) stopGesture(event);
+  }, { passive: false });
+  document.addEventListener("wheel", function (event) {
+    if (event.ctrlKey || event.metaKey) stopGesture(event);
+  }, { passive: false });
+  document.addEventListener("keydown", function (event) {
+    if ((event.ctrlKey || event.metaKey) && ["+", "-", "=", "0"].indexOf(event.key) >= 0) {
+      stopGesture(event);
+    }
+  }, false);
+})();
