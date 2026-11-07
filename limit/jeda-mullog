@@ -291,6 +291,109 @@ def restart_xray():
     run(["systemctl", "reset-failed", "xray"])
     return run(["systemctl", "restart", "xray"])
 
+XRAY_BIN = "/usr/local/bin/xray"
+XRAY_API = "127.0.0.1:10000"
+XRAY_TAG_INFO = {
+    "vmess": [("vmess-ws", 10002), ("vmess-grpc", 10006), ("vmess-hu", 10010), ("vmess-xh", 10017), ("vmess-tls", 8543)],
+    "vless": [("vless-ws", 10001), ("vless-grpc", 10005), ("vless-hu", 10009), ("vless-xh", 10016), ("vless-tls", 8443)],
+    "trojan": [("trojan-ws", 10003), ("trojan-grpc", 10007), ("trojan-hu", 10011), ("trojan-xh", 10018), ("trojan-tls", 8643)],
+    "shadowsocks": [("ss-ws", 10004), ("ss-grpc", 10008)],
+}
+
+def api_run(args, timeout=15):
+    try:
+        proc = subprocess.run(
+            [XRAY_BIN, "api"] + args,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=timeout,
+        )
+        return proc.returncode, proc.stdout or ""
+    except Exception as exc:
+        log("api xray gagal %s: %s" % (" ".join(args), exc))
+        return 1, str(exc)
+
+def api_remove_user(proto, user):
+    if proto not in XRAY_TAG_INFO:
+        return False
+    for tag, _port in XRAY_TAG_INFO[proto]:
+        rc, out = api_run(["rmu", "-s", XRAY_API, "-tag=" + tag, user])
+        if rc != 0 or ("Removed" not in out and "not found" not in out):
+            log("api rmu gagal %s/%s %s: %s" % (proto, tag, user, out.strip()[:300]))
+            return False
+    return True
+
+def client_from_state(state, proto):
+    user = state.get("user", "")
+    for block in state.get("blocks", []):
+        lines = block.get("lines") or []
+        if len(lines) < 2:
+            continue
+        raw = lines[1].strip()
+        raw = re.sub(r"^\},?\s*", "", raw)
+        if not raw.startswith("{"):
+            raw = "{" + raw
+        if raw.count("{") > raw.count("}"):
+            raw += "}" * (raw.count("{") - raw.count("}"))
+        try:
+            client = json.loads(raw)
+            if not isinstance(client, dict):
+                continue
+            client["email"] = user
+            if proto == "vmess":
+                client.setdefault("alterId", 0)
+            return client
+        except Exception:
+            continue
+    for line in state.get("dblines", []):
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        if proto == "trojan":
+            return {"password": parts[3], "email": user}
+        client = {"id": parts[3], "email": user}
+        if proto == "vmess":
+            client["alterId"] = 0
+        return client
+    return None
+
+def api_add_user(proto, user, client):
+    if proto not in XRAY_TAG_INFO or not client:
+        return False
+    for tag, port in XRAY_TAG_INFO[proto]:
+        client_for_tag = dict(client)
+        settings = {"clients": [client_for_tag]}
+        if proto == "vless":
+            settings["decryption"] = "none"
+            if tag != "vless-tls":
+                client_for_tag.pop("flow", None)
+        payload = {
+            "inbounds": [{
+                "tag": tag,
+                "port": port,
+                "listen": "127.0.0.1",
+                "protocol": proto,
+                "settings": settings,
+            }]
+        }
+        tmp = None
+        try:
+            fd, tmp = tempfile.mkstemp(prefix=".jeda-api-", suffix=".json")
+            with os.fdopen(fd, "w") as fh:
+                json.dump(payload, fh)
+            rc, out = api_run(["adu", "-s", XRAY_API, tmp])
+        finally:
+            if tmp:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+        if rc != 0 or "Added 1" not in out:
+            log("api adu gagal %s/%s %s: %s" % (proto, tag, user, (out or "").strip()[:300]))
+            return False
+    return True
+
 
 # ---------------------------------------------------------------------------
 # SSH
@@ -507,7 +610,9 @@ def suspend_xray(proto, user, limit=None, count=None, hold=False):
             pass
         return 4
 
-    restart_xray()
+    if not api_remove_user(proto, user):
+        log("fallback restart xray setelah suspend %s/%s" % (proto, user))
+        restart_xray()
     if hold:
         log("hold XRAY %s/%s (PAYG, tanpa timer)" % (proto, user))
         append_history(
@@ -584,9 +689,14 @@ def xray_restore(state):
                 for line in todo:
                     fh.write(line + "\n")
 
+    needs_restart = False
     if changed:
-        log("restore XRAY %s/%s" % (state.get("proto", ""), user))
-    return changed, ok
+        proto = state.get("proto", "")
+        client = client_from_state(state, proto)
+        if not api_add_user(proto, user, client):
+            needs_restart = True
+        log("restore XRAY %s/%s" % (proto, user))
+    return changed, ok, needs_restart
 
 
 # ---------------------------------------------------------------------------
@@ -618,10 +728,10 @@ def release_one(kind, user, proto=None):
             )
             return 0
         if state.get("kind") == "xray":
-            changed, ok = xray_restore(state)
+            changed, ok, needs_restart = xray_restore(state)
             if not ok:
                 return 4
-            if changed:
+            if needs_restart:
                 restart_xray()
             mark_restored("xray", state.get("user", ""), state.get("proto"))
             os.unlink(path)
@@ -640,6 +750,7 @@ def restore_all(only_due=False):
     now = time.time()
     _, _, notify = load_conf()
     xray_changed = False
+    xray_needs_restart = False
     try:
         names = sorted(os.listdir(STATE_DIR))
     except FileNotFoundError:
@@ -670,9 +781,11 @@ def restore_all(only_due=False):
                 if only_due and notifications_enabled(notify):
                     notify_restore("ssh", state.get("user", ""), None)
             elif state.get("kind") == "xray":
-                changed, ok = xray_restore(state)
+                changed, ok, needs_restart = xray_restore(state)
                 if changed:
                     xray_changed = True
+                if needs_restart:
+                    xray_needs_restart = True
                 if ok:
                     mark_restored("xray", state.get("user", ""), state.get("proto"))
                     os.unlink(path)
@@ -688,7 +801,7 @@ def restore_all(only_due=False):
         except Exception as exc:
             log("gagal restore %s: %s" % (name, exc))
 
-    if xray_changed:
+    if xray_needs_restart:
         restart_xray()
     return 0
 

@@ -175,6 +175,14 @@ HTML_DIR = Path("/var/www/html")
 MIHOMO_STATE = Path("/etc/kyt/jeda-mullog")
 MIHOMO_BIN = Path("/usr/local/sbin/jeda-mullog")
 MIHOMO_STATE_DIR = MIHOMO_STATE / "state"
+XRAY_BIN = "/usr/local/bin/xray"
+XRAY_API = "127.0.0.1:10000"
+XRAY_TAGS = {
+    "vmess": ["vmess-ws", "vmess-grpc", "vmess-hu", "vmess-xh", "vmess-tls"],
+    "vless": ["vless-ws", "vless-grpc", "vless-hu", "vless-xh", "vless-tls"],
+    "trojan": ["trojan-ws", "trojan-grpc", "trojan-hu", "trojan-xh", "trojan-tls"],
+    "shadowsocks": ["ss-ws", "ss-grpc"],
+}
 
 # Pay As You Go: tarif dihitung dari harga patokan 30 hari.
 PAYG_SECONDS_30D = 30 * 86400
@@ -1399,8 +1407,42 @@ def payg_jeda_state(service: str, protocol: str, username: str) -> dict | None:
     except Exception:
         return {}
 
+def xray_live_has_user(protocol: str, username: str) -> bool | None:
+    """Cek user di Xray yang sedang berjalan lewat API. None = API tidak bisa dipakai."""
+    tags = XRAY_TAGS.get(protocol, [])
+    if not tags:
+        return None
+    for _attempt in range(12):
+        found = False
+        haystack = []
+        retry = False
+        for tag in tags:
+            try:
+                proc = subprocess.run(
+                    [XRAY_BIN, "api", "inbounduser", "-s", XRAY_API, f"-tag={tag}", f"-email={username}"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=8,
+                )
+            except Exception:
+                retry = True
+                break
+            if proc.returncode != 0:
+                err = (proc.stderr or "").lower()
+                if "handler not found" in err:
+                    continue
+                retry = True
+                break
+            haystack.append(proc.stdout or "")
+        if not retry:
+            combined = "\n".join(haystack)
+            return '"email"' in combined or f'"{username}"' in combined
+        time.sleep(0.6)
+    return None
+
 def payg_account_is_blocked(service: str, protocol: str, username: str) -> tuple[bool, str]:
-    """Cek nyata: akun benar-benar tidak ada di config Xray / terkunci di sistem."""
+    """Cek nyata: akun benar-benar tidak ada di config + Xray live / terkunci di sistem."""
     if service == "ssh":
         try:
             pw = pwd.getpwnam(username)
@@ -1421,6 +1463,11 @@ def payg_account_is_blocked(service: str, protocol: str, username: str) -> tuple
         if status in ("L", "LK") or shell in ("/usr/sbin/nologin", "/sbin/nologin"):
             return True, ""
         return False, "password SSH masih aktif"
+    live = xray_live_has_user(protocol, username)
+    if live is None:
+        return False, "API Xray tidak tersedia untuk verifikasi live"
+    if live:
+        return False, "masih aktif di Xray live"
     cfg = PROTOCOLS.get(protocol) or {}
     try:
         text = XRAY_CONFIG.read_text(errors="ignore")
