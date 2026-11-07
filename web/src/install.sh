@@ -49,9 +49,11 @@ if [ ! -x /usr/sbin/haproxy ]; then
     exit 1
 fi
 
-install -d -m 755 "$APP_DIR" "$APP_DIR/data" "$APP_DIR/static"
+install -d -m 755 "$APP_DIR" "$APP_DIR/data"
 chmod 700 "$APP_DIR/data"
 install -m 644 "$ROOT/app.py" "$APP_DIR/app.py"
+rm -rf "$APP_DIR/static" "$APP_DIR/__pycache__"
+install -d -m 755 "$APP_DIR/static"
 cp -a "$ROOT/static/." "$APP_DIR/static/"
 chmod 644 "$APP_DIR/static/style.css" "$APP_DIR/static/app.js" "$APP_DIR/static/favicon.svg"
 find "$APP_DIR/static" -type f -exec chmod 644 {} +
