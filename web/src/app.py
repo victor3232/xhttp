@@ -6462,6 +6462,8 @@ def _account_badge(account: dict) -> tuple[str, str]:
         return "badge-bad", "Gagal"
     if account.get("source") == "payg":
         if account.get("payg_state") == PAYG_SUSPENDED:
+            if int(account.get("balance_milli") or 0) >= int(account.get("payg_min_balance_milli") or 0):
+                return "badge-warn", "Siap dinyalakan"
             return "badge-bad", "Saldo habis"
         if account.get("suspended"):
             return "badge-bad", "Suspended"
@@ -6548,9 +6550,20 @@ def _payg_html(account: dict) -> str:
             f'<small>± <span data-argo-cost>{rupiah_milli(0)}</span> sesi ini</small></div>'
         )
     elif state == PAYG_SUSPENDED:
-        label = "Saldo habis"
-        note = "Akun otomatis dimatikan. Isi saldo lalu tekan Start untuk menyalakan lagi."
-        action = '<a class="btn btn-small btn-primary" href="/deposit">Top up saldo</a>'
+        if balance >= min_balance:
+            label = "Siap dinyalakan"
+            note = "Saldo sudah cukup. Tekan Start untuk menyalakan akun dan memulai argo."
+            action = (
+                f'<form method="post" action="/dashboard/payg/start" class="inline-form">'
+                f'<input type="hidden" name="_csrf" value="{e(csrf)}">'
+                f'<input type="hidden" name="payg_id" value="{payg_id}">'
+                f'<button class="btn btn-small btn-primary" type="submit">Start argo</button></form>'
+                '<a class="btn btn-small btn-ghost" href="/deposit">Top up lagi</a>'
+            )
+        else:
+            label = "Saldo habis"
+            note = "Akun otomatis dimatikan. Isi saldo lalu tekan Start untuk menyalakan lagi."
+            action = '<a class="btn btn-small btn-primary" href="/deposit">Top up saldo</a>'
         argo = ""
     else:
         label = "Argo berhenti"
@@ -6562,12 +6575,14 @@ def _payg_html(account: dict) -> str:
             f'<input type="hidden" name="payg_id" value="{payg_id}">'
             f'<button class="btn btn-small btn-primary" type="submit"{disabled}>Start argo</button></form>'
         )
+        if balance < min_balance:
+            action += '<a class="btn btn-small btn-ghost" href="/deposit">Top up saldo</a>'
         argo = ""
     return f"""
       <div class="payg-panel">
         <div class="payg-panel-head">
           <div><span class="mini-label">PAY AS YOU GO</span><b>{e(label)}</b><small>{e(note)}</small></div>
-          <span class="badge {'badge-ok' if state == PAYG_RUNNING else ('badge-bad' if state == PAYG_SUSPENDED else 'badge-muted')}">{e(label)}</span>
+          <span class="badge {'badge-ok' if state == PAYG_RUNNING else ('badge-warn' if state == PAYG_SUSPENDED and balance >= min_balance else ('badge-bad' if state == PAYG_SUSPENDED else 'badge-muted'))}">{e(label)}</span>
         </div>
         <div class="payg-metrics">
           <div><span>Per menit</span><b>{rupiah_milli(rates['minute_milli'])}</b></div>
