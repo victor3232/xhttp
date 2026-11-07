@@ -329,6 +329,10 @@ DEFAULTS = {
     "payg_min_balance": "1000",
     "payg_min_topup": "5000",
     "payg_max_topup": "1000000",
+    "payg_ssh_ip_limit": "2",
+    "payg_ssh_quota_gb": "0",
+    "payg_xray_ip_limit": "2",
+    "payg_xray_quota_gb": "0",
 }
 
 INT_SETTINGS = {
@@ -347,6 +351,10 @@ INT_SETTINGS = {
     "payg_min_balance": (100, 1000000),
     "payg_min_topup": (1000, 10000000),
     "payg_max_topup": (1000, 100000000),
+    "payg_ssh_ip_limit": (0, 100),
+    "payg_ssh_quota_gb": (0, 10000),
+    "payg_xray_ip_limit": (0, 100),
+    "payg_xray_quota_gb": (0, 10000),
 }
 
 USER_RE = re.compile(r"^[a-z][a-z0-9]{7,14}$")
@@ -1467,8 +1475,8 @@ def payg_create_account(user_id: int, service: str, protocol: str, ip: str, user
     if wallet_balance_milli(int(user_id)) < min_balance:
         raise ValueError(f"Saldo minimal {rupiah_milli(min_balance)} untuk membuat akun Pay As You Go.")
 
-    ip_limit = _setting_int(settings, f"{service}_ip_limit", 2)
-    quota_gb = _setting_int(settings, f"{service}_quota_gb", 0)
+    ip_limit = _setting_int(settings, f"payg_{service}_ip_limit", 2)
+    quota_gb = _setting_int(settings, f"payg_{service}_quota_gb", 0)
     username = make_username(service, protocol)
     password = make_password() if service == "ssh" else ""
     account_id = 0
@@ -5527,7 +5535,12 @@ class Handler(BaseHTTPRequestHandler):
             return
         enabled = "1" if body.get("payg_enabled") == "1" else "0"
         values = {"payg_enabled": enabled}
-        for key in ("payg_base_ssh_30d", "payg_base_xray_30d", "payg_min_balance", "payg_min_topup", "payg_max_topup"):
+        for key in (
+            "payg_base_ssh_30d", "payg_base_xray_30d",
+            "payg_min_balance", "payg_min_topup", "payg_max_topup",
+            "payg_ssh_ip_limit", "payg_ssh_quota_gb",
+            "payg_xray_ip_limit", "payg_xray_quota_gb",
+        ):
             low, high = INT_SETTINGS[key]
             try:
                 num = int(body.get(key, "0"))
@@ -7853,9 +7866,22 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
           <label class="switch"><input type="checkbox" name="payg_enabled" value="1" {'checked' if settings.get('payg_enabled', '1') == '1' else ''}><span>Buka Pay As You Go</span></label>
         </fieldset>
       </div>
+      <div class="settings-grid two">
+        <fieldset>
+          <legend>Limit akun PAYG · SSH</legend>
+          <label>Limit IP per akun<input type="number" name="payg_ssh_ip_limit" min="0" max="100" value="{e(settings.get('payg_ssh_ip_limit', '2'))}"><small>0 = tanpa batas</small></label>
+          <label>Kuota bandwidth (GB)<input type="number" name="payg_ssh_quota_gb" min="0" max="10000" value="{e(settings.get('payg_ssh_quota_gb', '0'))}"><small>0 = tanpa batas</small></label>
+        </fieldset>
+        <fieldset>
+          <legend>Limit akun PAYG · Xray</legend>
+          <label>Limit IP per akun<input type="number" name="payg_xray_ip_limit" min="0" max="100" value="{e(settings.get('payg_xray_ip_limit', '2'))}"><small>0 = tanpa batas</small></label>
+          <label>Kuota bandwidth (GB)<input type="number" name="payg_xray_quota_gb" min="0" max="10000" value="{e(settings.get('payg_xray_quota_gb', '0'))}"><small>0 = tanpa batas</small></label>
+        </fieldset>
+      </div>
+      <p class="panel-hint">Limit IP &amp; kuota ini dipakai saat akun PAYG dibuat. Akun PAYG yang sudah ada tetap memakai limit saat pembuatannya.</p>
       <div class="payg-rate-grid admin-rate-grid">
-        <div class="payg-rate-card"><span class="mini-label">SSH</span><b>{rupiah(rates_ssh['base'])} / 30 hari</b><div><span>Per hari</span><b>{rupiah_milli(rates_ssh['day_milli'])}</b></div><div><span>Per jam</span><b>{rupiah_milli(rates_ssh['hour_milli'])}</b></div><div><span>Per menit</span><b>{rupiah_milli(rates_ssh['minute_milli'])}</b></div></div>
-        <div class="payg-rate-card"><span class="mini-label">XRAY</span><b>{rupiah(rates_xray['base'])} / 30 hari</b><div><span>Per hari</span><b>{rupiah_milli(rates_xray['day_milli'])}</b></div><div><span>Per jam</span><b>{rupiah_milli(rates_xray['hour_milli'])}</b></div><div><span>Per menit</span><b>{rupiah_milli(rates_xray['minute_milli'])}</b></div></div>
+        <div class="payg-rate-card"><span class="mini-label">SSH</span><b>{rupiah(rates_ssh['base'])} / 30 hari</b><div><span>Per hari</span><b>{rupiah_milli(rates_ssh['day_milli'])}</b></div><div><span>Per jam</span><b>{rupiah_milli(rates_ssh['hour_milli'])}</b></div><div><span>Per menit</span><b>{rupiah_milli(rates_ssh['minute_milli'])}</b></div><div><span>Limit IP</span><b>{e(settings.get('payg_ssh_ip_limit', '2'))}</b></div><div><span>Kuota</span><b>{e(settings.get('payg_ssh_quota_gb', '0'))} GB</b></div></div>
+        <div class="payg-rate-card"><span class="mini-label">XRAY</span><b>{rupiah(rates_xray['base'])} / 30 hari</b><div><span>Per hari</span><b>{rupiah_milli(rates_xray['day_milli'])}</b></div><div><span>Per jam</span><b>{rupiah_milli(rates_xray['hour_milli'])}</b></div><div><span>Per menit</span><b>{rupiah_milli(rates_xray['minute_milli'])}</b></div><div><span>Limit IP</span><b>{e(settings.get('payg_xray_ip_limit', '2'))}</b></div><div><span>Kuota</span><b>{e(settings.get('payg_xray_quota_gb', '0'))} GB</b></div></div>
       </div>
       <div class="form-actions"><button class="btn btn-primary btn-small" type="submit">Simpan pengaturan PAYG</button></div>
     </form>
