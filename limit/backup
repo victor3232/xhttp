@@ -85,6 +85,7 @@ BERKAS="
 /etc/default/dropbear
 /etc/kyt.txt
 /etc/kyt/jeda-mullog.conf
+/etc/kyt/trial.conf
 /etc/xray/limit.ssh
 /etc/xray/limit.vmess
 /usr/bin/kyt/modules/conn_notif.py
@@ -95,6 +96,10 @@ BERKAS="
 /usr/local/sbin/setting-jeda
 /usr/local/sbin/backup
 /usr/local/sbin/utility
+/usr/local/sbin/trial
+/usr/local/sbin/kyt-trial
+/usr/local/sbin/kyt-trial-expire
+/usr/local/sbin/trial-install.sh
 /etc/systemd/system/jeda-mullog.service
 /etc/systemd/system/vmip.service
 /etc/systemd/system/vlip.service
@@ -103,6 +108,8 @@ BERKAS="
 /etc/nginx/conf.d/vpnfree.conf
 /etc/haproxy/vpnfree.pem
 /etc/systemd/system/kyt-web.service
+/etc/systemd/system/kyt-trial-expire.service
+/etc/systemd/system/ssip.service
 /etc/systemd/system/slowdns.service
 /etc/systemd/system/slowdns.service.d/rcvbuf.conf
 /usr/local/sbin/slowdns-rcvbuf
@@ -135,6 +142,7 @@ FOLDER="
 /root/slowdns
 /var/lib/kyt
 /etc/kyt/jeda-mullog
+/etc/kyt/trial
 /usr/bin/kyt/database.db
 /usr/bin/kyt/var.txt
 /opt/kyt-web

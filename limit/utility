@@ -45,11 +45,12 @@ echo -e " $(sopt2 10 "CLEAR CACHE")$(sopt2 20 "FIX / RESTART HAPROXY")"
 echo -e " $(sopt2 21 "GANTI TEMA WARNA UI")$(sopt2 22 "CHECK BANDWIDTH")"
 echo -e " $(sopt2 23 "LIMIT SPEED")$(sopt2 24 "GANTI NS / SLOWDNS")"
 echo -e " $(sopt2 25 "TIMER MULLOG")$(sopt2 26 "SETTING WEBSITE")"
+echo -e " $(sopt2 27 "TRIAL MANAGER")"
 sline
 echo -e " $(sopt2 0 "Back To Menu")"
 sline
 printf '\n'
-printf ' %sSelect From Options %s[1-26 / 0]%s : %s' "$SN" "$SB" "$SN" "$SR"
+printf ' %sSelect From Options %s[1-27 / 0]%s : %s' "$SN" "$SB" "$SN" "$SR"
 read -r menu
 case $menu in
 1) clear ;
@@ -129,6 +130,9 @@ case $menu in
    ;;
 26) clear ;
    setting-web
+   ;;
+27) clear ;
+   trial
    ;;
 0) clear ;
    menu

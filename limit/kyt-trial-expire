@@ -1,0 +1,118 @@
+#!/usr/bin/env python3
+"""Persistent trial expiry worker.
+
+Runs every 30 seconds. Deletes trial accounts when:
+  - the minute deadline has passed
+  - quota usage has reached the configured limit
+  - the account has already disappeared (manual/quota cleanup)
+
+State is kept in /etc/kyt/trial/state so it survives bot/panel restarts and
+VPS reboots.
+"""
+
+import glob
+import importlib.machinery
+import importlib.util
+import json
+import os
+import sys
+import time
+
+TRIAL_BIN = "/usr/local/sbin/kyt-trial"
+INTERVAL = 30
+MISSING_GRACE = 120
+
+
+def load_trial_module():
+    loader = importlib.machinery.SourceFileLoader("kyt_trial_core", TRIAL_BIN)
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    if spec is None:
+        raise RuntimeError("kyt-trial tidak ditemukan")
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def log(message):
+    print("%s %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), message), flush=True)
+
+
+def process_once(core):
+    state_dir = core.STATE_DIR
+    try:
+        os.makedirs(state_dir, mode=0o700, exist_ok=True)
+    except Exception:
+        pass
+    paths = sorted(glob.glob(os.path.join(state_dir, "*.json")))
+    if not paths:
+        return 0
+    now = int(time.time())
+    deleted = 0
+    for path in paths:
+        state = core.read_json(path)
+        if not isinstance(state, dict):
+            log("state rusak, dilewati: %s" % path)
+            continue
+        proto = core.alias_proto(state.get("protocol", ""))
+        user = state.get("username", "")
+        if proto not in core.PROTOCOLS or not user:
+            log("state tidak valid, dihapus: %s" % path)
+            core.remove_file(path)
+            continue
+        try:
+            exists = core.account_exists(proto, user)
+        except Exception as exc:
+            log("gagal cek akun %s/%s: %s" % (proto, user, exc))
+            continue
+        if not exists:
+            # Jangan langsung hapus state: config.json bisa sedang ditulis ulang
+            # oleh script panel. Tunggu 2 menit agar tidak salah bersihkan.
+            missing_since = core.as_int(state.get("missing_since"), 0)
+            if not missing_since:
+                state["missing_since"] = now
+                core.write_json(path, state)
+                log("akun %s/%s belum terlihat, mulai grace %ds" % (proto, user, MISSING_GRACE))
+            elif now - missing_since >= MISSING_GRACE:
+                log("akun %s/%s sudah tidak ada, bersihkan state" % (proto, user))
+                core.delete_account(proto, user, "missing", notify=True)
+                deleted += 1
+            continue
+        if state.get("missing_since"):
+            state.pop("missing_since", None)
+            core.write_json(path, state)
+        expires_at = core.as_int(state.get("expires_at"), 0)
+        if expires_at and now >= expires_at:
+            log("trial %s/%s habis waktu" % (proto, user))
+            core.delete_account(proto, user, "time", notify=True)
+            deleted += 1
+            continue
+        limit, usage = core.read_quota(proto, user)
+        if limit > 0 and usage >= limit:
+            log("trial %s/%s habis quota (%d/%d)" % (proto, user, usage, limit))
+            core.delete_account(proto, user, "quota", notify=True)
+            deleted += 1
+            continue
+    if deleted:
+        log("%d trial diproses" % deleted)
+    return deleted
+
+
+def main():
+    if os.geteuid() != 0:
+        print("Harus dijalankan sebagai root.", file=sys.stderr)
+        return 1
+    core = load_trial_module()
+    once = "--once" in sys.argv[1:]
+    if once:
+        return 0 if process_once(core) >= 0 else 1
+    log("kyt-trial-expire aktif, interval %ds" % INTERVAL)
+    while True:
+        try:
+            process_once(core)
+        except Exception as exc:
+            log("ERROR: %s" % exc)
+        time.sleep(INTERVAL)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

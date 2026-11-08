@@ -1,0 +1,14 @@
+[Unit]
+Description=Limit IP Shadowsocks Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/limit-ip ssip
+Restart=always
+RestartSec=3
+TimeoutStopSec=10
+
+[Install]
+WantedBy=multi-user.target

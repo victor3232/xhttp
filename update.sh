@@ -34,6 +34,9 @@ res1() {
     unzip menu.zip
     chmod +x menu/*
     mv menu/* /usr/local/sbin
+    if [ -x /usr/local/sbin/trial-install.sh ]; then
+        bash /usr/local/sbin/trial-install.sh
+    fi
     rm -rf menu
     rm -rf menu.zip
     # Timer Mullog: pasang/refresh engine + service + limiter suspend.

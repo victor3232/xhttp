@@ -60,6 +60,9 @@ ok "$(ls menu/ | wc -l) file di-extract"
 
 echo -e " ${YEL}[3/3]${NC} Install menu baru..."
 mv -f menu/* /usr/local/sbin/ 2>/dev/null
+if [ -x /usr/local/sbin/trial-install.sh ]; then
+    bash /usr/local/sbin/trial-install.sh
+fi
 rm -rf /tmp/menu_update_tmp
 ok "Menu UI updated!"
 echo ""

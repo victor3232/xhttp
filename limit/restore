@@ -267,13 +267,19 @@ if [ -d "$AKAR/etc" ]; then
     [ -d "$AKAR/etc/default" ]      && salin "$AKAR/etc/default"      "/etc/default"
     [ -f "$AKAR/etc/kyt.txt" ]      && salin "$AKAR/etc/kyt.txt"      "/etc/kyt.txt"
     [ -d "$AKAR/etc/kyt/jeda-mullog" ] && salin "$AKAR/etc/kyt/jeda-mullog" "/etc/kyt/jeda-mullog"
+    [ -d "$AKAR/etc/kyt/trial" ] && salin "$AKAR/etc/kyt/trial" "/etc/kyt/trial"
     [ -f "$AKAR/etc/kyt/jeda-mullog.conf" ] && salin "$AKAR/etc/kyt/jeda-mullog.conf" "/etc/kyt/jeda-mullog.conf"
+    [ -f "$AKAR/etc/kyt/trial.conf" ] && salin "$AKAR/etc/kyt/trial.conf" "/etc/kyt/trial.conf"
+    [ -f "$AKAR/usr/local/sbin/kyt-trial" ] && salin "$AKAR/usr/local/sbin/kyt-trial" "/usr/local/sbin/kyt-trial"
+    [ -f "$AKAR/usr/local/sbin/kyt-trial-expire" ] && salin "$AKAR/usr/local/sbin/kyt-trial-expire" "/usr/local/sbin/kyt-trial-expire"
+    [ -f "$AKAR/usr/local/sbin/trial" ] && salin "$AKAR/usr/local/sbin/trial" "/usr/local/sbin/trial"
+    [ -f "$AKAR/usr/local/sbin/trial-install.sh" ] && salin "$AKAR/usr/local/sbin/trial-install.sh" "/usr/local/sbin/trial-install.sh"
     [ -f "$AKAR/usr/local/sbin/jeda-mullog" ] && salin "$AKAR/usr/local/sbin/jeda-mullog" "/usr/local/sbin/jeda-mullog"
     [ -f "$AKAR/usr/local/sbin/setting-jeda" ] && salin "$AKAR/usr/local/sbin/setting-jeda" "/usr/local/sbin/setting-jeda"
     [ -f "$AKAR/usr/local/sbin/utility" ] && salin "$AKAR/usr/local/sbin/utility" "/usr/local/sbin/utility"
     [ -f "$AKAR/usr/bin/limit-ip" ] && salin "$AKAR/usr/bin/limit-ip" "/usr/bin/limit-ip"
     [ -f "$AKAR/etc/xray/limit.ssh" ] && salin "$AKAR/etc/xray/limit.ssh" "/etc/xray/limit.ssh"
-    for _unit in jeda-mullog vmip vlip trip limitssh kyt-web; do
+    for _unit in jeda-mullog vmip vlip trip limitssh kyt-web kyt-trial-expire ssip; do
         [ -f "$AKAR/etc/systemd/system/${_unit}.service" ] && salin "$AKAR/etc/systemd/system/${_unit}.service" "/etc/systemd/system/${_unit}.service"
     done
     for _f in kyt-web-cert-sync issue-cert.sh kyt-web-wait-dns kyt-web-configure-edge vpnfree.conf.tpl; do
@@ -371,7 +377,7 @@ fi
 echo -e " ${CYAN}[5/5]${NC} Me-restart layanan VPN..."
 systemctl daemon-reload >/dev/null 2>&1
 GAGAL_SVC=""
-for svc in xray haproxy nginx xl2tpd strongswan-starter ipsec openvpn dropbear udp-custom ws jeda-mullog limitssh vmip vlip trip kyt-web; do
+for svc in xray haproxy nginx xl2tpd strongswan-starter ipsec openvpn dropbear udp-custom ws jeda-mullog limitssh vmip vlip trip ssip kyt-trial-expire kyt-web; do
     systemctl list-unit-files "${svc}.service" >/dev/null 2>&1 || [ -f "/etc/init.d/$svc" ] || continue
     if ! systemctl restart "$svc" >/dev/null 2>&1; then
         # xl2tpd di Debian 13 pakai init.d
@@ -382,7 +388,7 @@ for svc in xray haproxy nginx xl2tpd strongswan-starter ipsec openvpn dropbear u
         fi
     fi
 done
-for svc in jeda-mullog limitssh vmip vlip trip kyt-web; do
+for svc in jeda-mullog limitssh vmip vlip trip ssip kyt-trial-expire kyt-web; do
     systemctl list-unit-files "${svc}.service" >/dev/null 2>&1 && systemctl enable "$svc" >/dev/null 2>&1
 done
 ipsec rereadsecrets >/dev/null 2>&1

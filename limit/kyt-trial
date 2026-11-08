@@ -1,0 +1,1023 @@
+#!/usr/bin/env python3
+"""Trial account manager for HITS SSH.
+
+Two setting groups only:
+  SSH  : minutes, quota GB, IP limit
+  XRAY : minutes, quota GB, IP limit  (VMess/VLESS/Trojan/Shadowsocks)
+
+Trial accounts are created with the normal panel scripts, then registered in
+/etc/kyt/trial/state so kyt-trial-expire can delete them after the minute
+deadline or when the quota is exhausted.
+"""
+
+import argparse
+import glob
+import json
+import os
+import re
+import secrets
+import shutil
+import signal
+import string
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+import urllib.request
+from datetime import datetime, timedelta, timezone
+
+CONF = "/etc/kyt/trial.conf"
+STATE_DIR = "/etc/kyt/trial/state"
+XRAY_CONFIG = "/etc/xray/config.json"
+MULLOG = "/usr/local/sbin/jeda-mullog"
+WIB = timezone(timedelta(hours=7))
+
+DEFAULTS = {
+    "ENABLED": "1",
+    "SSH_MINUTES": "30",
+    "SSH_QUOTA_GB": "10",
+    "SSH_IP_LIMIT": "2",
+    "XRAY_MINUTES": "30",
+    "XRAY_QUOTA_GB": "10",
+    "XRAY_IP_LIMIT": "2",
+    "NOTIFY": "1",
+}
+
+PROTOCOLS = {
+    "ssh": {
+        "label": "SSH",
+        "service": "ssh",
+        "script": "/usr/local/sbin/addssh",
+        "prefix": "TrialSSH",
+        "db": "/etc/ssh/.ssh.db",
+        "db_marker": "#ssh#",
+        "db_markers": ["#ssh#"],
+        "config_marker": "",
+        "limit": "/etc/ssh/{user}",
+        "usage": "/etc/limit/ssh/{user}",
+        "ip": "/etc/kyt/limit/ssh/ip/{user}",
+        "password": True,
+    },
+    "vmess": {
+        "label": "VMess",
+        "service": "xray",
+        "script": "/usr/local/sbin/addws",
+        "trial_script": "/usr/local/sbin/trialws",
+        "prefix": "TrialVM",
+        "db": "/etc/vmess/.vmess.db",
+        "db_marker": "###",
+        "db_markers": ["###"],
+        "config_marker": "###",
+        "limit": "/etc/vmess/{user}",
+        "usage": "/etc/limit/vmess/{user}",
+        "ip": "/etc/kyt/limit/vmess/ip/{user}",
+        "password": False,
+    },
+    "vless": {
+        "label": "VLESS",
+        "service": "xray",
+        "script": "/usr/local/sbin/addvless",
+        "trial_script": "/usr/local/sbin/trialvless",
+        "prefix": "TrialVL",
+        "db": "/etc/vless/.vless.db",
+        "db_marker": "#&",
+        "db_markers": ["#&", "###"],
+        "config_marker": "#&",
+        "limit": "/etc/vless/{user}",
+        "usage": "/etc/limit/vless/{user}",
+        "ip": "/etc/kyt/limit/vless/ip/{user}",
+        "password": False,
+    },
+    "trojan": {
+        "label": "Trojan",
+        "service": "xray",
+        "script": "/usr/local/sbin/addtr",
+        "trial_script": "/usr/local/sbin/trialtr",
+        "prefix": "TrialTR",
+        "db": "/etc/trojan/.trojan.db",
+        "db_marker": "#!",
+        "db_markers": ["###", "#!"],
+        "config_marker": "#!",
+        "limit": "/etc/trojan/{user}",
+        "usage": "/etc/limit/trojan/{user}",
+        "ip": "/etc/kyt/limit/trojan/ip/{user}",
+        "password": False,
+    },
+    "shadowsocks": {
+        "label": "Shadowsocks",
+        "service": "xray",
+        "script": "/usr/local/sbin/addss",
+        "trial_script": "/usr/local/sbin/trialss",
+        "prefix": "TrialSS",
+        "db": "/etc/shadowsocks/.shadowsocks.db",
+        "db_marker": "###",
+        "db_markers": ["###"],
+        "config_marker": "#!#",
+        "limit": "/etc/shadowsocks/{user}",
+        "usage": "/etc/limit/shadowsocks/{user}",
+        "ip": "/etc/kyt/limit/shadowsocks/ip/{user}",
+        "password": False,
+    },
+}
+
+ALIASES = {
+    "ss": "shadowsocks",
+    "shadow": "shadowsocks",
+}
+
+
+def alias_proto(proto):
+    proto = (proto or "").strip().lower()
+    return ALIASES.get(proto, proto)
+
+
+def load_conf():
+    data = dict(DEFAULTS)
+    try:
+        with open(CONF, "r", errors="ignore") as fh:
+            for raw in fh:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                key = key.strip().upper()
+                if key in data:
+                    data[key] = value.strip().strip("'\"")
+    except FileNotFoundError:
+        pass
+    return data
+
+
+def save_conf(values):
+    order = [
+        "ENABLED", "SSH_MINUTES", "SSH_QUOTA_GB", "SSH_IP_LIMIT",
+        "XRAY_MINUTES", "XRAY_QUOTA_GB", "XRAY_IP_LIMIT", "NOTIFY",
+    ]
+    lines = ["# Trial account settings - HITS SSH", "# 0 quota / 0 IP = unlimited"]
+    for key in order:
+        lines.append("%s=%s" % (key, values.get(key, DEFAULTS[key])))
+    tmp = CONF + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+    os.replace(tmp, CONF)
+    os.chmod(CONF, 0o600)
+
+
+def as_int(value, default=0):
+    try:
+        return int(str(value).strip())
+    except Exception:
+        return int(default)
+
+
+def validate_value(key, value):
+    key = key.upper()
+    if key in ("ENABLED", "NOTIFY"):
+        return "1" if str(value).strip() in ("1", "true", "yes", "on", "ya") else "0"
+    number = as_int(value, -1)
+    if number < 0:
+        raise ValueError("nilai harus angka")
+    if key.endswith("_MINUTES"):
+        if not (1 <= number <= 1440):
+            raise ValueError("menit harus 1-1440")
+    elif key.endswith("_QUOTA_GB"):
+        if not (0 <= number <= 10000):
+            raise ValueError("quota harus 0-10000 GB")
+    elif key.endswith("_IP_LIMIT"):
+        if not (0 <= number <= 100):
+            raise ValueError("limit IP harus 0-100")
+    else:
+        raise ValueError("key tidak dikenal: %s" % key)
+    return str(number)
+
+
+def qlabel(gb):
+    gb = as_int(gb, 0)
+    return "Unlimited" if gb <= 0 else ("%d GB" % gb)
+
+
+def iplabel(limit):
+    limit = as_int(limit, 0)
+    return "Unlimited" if limit <= 0 else ("%d IP" % limit)
+
+
+def expires_text(epoch):
+    return datetime.fromtimestamp(int(epoch), WIB).strftime("%d/%m/%Y %H:%M WIB")
+
+
+def ensure_dirs():
+    os.makedirs(STATE_DIR, mode=0o700, exist_ok=True)
+    for proto in PROTOCOLS.values():
+        for key in ("limit", "usage", "ip"):
+            path = os.path.dirname(proto[key].format(user="x"))
+            if path:
+                os.makedirs(path, mode=0o755, exist_ok=True)
+
+
+def state_path(proto, user):
+    return os.path.join(STATE_DIR, "%s-%s.json" % (proto, user))
+
+
+def read_json(path, default=None):
+    try:
+        with open(path, "r", errors="ignore") as fh:
+            return json.load(fh)
+    except Exception:
+        return default
+
+
+def write_json(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(data, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp, path)
+    os.chmod(path, 0o600)
+
+
+def bot_credentials():
+    token = chat = ""
+    try:
+        with open("/etc/bot/.bot.db", "r", errors="ignore") as fh:
+            for line in fh:
+                if line.startswith("#bot# "):
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        token, chat = parts[1], parts[2]
+    except Exception:
+        pass
+    if not token or not chat:
+        try:
+            with open("/usr/bin/kyt/var.txt", "r", errors="ignore") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line.startswith("BOT_TOKEN="):
+                        token = line.split("=", 1)[1].strip("'\" ")
+                    elif line.startswith("ADMIN="):
+                        chat = line.split("=", 1)[1].strip("'\" ")
+        except Exception:
+            pass
+    return token, chat
+
+
+def telegram_send(text):
+    token, chat = bot_credentials()
+    if not token or not chat:
+        return False
+    url = "https://api.telegram.org/bot%s/sendMessage" % token
+    data = urllib.parse.urlencode({
+        "chat_id": chat,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": "1",
+    }).encode("utf-8")
+    try:
+        req = urllib.request.Request(url, data=data, method="POST")
+        urllib.request.urlopen(req, timeout=12).read(1)
+        return True
+    except Exception:
+        return False
+
+
+def db_has(meta, user):
+    markers = meta.get("db_markers") or [meta["db_marker"]]
+    try:
+        with open(meta["db"], "r", errors="ignore") as fh:
+            for line in fh:
+                for marker in markers:
+                    prefix = marker + " " + user
+                    if line.startswith(prefix + " ") or line.rstrip() == prefix:
+                        return True
+    except Exception:
+        pass
+    return False
+
+
+def config_has(meta, user):
+    marker = meta.get("config_marker") or ""
+    if not marker:
+        return True
+    try:
+        with open(XRAY_CONFIG, "r", errors="ignore") as fh:
+            for line in fh:
+                if line.startswith(marker + " " + user + " "):
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def account_exists(proto, user):
+    meta = PROTOCOLS[proto]
+    if proto == "ssh":
+        try:
+            if subprocess.run(["id", "-u", user], stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, timeout=10).returncode != 0:
+                return False
+        except Exception:
+            return False
+    return db_has(meta, user) and config_has(meta, user)
+
+
+def gen_username(meta):
+    alphabet = string.ascii_uppercase + string.digits
+    for _ in range(40):
+        user = meta["prefix"] + "".join(secrets.choice(alphabet) for _ in range(4))
+        if not any(account_exists(p, user) for p in PROTOCOLS):
+            return user
+    raise RuntimeError("gagal membuat username trial unik")
+
+
+def gen_password():
+    alphabet = string.ascii_letters + string.digits
+    return "".join(secrets.choice(alphabet) for _ in range(10))
+
+
+def script_answers(proto, user, password, quota_gb, ip_limit):
+    if proto == "ssh":
+        return [user, password, str(ip_limit), str(quota_gb), "1"]
+    if proto == "shadowsocks":
+        return [user, "1", str(quota_gb)]
+    return [user, "1", str(quota_gb), str(ip_limit)]
+
+
+def run_add(proto, user, password, quota_gb, ip_limit, timeout=60):
+    meta = PROTOCOLS[proto]
+    answers = script_answers(proto, user, password, quota_gb, ip_limit)
+    try:
+        proc = subprocess.Popen(
+            [meta["script"]],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+    except Exception as exc:
+        return False, "gagal menjalankan %s: %s" % (meta["script"], exc)
+
+    try:
+        proc.stdin.write("\n".join(str(a) for a in answers) + "\n")
+        proc.stdin.flush()
+    except Exception:
+        pass
+
+    start = time.time()
+    while time.time() - start < timeout:
+        if proc.poll() is not None:
+            break
+        try:
+            if account_exists(proto, user):
+                time.sleep(1.0)
+                break
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+    if proc.poll() is None:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except Exception:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        time.sleep(1)
+        if proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+    try:
+        output = proc.stdout.read() if proc.stdout else ""
+    except Exception:
+        output = ""
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        pass
+    return account_exists(proto, user), output
+
+
+def run_xray_trial(proto, timeout=30):
+    """Jalankan script trial panel (trialws/trialvless/trialtr/trialss).
+
+    Script membuat username sendiri (Trial-XX123), menulis config + DB, lalu
+    berhenti di "Press any key". Kita kirim satu newline supaya selesai, dan
+    menunggu proses keluar agar semua blok config tertulis lengkap.
+    """
+    meta = PROTOCOLS[proto]
+    script = meta.get("trial_script") or meta["script"]
+    try:
+        proc = subprocess.Popen(
+            [script],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=True,
+        )
+    except Exception as exc:
+        return "", "gagal menjalankan %s: %s" % (script, exc), False
+    try:
+        proc.stdin.write("\n")
+        proc.stdin.close()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+        except Exception:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+        time.sleep(0.8)
+        if proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+    try:
+        output = proc.stdout.read() if proc.stdout else ""
+    except Exception:
+        output = ""
+    match = re.search(r"Trial-[A-Za-z]{1,4}\d+", output or "")
+    user = match.group(0) if match else ""
+    if not user:
+        return "", output, False
+    for _ in range(20):
+        if account_exists(proto, user):
+            return user, output, True
+        time.sleep(0.4)
+    return user, output, False
+
+
+def update_db_limits(proto, user, quota_gb, ip_limit):
+    """Samakan field quota/IP di database protokol dengan setting trial."""
+    if proto == "ssh":
+        return
+    meta = PROTOCOLS[proto]
+    try:
+        with open(meta["db"], "r", errors="ignore") as fh:
+            lines = fh.readlines()
+    except FileNotFoundError:
+        return
+    markers = meta.get("db_markers") or [meta["db_marker"]]
+    changed = False
+    out = []
+    for line in lines:
+        matched = False
+        for marker in markers:
+            prefix = marker + " " + user
+            if line.startswith(prefix + " ") or line.rstrip() == prefix:
+                matched = True
+                break
+        if matched:
+            parts = line.rstrip("\n").split()
+            # Semua DB Xray: marker user exp uuid [quota ip]
+            parts = parts[:4] + [str(quota_gb), str(ip_limit)]
+            line = " ".join(parts) + "\n"
+            changed = True
+        out.append(line)
+    if changed:
+        tmp = meta["db"] + ".tmp"
+        with open(tmp, "w") as fh:
+            fh.writelines(out)
+        os.replace(tmp, meta["db"])
+
+
+def write_int(path, value):
+    os.makedirs(os.path.dirname(path), mode=0o755, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.write("%d\n" % int(value))
+    os.replace(tmp, path)
+
+
+def remove_file(path):
+    try:
+        if os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            os.remove(path)
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+
+def set_limits(proto, user, quota_gb, ip_limit):
+    meta = PROTOCOLS[proto]
+    quota_bytes = max(0, as_int(quota_gb, 0)) * (1024 ** 3)
+    limit_path = meta["limit"].format(user=user)
+    usage_path = meta["usage"].format(user=user)
+    ip_path = meta["ip"].format(user=user)
+    if quota_bytes > 0:
+        write_int(limit_path, quota_bytes)
+        write_int(usage_path, 0)
+    else:
+        remove_file(limit_path)
+        remove_file(usage_path)
+    if as_int(ip_limit, 0) > 0:
+        write_int(ip_path, as_int(ip_limit, 0))
+    else:
+        remove_file(ip_path)
+
+
+def read_quota(proto, user):
+    meta = PROTOCOLS[proto]
+    limit = 0
+    usage = 0
+    try:
+        with open(meta["limit"].format(user=user), "r", errors="ignore") as fh:
+            limit = int(fh.read().strip() or "0")
+    except Exception:
+        limit = 0
+    try:
+        with open(meta["usage"].format(user=user), "r", errors="ignore") as fh:
+            usage = int(fh.read().strip() or "0")
+    except Exception:
+        usage = 0
+    return max(0, limit), max(0, usage)
+
+
+def annotate_txt(proto, user, minutes, quota_gb, ip_limit, expires_at):
+    header = (
+        "========================================\n"
+        "TRIAL ACCOUNT - %s MENIT\n"
+        "Quota: %s | Limit IP: %s\n"
+        "Berakhir: %s\n"
+        "========================================\n\n"
+        % (minutes, qlabel(quota_gb), iplabel(ip_limit), expires_text(expires_at))
+    )
+    files = glob.glob("/var/www/html/*%s*.txt" % user)
+    for path in files:
+        try:
+            with open(path, "r", errors="ignore") as fh:
+                body = fh.read()
+            if "TRIAL ACCOUNT" in body:
+                continue
+            with open(path, "w") as fh:
+                fh.write(header + body)
+        except Exception:
+            pass
+    return files
+
+
+def remove_mullog_state(proto, user):
+    try:
+        if proto == "ssh":
+            subprocess.run([MULLOG, "release", "ssh", user], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=20)
+        else:
+            subprocess.run([MULLOG, "release", "xray", proto, user], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=20)
+    except Exception:
+        pass
+    for path in (
+        "/etc/kyt/jeda-mullog/state/ssh-%s.json" % user,
+        "/etc/kyt/jeda-mullog/state/xray-%s-%s.json" % (proto, user),
+    ):
+        remove_file(path)
+    for path in glob.glob("/etc/kyt/jeda-mullog/restored/*%s*" % user):
+        remove_file(path)
+
+
+def remove_db_lines(meta, user):
+    try:
+        with open(meta["db"], "r", errors="ignore") as fh:
+            lines = fh.readlines()
+    except FileNotFoundError:
+        return False
+    markers = meta.get("db_markers") or [meta["db_marker"]]
+    def _match(line):
+        for marker in markers:
+            prefix = marker + " " + user
+            if line.startswith(prefix + " ") or line.rstrip() == prefix:
+                return True
+        return False
+    kept = [line for line in lines if not _match(line)]
+    if len(kept) == len(lines):
+        return False
+    tmp = meta["db"] + ".tmp"
+    with open(tmp, "w") as fh:
+        fh.writelines(kept)
+    os.replace(tmp, meta["db"])
+    return True
+
+
+def remove_xray_blocks(meta, user):
+    marker = meta.get("config_marker") or ""
+    if not marker:
+        return False
+    try:
+        with open(XRAY_CONFIG, "r", errors="ignore") as fh:
+            lines = fh.readlines()
+    except FileNotFoundError:
+        return False
+    out = []
+    changed = False
+    i = 0
+    total = len(lines)
+    while i < total:
+        line = lines[i]
+        if line.startswith(marker + " " + user + " "):
+            changed = True
+            i += 1
+            # Normally the next line is the client object: },{"id": ...}
+            while i < total:
+                nxt = lines[i]
+                i += 1
+                if nxt.startswith("},{"):
+                    break
+                if re.match(r"^(###|#&|#!|#!#)\s", nxt):
+                    i -= 1
+                    break
+            continue
+        out.append(line)
+        i += 1
+    if changed:
+        tmp = XRAY_CONFIG + ".tmp"
+        with open(tmp, "w") as fh:
+            fh.writelines(out)
+        os.replace(tmp, XRAY_CONFIG)
+    return changed
+
+
+def delete_account(proto, user, reason="manual", notify=True):
+    meta = PROTOCOLS[proto]
+    remove_mullog_state(proto, user)
+    if proto == "ssh":
+        try:
+            subprocess.run(["pkill", "-9", "-u", user], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=15)
+        except Exception:
+            pass
+        try:
+            subprocess.run(["userdel", "-f", user], stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL, timeout=20)
+        except Exception:
+            pass
+        remove_db_lines(meta, user)
+        for path in (
+            "/etc/ssh/%s" % user,
+            "/etc/limit/ssh/%s" % user,
+            "/etc/limit/ssh/%s.lock" % user,
+            "/etc/kyt/limit/ssh/ip/%s" % user,
+            "/var/www/html/ssh-%s.txt" % user,
+        ):
+            remove_file(path)
+        changed = False
+    else:
+        changed = remove_xray_blocks(meta, user)
+        remove_db_lines(meta, user)
+        for path in (
+            meta["limit"].format(user=user),
+            meta["usage"].format(user=user),
+            meta["ip"].format(user=user),
+        ):
+            remove_file(path)
+        if changed:
+            try:
+                subprocess.run(["systemctl", "restart", "xray"], stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=90)
+            except Exception:
+                pass
+    for path in glob.glob("/var/www/html/*%s*.txt" % user):
+        remove_file(path)
+    remove_file(state_path(proto, user))
+    if notify:
+        action = {
+            "time": "Waktu trial habis",
+            "quota": "Quota trial habis",
+            "manual": "Dihapus admin",
+            "missing": "Akun sudah tidak ada",
+        }.get(reason, reason)
+        telegram_send(
+            "<b>🗑️ TRIAL DIHAPUS</b>\n"
+            "Akun   : <code>%s</code>\n"
+            "Layanan: <code>%s</code>\n"
+            "Alasan : <code>%s</code>" % (user, meta["label"], action)
+        )
+    return True
+
+
+def create_trial(proto, minutes=None, quota_gb=None, ip_limit=None,
+                 source="menu", notify_create=True):
+    proto = alias_proto(proto)
+    if proto not in PROTOCOLS:
+        raise ValueError("protokol tidak dikenal: %s" % proto)
+    conf = load_conf()
+    if conf.get("ENABLED", "1") != "1":
+        raise ValueError("Trial sedang dinonaktifkan di Trial Settings.")
+    group = "SSH" if proto == "ssh" else "XRAY"
+    if minutes is None:
+        minutes = as_int(conf.get(group + "_MINUTES"), 30)
+    if quota_gb is None:
+        quota_gb = as_int(conf.get(group + "_QUOTA_GB"), 10)
+    if ip_limit is None:
+        ip_limit = as_int(conf.get(group + "_IP_LIMIT"), 2)
+    minutes = int(minutes)
+    quota_gb = int(quota_gb)
+    ip_limit = int(ip_limit)
+    if not (1 <= minutes <= 1440):
+        raise ValueError("menit harus 1-1440")
+    if not (0 <= quota_gb <= 10000):
+        raise ValueError("quota harus 0-10000 GB")
+    if not (0 <= ip_limit <= 100):
+        raise ValueError("limit IP harus 0-100")
+
+    ensure_dirs()
+    meta = PROTOCOLS[proto]
+    if proto == "ssh":
+        user = gen_username(meta)
+        password = gen_password()
+        ok, output = run_add(proto, user, password, quota_gb, ip_limit)
+    else:
+        password = ""
+        user, output, ok = run_xray_trial(proto)
+    if not ok or not user:
+        if user:
+            delete_account(proto, user, "manual", notify=False)
+        raise RuntimeError("gagal membuat akun trial %s. Output:\n%s" % (meta["label"], output[-2500:]))
+
+    set_limits(proto, user, quota_gb, ip_limit)
+    update_db_limits(proto, user, quota_gb, ip_limit)
+    now = int(time.time())
+    expires_at = now + minutes * 60
+    state = {
+        "protocol": proto,
+        "service": meta["service"],
+        "username": user,
+        "password": password,
+        "minutes": minutes,
+        "quota_gb": quota_gb,
+        "ip_limit": ip_limit,
+        "created_at": now,
+        "expires_at": expires_at,
+        "source": source,
+    }
+    write_json(state_path(proto, user), state)
+    txt_files = annotate_txt(proto, user, minutes, quota_gb, ip_limit, expires_at)
+    if notify_create and load_conf().get("NOTIFY", "1") == "1":
+        telegram_send(
+            "<b>🎟️ TRIAL DIBUAT</b>\n"
+            "Akun   : <code>%s</code>\n"
+            "Layanan: <code>%s</code>\n"
+            "Durasi : <code>%d menit</code>\n"
+            "Quota  : <code>%s</code>\n"
+            "Limit  : <code>%s</code>\n"
+            "Berakhir: <code>%s</code>"
+            % (user, meta["label"], minutes, qlabel(quota_gb), iplabel(ip_limit), expires_text(expires_at))
+        )
+    result = dict(state)
+    result.update({
+        "ok": True,
+        "label": meta["label"],
+        "expires_text": expires_text(expires_at),
+        "output": output,
+        "txt_files": txt_files,
+    })
+    return result
+
+
+def list_trials():
+    items = []
+    for path in sorted(glob.glob(os.path.join(STATE_DIR, "*.json"))):
+        state = read_json(path)
+        if not isinstance(state, dict):
+            continue
+        proto = alias_proto(state.get("protocol", ""))
+        user = state.get("username", "")
+        if proto not in PROTOCOLS or not user:
+            continue
+        limit, usage = read_quota(proto, user)
+        now = int(time.time())
+        expires_at = as_int(state.get("expires_at"), 0)
+        state["remaining_seconds"] = max(0, expires_at - now)
+        state["exists"] = account_exists(proto, user)
+        state["usage_bytes"] = usage
+        state["limit_bytes"] = limit
+        state["label"] = PROTOCOLS[proto]["label"]
+        state["path"] = path
+        items.append(state)
+    return items
+
+
+def human_create(result):
+    print("")
+    print("========================================")
+    print(" TRIAL %s" % result["label"].upper())
+    print("========================================")
+    print(" Username : %s" % result["username"])
+    if result.get("password"):
+        print(" Password : %s" % result["password"])
+    print(" Durasi   : %d menit" % result["minutes"])
+    print(" Quota    : %s" % qlabel(result["quota_gb"]))
+    print(" Limit IP : %s" % iplabel(result["ip_limit"]))
+    print(" Berakhir : %s" % result["expires_text"])
+    print("========================================")
+    if result.get("output"):
+        print("")
+        print(result["output"].rstrip())
+    print("")
+
+
+def human_list(items):
+    if not items:
+        print("Belum ada trial aktif.")
+        return
+    print("")
+    print("%-3s %-10s %-16s %-10s %-12s %-8s" % ("#", "LAYANAN", "USERNAME", "SISA", "QUOTA", "STATUS"))
+    print("-" * 78)
+    now = int(time.time())
+    for idx, item in enumerate(items, 1):
+        rem = max(0, as_int(item.get("expires_at"), 0) - now)
+        mins = rem // 60
+        quota = qlabel(item.get("quota_gb", 0))
+        status = "aktif" if item.get("exists") else "hilang"
+        print("%-3d %-10s %-16s %-10s %-12s %-8s" % (
+            idx, item.get("label", ""), item.get("username", ""),
+            "%dm" % mins, quota, status,
+        ))
+    print("-" * 78)
+
+
+def interactive_settings():
+    conf = load_conf()
+    print("")
+    print("TRIAL SETTINGS")
+    print("Enter = pakai nilai sekarang")
+    print("")
+    prompts = [
+        ("ENABLED", "Trial aktif (1/0)"),
+        ("SSH_MINUTES", "Trial SSH - menit"),
+        ("SSH_QUOTA_GB", "Trial SSH - quota GB (0=unlimited)"),
+        ("SSH_IP_LIMIT", "Trial SSH - limit IP (0=unlimited)"),
+        ("XRAY_MINUTES", "Trial All Xray - menit"),
+        ("XRAY_QUOTA_GB", "Trial All Xray - quota GB (0=unlimited)"),
+        ("XRAY_IP_LIMIT", "Trial All Xray - limit IP (0=unlimited)"),
+        ("NOTIFY", "Notifikasi Telegram (1/0)"),
+    ]
+    values = dict(conf)
+    for key, label in prompts:
+        current = values.get(key, DEFAULTS[key])
+        raw = input(" %-38s [%s]: " % (label, current)).strip()
+        if not raw:
+            continue
+        try:
+            values[key] = validate_value(key, raw)
+        except ValueError as exc:
+            print("  ! %s - nilai lama dipakai" % exc)
+    save_conf(values)
+    print("")
+    print("Tersimpan.")
+    print("  SSH  : %s menit, %s, %s" % (values["SSH_MINUTES"], qlabel(values["SSH_QUOTA_GB"]), iplabel(values["SSH_IP_LIMIT"])))
+    print("  XRAY : %s menit, %s, %s" % (values["XRAY_MINUTES"], qlabel(values["XRAY_QUOTA_GB"]), iplabel(values["XRAY_IP_LIMIT"])))
+    print("")
+
+
+def interactive_active():
+    items = list_trials()
+    human_list(items)
+    if not items:
+        return
+    raw = input(" Nomor trial yang mau dihapus (Enter = batal): ").strip()
+    if not raw.isdigit():
+        return
+    idx = int(raw) - 1
+    if not (0 <= idx < len(items)):
+        print("Nomor tidak valid.")
+        return
+    item = items[idx]
+    if input(" Hapus trial %s? (y/N): " % item["username"]).strip().lower() != "y":
+        return
+    delete_account(alias_proto(item["protocol"]), item["username"], "manual", notify=True)
+    print("Trial dihapus.")
+
+
+def main():
+    if os.geteuid() != 0:
+        print("Harus dijalankan sebagai root.", file=sys.stderr)
+        return 1
+    parser = argparse.ArgumentParser(prog="kyt-trial")
+    sub = parser.add_subparsers(dest="cmd")
+
+    p_create = sub.add_parser("create")
+    p_create.add_argument("--protocol", required=True)
+    p_create.add_argument("--minutes", type=int)
+    p_create.add_argument("--quota", type=int)
+    p_create.add_argument("--ip", type=int)
+    p_create.add_argument("--source", default="menu")
+    p_create.add_argument("--json", action="store_true")
+    p_create.add_argument("--no-notify", action="store_true")
+
+    p_delete = sub.add_parser("delete")
+    p_delete.add_argument("--protocol", required=True)
+    p_delete.add_argument("--username", required=True)
+    p_delete.add_argument("--reason", default="manual")
+    p_delete.add_argument("--json", action="store_true")
+
+    p_list = sub.add_parser("list")
+    p_list.add_argument("--json", action="store_true")
+
+    sub.add_parser("active")
+    sub.add_parser("settings")
+
+    p_conf = sub.add_parser("config")
+    p_conf.add_argument("key", nargs="?")
+    p_conf.add_argument("value", nargs="?")
+
+    args = parser.parse_args()
+    if not args.cmd:
+        parser.print_help()
+        return 64
+
+    if args.cmd == "create":
+        try:
+            result = create_trial(
+                args.protocol, args.minutes, args.quota, args.ip, args.source,
+                notify_create=not args.no_notify,
+            )
+        except Exception as exc:
+            if args.json:
+                print(json.dumps({"ok": False, "error": str(exc)}, ensure_ascii=False))
+            else:
+                print("GAGAL: %s" % exc, file=sys.stderr)
+            return 1
+        if args.json:
+            print(json.dumps(result, ensure_ascii=False))
+        else:
+            human_create(result)
+        return 0
+
+    if args.cmd == "delete":
+        proto = alias_proto(args.protocol)
+        if proto not in PROTOCOLS:
+            print("Protokol tidak dikenal.", file=sys.stderr)
+            return 1
+        delete_account(proto, args.username, args.reason, notify=True)
+        if args.json:
+            print(json.dumps({"ok": True}, ensure_ascii=False))
+        else:
+            print("Trial %s dihapus." % args.username)
+        return 0
+
+    if args.cmd == "list":
+        items = list_trials()
+        if args.json:
+            print(json.dumps(items, ensure_ascii=False))
+        else:
+            human_list(items)
+        return 0
+
+    if args.cmd == "active":
+        interactive_active()
+        return 0
+
+    if args.cmd == "settings":
+        interactive_settings()
+        return 0
+
+    if args.cmd == "config":
+        conf = load_conf()
+        if not args.key:
+            for key in DEFAULTS:
+                print("%s=%s" % (key, conf.get(key, DEFAULTS[key])))
+            return 0
+        key = args.key.strip().upper()
+        if key not in DEFAULTS:
+            print("Key tidak dikenal: %s" % key, file=sys.stderr)
+            return 1
+        if args.value is None:
+            print(conf.get(key, DEFAULTS[key]))
+            return 0
+        try:
+            conf[key] = validate_value(key, args.value)
+        except ValueError as exc:
+            print("Nilai tidak valid: %s" % exc, file=sys.stderr)
+            return 1
+        save_conf(conf)
+        print("%s=%s" % (key, conf[key]))
+        return 0
+
+    parser.print_help()
+    return 64
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,70 @@
+#!/bin/bash
+# HITS SSH - Trial Manager (menu VPS)
+set -u
+
+TRIAL_BIN="/usr/local/sbin/kyt-trial"
+pause() { read -r -n 1 -s -p " Tekan Enter untuk kembali..." _; }
+
+show_header() {
+    clear
+    echo "========================================================="
+    echo "                    TRIAL MANAGER"
+    echo "========================================================="
+    "$TRIAL_BIN" config 2>/dev/null | while IFS='=' read -r k v; do
+        case "$k" in
+            ENABLED)      [ "$v" = "1" ] && echo " Status     : AKTIF" || echo " Status     : NONAKTIF" ;;
+            SSH_MINUTES)  echo " Trial SSH  : ${v} menit" ;;
+            SSH_QUOTA_GB) echo "   Quota    : ${v} GB (0=unlimited)" ;;
+            SSH_IP_LIMIT) echo "   Limit IP : ${v} (0=unlimited)" ;;
+            XRAY_MINUTES) echo " Trial Xray : ${v} menit" ;;
+            XRAY_QUOTA_GB) echo "   Quota    : ${v} GB (0=unlimited)" ;;
+            XRAY_IP_LIMIT) echo "   Limit IP : ${v} (0=unlimited)" ;;
+        esac
+    done
+    echo "========================================================="
+}
+
+xray_menu() {
+    while true; do
+        show_header
+        echo "                TRIAL ALL XRAY"
+        echo "========================================================="
+        echo "  1) VMess"
+        echo "  2) VLESS"
+        echo "  3) Trojan"
+        echo "  4) Shadowsocks"
+        echo "  0) Kembali"
+        echo "========================================================="
+        read -r -p " Pilih protokol [1-4 / 0] : " p
+        case "$p" in
+            1) proto=vmess ;;
+            2) proto=vless ;;
+            3) proto=trojan ;;
+            4) proto=shadowsocks ;;
+            0) return ;;
+            *) continue ;;
+        esac
+        clear
+        "$TRIAL_BIN" create --protocol "$proto" --source menu
+        pause
+    done
+}
+
+while true; do
+    show_header
+    echo "  1) Trial SSH"
+    echo "  2) Trial All Xray"
+    echo "  3) Trial Settings"
+    echo "  4) Trial Active / Hapus"
+    echo "  0) Kembali ke Utility"
+    echo "========================================================="
+    read -r -p " Pilih [1-4 / 0] : " opt
+    case "$opt" in
+        1) clear; "$TRIAL_BIN" create --protocol ssh --source menu; pause ;;
+        2) xray_menu ;;
+        3) clear; "$TRIAL_BIN" settings; pause ;;
+        4) clear; "$TRIAL_BIN" active; pause ;;
+        0) exec utility ;;
+        *) continue ;;
+    esac
+done
