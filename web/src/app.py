@@ -6237,8 +6237,8 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
     else:
         items = [
             ("home", "/", "Beranda"),
-            ("premium", "/premium", "Beli Akun"),
-            ("free", "/gratis", "Buat Akun"),
+            ("premium", "/premium", "Premium Akun"),
+            ("free", "/gratis", "Free Akun"),
             ("deposit", "/deposit", "Deposit"),
             ("invoice", "/cek-invoice", "Cek Invoice"),
             ("contact", "/kontak", "Kontak"),
