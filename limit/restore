@@ -287,6 +287,7 @@ if [ -d "$AKAR/etc" ]; then
     done
     [ -f "$AKAR/root/kyt-web-admin.txt" ] && salin "$AKAR/root/kyt-web-admin.txt" "/root/kyt-web-admin.txt"
     [ -f "$AKAR/etc/kyt-web.conf" ] && salin "$AKAR/etc/kyt-web.conf" "/etc/kyt-web.conf"
+    [ -f "$AKAR/etc/kyt-web-mail.key" ] && salin "$AKAR/etc/kyt-web-mail.key" "/etc/kyt-web-mail.key"
     [ -f "$AKAR/usr/local/sbin/setting-web" ] && salin "$AKAR/usr/local/sbin/setting-web" "/usr/local/sbin/setting-web"
     [ -f "$AKAR/etc/bot/.bot.db" ] && salin "$AKAR/etc/bot/.bot.db" "/etc/bot/.bot.db"
     [ -f "$AKAR/usr/bin/kyt/gomerch_token.json" ] && salin "$AKAR/usr/bin/kyt/gomerch_token.json" "/usr/bin/kyt/gomerch_token.json"
@@ -334,7 +335,7 @@ echo -e "       -> ${GREEN}${DIPULIHKAN} data dipulihkan${NC}"
 for f in /etc/shadow /etc/gshadow; do
     [ -f "$f" ] && chmod 640 "$f" 2>/dev/null
 done
-for f in /etc/ipsec.secrets /etc/ppp/chap-secrets /etc/xray/xray.key /etc/haproxy/hap.pem; do
+for f in /etc/ipsec.secrets /etc/ppp/chap-secrets /etc/xray/xray.key /etc/haproxy/hap.pem /etc/kyt-web-mail.key; do
     [ -f "$f" ] && chmod 600 "$f" 2>/dev/null
 done
 for f in /usr/local/sbin/jeda-mullog /usr/local/sbin/setting-jeda /usr/local/sbin/utility /usr/local/sbin/kyt-web-configure-edge /usr/local/sbin/setting-web /usr/bin/limit-ip /etc/xray/limit.ssh; do
