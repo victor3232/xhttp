@@ -7329,7 +7329,7 @@ def render_auth_page(
         "register": ("DAFTAR GRATIS", "Satu akun, semua terkendali.", "Cukup email dan password. Setelah verifikasi, dashboard langsung aktif.", "Daftar sekarang"),
         "forgot": ("LUPA PASSWORD", "Atur ulang dengan aman.", "Masukkan email akun. Kami kirim tautan untuk membuat password baru.", "Kirim tautan reset"),
         "reset": ("PASSWORD BARU", "Buat password baru.", "Minimal 8 karakter. Bebas kombinasi huruf, angka, atau simbol.", "Simpan password"),
-        "verify": ("VERIFIKASI EMAIL", "Cek inbox Anda.", "Masukkan kode 6 digit dari email, atau klik tombol verifikasi di email. Belum menerima email? Kirim ulang di bawah.", "Verifikasi dengan kode"),
+        "verify": ("VERIFIKASI EMAIL", "MASUKKAN KODE VERIFIKASI", "Silakan cek Inbox atau folder SPAM, lalu masukkan kode 6 digit dari email. Anda juga bisa klik tombol verifikasi di email. Belum menerima email? Kirim ulang di bawah.", "Verifikasi dengan kode"),
     }
     eyebrow, title, lead, submit = copy.get(mode, copy["login"])
     err_html = f'<div class="notice notice-error">{e(error)}</div>' if error else ""
