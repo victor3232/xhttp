@@ -27,7 +27,8 @@ case "${1:-}" in
   *.*) REPO="https://$1" ;;
 esac
 case "$REPO" in http://*|https://*) ;; *) REPO="https://$REPO" ;; esac
-REPO="${REPO%/}"
+# Wajib diakhiri tepat satu "/" karena semua aset memakai pola "${REPO}limit/..."
+REPO="${REPO%/}/"
 export KYT_REPO="$REPO"
 
 # Menu/lisensi default ke repo GitHub (raw), terpisah dari domain installer.
