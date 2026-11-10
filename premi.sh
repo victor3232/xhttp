@@ -305,10 +305,13 @@ function first_setup(){
         
         if [[ "$OS_VERSION" == "22.04" ]] || [[ "$OS_VERSION" == "24.04" ]]; then
             echo "Terdeteksi Ubuntu $OS_VERSION..."
-            # Install libssl1.1 dari repo legacy
+            # Install libssl1.1 dari repo legacy (dibutuhkan binary lama ftvpn).
             echo "deb http://security.ubuntu.com/ubuntu focal-security main" | tee /etc/apt/sources.list.d/focal-security.list
             apt-get update
-            apt-get install libssl1.1 -y
+            apt-get install libssl1.1 -y || echo "  libssl1.1 tidak tersedia, dilewati."
+            # Jangan tinggalkan repo focal di sistem 22/24 agar apt tidak campur rilis.
+            rm -f /etc/apt/sources.list.d/focal-security.list
+            apt-get update -y >/dev/null 2>&1
             apt_pasang haproxy
         elif [[ "$OS_VERSION" == "20.04" ]] || [[ "$OS_VERSION" < "22.04" ]]; then
             # Ubuntu 20.04 kebawah
