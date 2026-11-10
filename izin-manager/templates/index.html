@@ -1,0 +1,127 @@
+{% extends "base.html" %}
+{% block title %}IZIN MANAGER — HITS SSH{% endblock %}
+{% block body %}
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark">◈</span>
+    <div>
+      <h1>IZIN MANAGER</h1>
+      <p>Add / delete / check IP lisensi</p>
+    </div>
+  </div>
+  <div class="top-actions">
+    <a class="btn btn-ghost" href="https://github.com/{{ repo }}/blob/{{ branch }}/{{ path }}" target="_blank" rel="noopener">Lihat file izin</a>
+    <form method="post" action="{{ url_for('logout') }}">
+      <button class="btn btn-ghost" type="submit">Keluar</button>
+    </form>
+  </div>
+</header>
+
+{% with messages = get_flashed_messages(with_categories=true) %}
+  {% for category, message in messages %}
+    <div class="alert alert-{{ 'error' if category == 'error' else 'ok' }}">{{ message }}</div>
+  {% endfor %}
+{% endwith %}
+
+{% if error %}<div class="alert alert-error">{{ error }}</div>{% endif %}
+
+<section class="stats">
+  <div class="stat"><span>Total</span><b>{{ stats.total }}</b></div>
+  <div class="stat"><span>Aktif</span><b class="ok">{{ stats.active }}</b></div>
+  <div class="stat"><span>Expired</span><b class="bad">{{ stats.expired }}</b></div>
+  <div class="stat"><span>Lifetime</span><b class="blue">{{ stats.lifetime }}</b></div>
+  <div class="stat"><span>Invalid</span><b class="muted">{{ stats.invalid }}</b></div>
+</section>
+
+<section class="card">
+  <div class="card-head">
+    <h2>Tambah / Update IP</h2>
+    <p>Kalau IP sudah ada, data lama otomatis diperbarui.</p>
+  </div>
+  <form method="post" action="{{ url_for('add') }}" class="add-grid">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label>Nama
+      <input name="name" maxlength="40" required placeholder="contoh: admin / premiumv1">
+    </label>
+    <label>Expired
+      <input name="expiry" required placeholder="2026-12-31 atau lifetime">
+    </label>
+    <label>IP
+      <input name="ip" required placeholder="1.2.3.4" inputmode="decimal">
+    </label>
+    <button class="btn btn-primary" type="submit">Simpan IP</button>
+  </form>
+</section>
+
+<section class="card">
+  <div class="card-head table-head">
+    <div>
+      <h2>Daftar IP</h2>
+      <p>{{ entries|length }} baris ditampilkan · hari ini {{ today }}</p>
+    </div>
+    <form method="get" action="{{ url_for('index') }}" class="search">
+      <input name="q" value="{{ q }}" placeholder="Cari nama / IP / tanggal">
+      <button class="btn btn-ghost" type="submit">Cari</button>
+      {% if q %}<a class="btn btn-ghost" href="{{ url_for('index') }}">Reset</a>{% endif %}
+    </form>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Nama</th>
+          <th>IP</th>
+          <th>Expired</th>
+          <th>Status</th>
+          <th>Sisa</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+      {% for e in entries %}
+        <tr class="{{ 'row-invalid' if not e.valid else '' }}">
+          <td><b>{{ e.name or '-' }}</b>{% if e.error %}<small class="err">{{ e.error }}</small>{% endif %}</td>
+          <td><code>{{ e.ip or '-' }}</code></td>
+          <td>{{ e.expiry or '-' }}</td>
+          <td>
+            {% if e.status == 'active' %}
+              {% if e.days_left is not none and e.days_left <= 7 %}
+                <span class="badge badge-warn">Hampir habis</span>
+              {% else %}
+                <span class="badge badge-ok">Aktif</span>
+              {% endif %}
+            {% elif e.status == 'lifetime' %}
+              <span class="badge badge-blue">Lifetime</span>
+            {% elif e.status == 'expired' %}
+              <span class="badge badge-bad">Expired</span>
+            {% else %}
+              <span class="badge badge-muted">Invalid</span>
+            {% endif %}
+          </td>
+          <td>
+            {% if e.status == 'lifetime' %}∞
+            {% elif e.days_left is not none %}{{ e.days_left }} hari
+            {% else %}-{% endif %}
+          </td>
+          <td class="right">
+            <form method="post" action="{{ url_for('delete') }}" onsubmit="return confirm('Hapus IP {{ e.ip }}?');">
+              <input type="hidden" name="csrf" value="{{ csrf }}">
+              <input type="hidden" name="ip" value="{{ e.ip }}">
+              <button class="btn btn-danger btn-small" type="submit">Hapus</button>
+            </form>
+          </td>
+        </tr>
+      {% else %}
+        <tr><td colspan="6" class="empty">Belum ada data{% if q %} untuk "{{ q }}"{% endif %}.</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<footer class="foot">
+  <span>{{ 'Mode lokal: file izin' if local_mode else 'GitHub: ' ~ repo ~ '/' ~ path ~ ' @ ' ~ branch }}</span>
+  <span>API: <code>/api/check?ip=1.2.3.4</code> · header <code>X-API-Key</code></span>
+</footer>
+{% endblock %}

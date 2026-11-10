@@ -1,0 +1,26 @@
+{% extends "base.html" %}
+{% block title %}Login — IZIN MANAGER{% endblock %}
+{% block body %}
+<main class="login-wrap">
+  <section class="card login-card">
+    <div class="brand">
+      <span class="brand-mark">◈</span>
+      <div>
+        <h1>IZIN MANAGER</h1>
+        <p>Kelola IP lisensi HITS SSH</p>
+      </div>
+    </div>
+
+    {% if error %}<div class="alert alert-error">{{ error }}</div>{% endif %}
+
+    <form method="post" class="stack">
+      <label>Password admin
+        <input type="password" name="password" autocomplete="current-password" required autofocus placeholder="Masukkan password">
+      </label>
+      <button class="btn btn-primary" type="submit">Masuk</button>
+    </form>
+
+    <p class="foot">Akses hanya untuk admin. Jangan bagikan password.</p>
+  </section>
+</main>
+{% endblock %}
