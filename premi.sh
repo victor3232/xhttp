@@ -336,7 +336,9 @@ function first_setup(){
             if [[ "$OS_VERSION" == "12" ]]; then
                 echo "deb http://security.debian.org/debian-security bullseye-security main" > /etc/apt/sources.list.d/bullseye-security.list
                 apt-get update
-                apt-get install libssl1.1 -y
+                apt-get install libssl1.1 -y || echo "  libssl1.1 tidak tersedia di mirror, dilewati."
+                # Jangan tinggalkan repo bullseye di sistem bookworm.
+                rm -f /etc/apt/sources.list.d/bullseye-security.list
             fi
             
             # Debian 11 & 12 Install HAProxy langsung dari repo official (Stable)
