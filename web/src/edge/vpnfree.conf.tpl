@@ -55,10 +55,11 @@ server {
 
 server {
     # TLS diterminasi HAProxy; nginx menerima HTTP + PROXY protocol.
-    # Catatan: JANGAN pakai "http2 on;" — direktif itu baru ada di nginx >= 1.25.
-    # Debian 12 (nginx 1.22) dan Ubuntu 22/24 (nginx 1.18/1.24) akan gagal nginx -t.
-    # HAProxy sudah menangani HTTP/2 di sisi klien dan meneruskan HTTP/1.1 ke sini.
-    listen 127.0.0.1:8444 proxy_protocol;
+    # HAProxy meneruskan HTTP/2 mentah (backend mode tcp), jadi nginx wajib http2.
+    # Pakai parameter "http2" di listen: kompatibel nginx 1.18-1.24 DAN 1.25+.
+    # Jangan pakai direktif "http2 on;" karena baru ada di nginx >= 1.25
+    # (Debian 12 = 1.22, Ubuntu 22.04 = 1.18, Ubuntu 24.04 = 1.24).
+    listen 127.0.0.1:8444 proxy_protocol http2;
     server_name __DOMAIN__;
     server_tokens off;
     client_max_body_size 128k;
