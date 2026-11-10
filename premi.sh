@@ -1346,7 +1346,7 @@ clear
     install_xray
     ssh
     udp_mini
-    ssh_slow
+    # SlowDNS TIDAK dipasang otomatis; aktifkan manual via menu SLOWDNS SETTING.
     ins_SSHD
     ins_dropbear
     ins_vnstat

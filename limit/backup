@@ -76,6 +76,7 @@ BERKAS="
 /etc/xray/city
 /etc/xray/isp
 /etc/xray/dns
+/etc/kyt-dns-mode
 /etc/xray/xray.crt
 /etc/xray/xray.key
 /etc/haproxy/haproxy.cfg

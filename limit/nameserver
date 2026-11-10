@@ -26,7 +26,8 @@ xray_domain=$(cat /etc/xray/domain 2>/dev/null || cat /root/domain 2>/dev/null |
 # menimpa resolusi domain Xray.
 # Kalau domain SlowDNS sudah pernah dipilih (menu GANTI NS), pertahankan.
 existing_dns=$(cat /etc/xray/dns 2>/dev/null || cat /root/slowdns/dns_domain 2>/dev/null || true)
-domain="${existing_dns:-dns.${xray_domain}}"
+domain="${KYT_DNS_DOMAIN:-${existing_dns:-dns.${xray_domain}}}"
+upstream="${KYT_DNS_UPSTREAM:-127.0.0.1:22}"
 ns_domain="ns.${domain}"
 
 echo "Memasang SlowDNS Server untuk domain: $domain ($ns_domain)..."
@@ -72,6 +73,7 @@ mkdir -p /etc/xray /etc/slowdns /root/slowdns
 echo "$domain" > /etc/xray/dns
 echo "$domain" > /root/slowdns/dns_domain
 echo "$domain" > /etc/xray/dns_domain 2>/dev/null || true
+[ -s /etc/kyt-dns-mode ] || printf 'ssh\n' > /etc/kyt-dns-mode
 
 # 5. Pasang service otomatis
 # Unit lama harus dibuang: WORK sudah dihapus di atas, sedangkan install.sh
@@ -80,7 +82,7 @@ systemctl stop slowdns >/dev/null 2>&1 || true
 systemctl disable slowdns >/dev/null 2>&1 || true
 rm -f /etc/systemd/system/slowdns.service
 systemctl daemon-reload >/dev/null 2>&1 || true
-printf '%s\n53\n%s\n127.0.0.1:22\n' "$BIND_IP" "$domain" | bash "$WORK/install.sh" install
+printf '%s\n53\n%s\n%s\n' "$BIND_IP" "$domain" "$upstream" | bash "$WORK/install.sh" install
 
 # 5b. Kembalikan key lama (kalau ada) agar Public Key pelanggan tidak berubah.
 if [ -n "$KEY_BAK" ]; then
@@ -92,7 +94,7 @@ if [ -n "$KEY_BAK" ]; then
         echo "Peringatan: key lama tidak bisa dipakai, membuat key baru..."
         rm -f "$WORK/server.key" "$WORK/server.pub" "$WORK/slowdns.env" /etc/systemd/system/slowdns.service
         systemctl daemon-reload >/dev/null 2>&1 || true
-        printf '%s\n53\n%s\n127.0.0.1:22\n' "$BIND_IP" "$domain" | bash "$WORK/install.sh" install || true
+        printf '%s\n53\n%s\n%s\n' "$BIND_IP" "$domain" "$upstream" | bash "$WORK/install.sh" install || true
     fi
     rm -rf "$KEY_BAK"
 fi
