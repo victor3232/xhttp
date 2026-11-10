@@ -917,12 +917,13 @@ gotop_latest="$(curl -s https://api.github.com/repos/xxxserxxx/gotop/releases | 
     dpkg -i /tmp/gotop.deb >/dev/null 2>&1
     
         # > Buat swap sebesar 1G
+    swapoff /swapfile >/dev/null 2>&1
     dd if=/dev/zero of=/swapfile bs=1024 count=1048576
     mkswap /swapfile
     chown root:root /swapfile
     chmod 0600 /swapfile >/dev/null 2>&1
     swapon /swapfile >/dev/null 2>&1
-    sed -i '$ i\/swapfile      swap swap   defaults    0 0' /etc/fstab
+    grep -q '^/swapfile' /etc/fstab 2>/dev/null || sed -i '$ i\/swapfile      swap swap   defaults    0 0' /etc/fstab
 
     # > Singkronisasi jam
     chronyd -q 'server 0.id.pool.ntp.org iburst'
@@ -941,17 +942,15 @@ print_install "Menginstall Fail2ban"
 #/etc/init.d/fail2ban restart
 #/etc/init.d/fail2ban status
 
-# Instal DDOS Flate
+# Instal DDOS Flate (idempotent: jangan hentikan instalasi saat dijalankan ulang)
 if [ -d '/usr/local/ddos' ]; then
-	echo; echo; echo "Please un-install the previous version first"
-	exit 0
-else
-	mkdir /usr/local/ddos
+	rm -rf /usr/local/ddos
 fi
+mkdir -p /usr/local/ddos
 
 clear
 # banner
-echo "Banner /etc/kyt.txt" >>/etc/ssh/sshd_config
+grep -q '^Banner /etc/kyt.txt' /etc/ssh/sshd_config 2>/dev/null || echo "Banner /etc/kyt.txt" >>/etc/ssh/sshd_config
 sed -i 's@DROPBEAR_BANNER=""@DROPBEAR_BANNER="/etc/kyt.txt"@g' /etc/default/dropbear
 
 # Ganti Banner
@@ -1098,7 +1097,8 @@ function menu(){
     clear
     print_install "Memasang Menu Packet"
     wget -O menu.zip "${REPO}limit/menu.zip?v=20261110"
-    unzip menu.zip
+    rm -rf menu
+    unzip -oq menu.zip
     chmod +x menu/*
     mv menu/* /usr/local/sbin
     if [ -x /usr/local/sbin/trial-install.sh ]; then
