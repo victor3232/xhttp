@@ -126,7 +126,7 @@ else:
     text = re.sub(r"(?m)^    use_backend VPNFREE_SSL .*$", "    use_backend VPNFREE_SSL if is_vpnfree_ssl", text)
 
 # backend
-if "backend VPNFREE_HTTP" not in text:
+if "\nbackend VPNFREE_HTTP\n" not in text:
     anchor = "\nbackend recir_https_www\n"
     if anchor not in text:
         raise SystemExit("backend recir_https_www tidak ditemukan")
@@ -144,6 +144,9 @@ if "backend VPNFREE_HTTP" not in text:
 else:
     text = re.sub(r"(?m)^    server vpnfree-http .*$", "    server vpnfree-http 127.0.0.1:8088 send-proxy-v2", text)
     text = re.sub(r"(?m)^    server vpnfree-ssl .*$", "    server vpnfree-ssl 127.0.0.1:8444 send-proxy-v2", text)
+
+if "\nbackend VPNFREE_HTTP\n" not in text or "\nbackend VPNFREE_SSL\n" not in text:
+    raise SystemExit("gagal menambahkan backend VPNFREE ke haproxy.cfg")
 
 HAPROXY_CFG.write_text(text)
 
