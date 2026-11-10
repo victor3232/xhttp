@@ -24,7 +24,9 @@ fi
 xray_domain=$(cat /etc/xray/domain 2>/dev/null || cat /root/domain 2>/dev/null || echo "$MYIP")
 # Pisahkan domain SlowDNS dari domain Xray supaya delegasi NS tidak
 # menimpa resolusi domain Xray.
-domain="dns.${xray_domain}"
+# Kalau domain SlowDNS sudah pernah dipilih (menu GANTI NS), pertahankan.
+existing_dns=$(cat /etc/xray/dns 2>/dev/null || cat /root/slowdns/dns_domain 2>/dev/null || true)
+domain="${existing_dns:-dns.${xray_domain}}"
 ns_domain="ns.${domain}"
 
 echo "Memasang SlowDNS Server untuk domain: $domain ($ns_domain)..."
@@ -51,6 +53,12 @@ fi
 
 # 3. Ekstrak ke /root/slowdns
 WORK="/root/slowdns"
+# Simpan key lama supaya pubkey tidak berubah saat reinstall.
+KEY_BAK=""
+if [ -s "$WORK/server.key" ] && [ -s "$WORK/server.pub" ]; then
+    KEY_BAK="$(mktemp -d /tmp/slowdns-key.XXXXXX)"
+    cp -a "$WORK/server.key" "$WORK/server.pub" "$KEY_BAK/"
+fi
 rm -rf "$WORK"
 install -d -m 0700 "$WORK"
 tar -xzf "$ARCHIVE" -C "$WORK"
@@ -73,6 +81,21 @@ systemctl disable slowdns >/dev/null 2>&1 || true
 rm -f /etc/systemd/system/slowdns.service
 systemctl daemon-reload >/dev/null 2>&1 || true
 printf '%s\n53\n%s\n127.0.0.1:22\n' "$BIND_IP" "$domain" | bash "$WORK/install.sh" install
+
+# 5b. Kembalikan key lama (kalau ada) agar Public Key pelanggan tidak berubah.
+if [ -n "$KEY_BAK" ]; then
+    install -m 0600 "$KEY_BAK/server.key" "$WORK/server.key"
+    install -m 0644 "$KEY_BAK/server.pub" "$WORK/server.pub"
+    systemctl restart slowdns >/dev/null 2>&1 || true
+    sleep 1
+    if ! systemctl is-active --quiet slowdns; then
+        echo "Peringatan: key lama tidak bisa dipakai, membuat key baru..."
+        rm -f "$WORK/server.key" "$WORK/server.pub" "$WORK/slowdns.env" /etc/systemd/system/slowdns.service
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        printf '%s\n53\n%s\n127.0.0.1:22\n' "$BIND_IP" "$domain" | bash "$WORK/install.sh" install || true
+    fi
+    rm -rf "$KEY_BAK"
+fi
 
 # 6. Kompatibilitas symlink
 ln -sfn /root/slowdns/server.pub /etc/slowdns/server.pub
