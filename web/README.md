@@ -43,7 +43,7 @@ Edit `src/app.py`, `src/static/style.css`, atau `src/static/app.js`, lalu:
 Upload `web.zip` ke repo. Worker akan menyajikannya di:
 
 ```text
-https://scvpn.jolang323.workers.dev/web/web.zip
+https://raw.githubusercontent.com/victor3232/xhttp/main/web/web.zip
 ```
 
 Tidak perlu menyentuh `premi.sh` atau `menu.zip` setiap kali UI berubah. Cukup

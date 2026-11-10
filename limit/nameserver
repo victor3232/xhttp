@@ -4,7 +4,7 @@
 # ============================================================
 set -euo pipefail
 
-REPO="${KYT_REPO:-https://scvpn.jolang323.workers.dev}"
+REPO="${KYT_REPO:-https://raw.githubusercontent.com/victor3232/xhttp/main}"
 [[ "$REPO" != */ ]] && REPO="${REPO}/"
 
 MYIP=$(curl -sS ipv4.icanhazip.com || wget -qO- ipv4.icanhazip.com || curl -sS ifconfig.me)
@@ -66,6 +66,12 @@ echo "$domain" > /root/slowdns/dns_domain
 echo "$domain" > /etc/xray/dns_domain 2>/dev/null || true
 
 # 5. Pasang service otomatis
+# Unit lama harus dibuang: WORK sudah dihapus di atas, sedangkan install.sh
+# menolak reinstall kalau unit ada tapi slowdns.env tidak ada.
+systemctl stop slowdns >/dev/null 2>&1 || true
+systemctl disable slowdns >/dev/null 2>&1 || true
+rm -f /etc/systemd/system/slowdns.service
+systemctl daemon-reload >/dev/null 2>&1 || true
 printf '%s\n53\n%s\n127.0.0.1:22\n' "$BIND_IP" "$domain" | bash "$WORK/install.sh" install
 
 # 6. Kompatibilitas symlink
@@ -73,6 +79,12 @@ ln -sfn /root/slowdns/server.pub /etc/slowdns/server.pub
 
 if systemctl is-active --quiet slowdns; then
     echo "SlowDNS Server berhasil aktif pada UDP 53 -> SSH 22!"
+    if [ -s /root/slowdns/server.pub ]; then
+        echo "Public Key Server: $(cat /root/slowdns/server.pub)"
+    else
+        echo "Peringatan: server.pub tidak ditemukan."
+    fi
 else
     echo "Peringatan: slowdns.service belum berjalan aktif."
+    echo "Cek: journalctl -u slowdns -n 20"
 fi

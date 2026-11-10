@@ -7,7 +7,7 @@ Blue="\033[0;37m"
 GREEN="\033[0;37m"
 
 BGX="\033[42m"
-UPDATE="https://scvpn.jolang323.workers.dev/"
+UPDATE="https://raw.githubusercontent.com/victor3232/xhttp/main/"
 #BOT="https://raw.githubusercontent.com/myridwan/src/ipuk/"
 UDPCORE="${UPDATE}limit/install-udp.sh"
 clear

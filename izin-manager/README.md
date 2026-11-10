@@ -222,14 +222,14 @@ curl -4 -fsSL "https://domain-railway/api/check?ip=$(curl -4 -s ipv4.icanhazip.c
 Installer memakai:
 
 ```text
-https://scvpn.jolang323.workers.dev/izin
+https://raw.githubusercontent.com/victor3232/xhttp/main/izin
 ```
 
 Kalau worker melakukan cache, perubahan file GitHub mungkin belum langsung terlihat.
 Tes dari VPS:
 
 ```bash
-curl -4 -s "https://scvpn.jolang323.workers.dev/izin?v=$(date +%s)" | grep IP_ANDA
+curl -4 -s "https://raw.githubusercontent.com/victor3232/xhttp/main/izin?v=$(date +%s)" | grep IP_ANDA
 ```
 
 Kalau belum muncul:

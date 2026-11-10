@@ -9,7 +9,7 @@ export -f wget curl 2>/dev/null || true
 CONF="/etc/kyt-web.conf"
 SERVICE="kyt-web"
 APP="/opt/kyt-web/app.py"
-REPO="${KYT_REPO:-https://scvpn.jolang323.workers.dev}"
+REPO="${KYT_REPO:-https://raw.githubusercontent.com/victor3232/xhttp/main}"
 ZIP_URL="${REPO%/}/web/web.zip"
 FALLBACK="https://raw.githubusercontent.com/victor3232/xhttp/main/web/web.zip"
 
