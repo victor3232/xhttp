@@ -19,8 +19,9 @@ get_b64() {
 }
 
 # ==== Sumber installer & lisensi (dapat dioverride) ====
-# Installer/aset: KYT_REPO, argumen URL, atau default stabil workers.dev.
-REPO="${KYT_REPO:-https://scvpn.jolang323.workers.dev}"
+# Installer/aset: KYT_REPO, argumen URL, atau default repo GitHub (raw).
+KYT_RAW_DEFAULT="https://raw.githubusercontent.com/victor3232/xhttp/main"
+REPO="${KYT_REPO:-$KYT_RAW_DEFAULT/}"
 case "${1:-}" in
   http://*|https://*) REPO="$1" ;;
   *.*) REPO="https://$1" ;;
@@ -29,13 +30,12 @@ case "$REPO" in http://*|https://*) ;; *) REPO="https://$REPO" ;; esac
 REPO="${REPO%/}"
 export KYT_REPO="$REPO"
 
-# Menu/lisensi selalu ke endpoint stabil, terpisah dari domain installer.
-LICENSE_URL="${KYT_LICENSE_URL:-https://scvpn.jolang323.workers.dev}"
+# Menu/lisensi default ke repo GitHub (raw), terpisah dari domain installer.
+LICENSE_URL="${KYT_LICENSE_URL:-$KYT_RAW_DEFAULT}"
 LICENSE_URL="${LICENSE_URL%/}"
 export KYT_LICENSE_URL="$LICENSE_URL"
-if [ ! -s /etc/kyt-license.conf ]; then
-  printf '%s\n' "$LICENSE_URL" > /etc/kyt-license.conf 2>/dev/null || true
-fi
+# Selalu tulis ulang agar VPS lama yang masih memakai URL worker ikut pindah ke repo.
+printf '%s\n' "$LICENSE_URL" > /etc/kyt-license.conf 2>/dev/null || true
 
 # FIX: Agar tidak tanya restart service (Ubuntu 22/24)
 if [ -f /etc/needrestart/needrestart.conf ]; then
@@ -193,54 +193,28 @@ fi
 red='\e[1;31m'
 green='\e[0;32m'
 NC='\e[0m'
-#IZIN SCRIPT
-MYIP=$(curl -sS ipv4.icanhazip.com)
-echo -e "\e[32mloading...\e[0m"
-clear
-#IZIN SCRIPT
-MYIP=$(curl -sS ipv4.icanhazip.com)
-echo -e "\e[32mloading...\e[0m" 
-clear
-# Version sc
-clear
-#########################
-# USERNAME
-rm -f /usr/bin/user
-username=$(curl -4 -fsSL --max-time 15 "$LICENSE_URL/izin" | grep "$MYIP" | awk '{print $2}')
-echo "$username" >/usr/bin/user
-expx=$(curl -4 -fsSL --max-time 15 "$LICENSE_URL/izin" | grep "$MYIP" | awk '{print $3}')
-echo "$expx" >/usr/bin/e
-# DETAIL ORDER
-username=$(cat /usr/bin/user)
-oid=$(cat /usr/bin/ver)
-exp=$(cat /usr/bin/e)
-clear
-# CERTIFICATE STATUS
-d1=$(date -d "$valid" +%s)
-d2=$(date -d "$today" +%s)
-certifacate=$(((d1 - d2) / 86400))
-# VPS Information
-DATE=$(date +'%Y-%m-%d')
-datediff() {
-    d1=$(date -d "$1" +%s)
-    d2=$(date -d "$2" +%s)
-    echo -e "$COLOR1 $NC Expiry In   : $(( (d1 - d2) / 86400 )) Days"
-}
-mai="datediff "$Exp" "$DATE""
-
-# Status ExpiRED Active | Geo Project
-Info="(${green}Active${NC})"
-Error="(${RED}ExpiRED${NC})"
-today=`date -d "0 days" +"%Y-%m-%d"`
-Exp1=$(curl -4 -fsSL --max-time 15 "$LICENSE_URL/izin" | grep "$MYIP" | awk '{print $4}')
-if [[ $today < $Exp1 ]]; then
-sts="${Info}"
-else
-sts="${Error}"
+#IZIN SCRIPT (sumber data: repo GitHub)
+MYIP=$(curl -4 -sS --max-time 10 ipv4.icanhazip.com 2>/dev/null || wget -4 -qO- --timeout=10 ipv4.icanhazip.com 2>/dev/null)
+if [ -z "$MYIP" ]; then
+    MYIP=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
 fi
 echo -e "\e[32mloading...\e[0m"
 clear
-# REPO sudah diatur di bagian atas (KYT_REPO / argumen / workers.dev)
+#########################
+# USERNAME / EXPIRED (dari file izin di repo)
+IZIN_TXT=$(curl -4 -fsSL --max-time 20 "$LICENSE_URL/izin" 2>/dev/null || wget -4 -qO- --timeout=20 "$LICENSE_URL/izin" 2>/dev/null)
+rm -f /usr/bin/user /usr/bin/e
+username=$(printf '%s\n' "$IZIN_TXT" | awk -v ip="$MYIP" '$NF==ip {print $2; exit}')
+exp=$(printf '%s\n' "$IZIN_TXT" | awk -v ip="$MYIP" '$NF==ip {print $3; exit}')
+[ -z "$username" ] && username="admin"
+echo "$username" >/usr/bin/user
+echo "$exp" >/usr/bin/e
+today=$(date +%Y-%m-%d)
+echo -e "\e[32mloading...\e[0m"
+clear
+echo -e "\e[32mloading...\e[0m"
+clear
+# REPO sudah diatur di bagian atas (KYT_REPO / argumen / repo GitHub raw)
 
 ####
 start=$(date +%s)
@@ -1120,7 +1094,7 @@ print_success "All Packet"
 function menu(){
     clear
     print_install "Memasang Menu Packet"
-    wget -O menu.zip "${REPO}limit/menu.zip?v=20261106"
+    wget -O menu.zip "${REPO}limit/menu.zip?v=20261110"
     unzip menu.zip
     chmod +x menu/*
     mv menu/* /usr/local/sbin
@@ -1385,7 +1359,7 @@ rm -rf /root/README.md
 rm -rf /root/domain
 #sudo hostnamectl set-hostname $user
 secs_to_human "$(($(date +%s) - ${start}))"
-sudo hostnamectl set-hostname $username
+[ -n "$username" ] && sudo hostnamectl set-hostname "$username" 2>/dev/null
 echo -e "${green} Script Successfull Installed"
 echo ""
 read -p "$( echo -e "Press ${YELLOW}[ ${NC}${YELLOW}Enter${NC} ${YELLOW}]${NC} For Reboot") "

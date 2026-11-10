@@ -30,7 +30,7 @@ fun_bar() {
     tput cnorm
 }
 res1() {
-    wget -O menu.zip "https://raw.githubusercontent.com/victor3232/xhttp/main/limit/menu.zip?v=20261106"
+    wget -O menu.zip "https://raw.githubusercontent.com/victor3232/xhttp/main/limit/menu.zip?v=20261110"
     unzip menu.zip
     chmod +x menu/*
     mv menu/* /usr/local/sbin
