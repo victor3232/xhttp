@@ -468,6 +468,14 @@ clear
 function pasang_ssl() {
 clear
 print_install "Memasang SSL Pada Domain"
+    domain=$(cat /root/domain 2>/dev/null)
+    # Pakai ulang sertifikat yang masih valid agar instalasi ulang tidak kena limit Let's Encrypt.
+    if [ -n "$domain" ] && [ -s /etc/xray/xray.crt ] && [ -s /etc/xray/xray.key ] \
+       && openssl x509 -checkend 604800 -noout -in /etc/xray/xray.crt >/dev/null 2>&1 \
+       && openssl x509 -noout -text -in /etc/xray/xray.crt 2>/dev/null | grep -q "DNS:$domain"; then
+        print_success "SSL Certificate (masih valid)"
+        return 0
+    fi
     rm -rf /etc/xray/xray.key
     rm -rf /etc/xray/xray.crt
     domain=$(cat /root/domain)
