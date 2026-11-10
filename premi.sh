@@ -11,10 +11,12 @@ export -f wget curl 2>/dev/null || true
 # Ambil binary lewat base64 supaya proxy/CDN tidak merusak byte non-teks.
 get_b64() {
     local url="$1" out="$2" tmp="${2}.b64"
-    wget -q --timeout=30 -O "$tmp" "$url" || curl -fsSL --max-time 60 -o "$tmp" "$url" || return 1
+    wget -q --timeout=30 -O "$tmp" "$url" || curl -fsSL --max-time 60 -o "$tmp" "$url" || { rm -f "$tmp"; return 1; }
     [ -s "$tmp" ] || { rm -f "$tmp"; return 1; }
-    base64 -d "$tmp" > "$out" || { rm -f "$out" "$tmp"; return 1; }
-    chmod 755 "$out"
+    # Tulis ke file sementara lalu rename: aman walau binary lama sedang berjalan.
+    base64 -d "$tmp" > "${out}.new" || { rm -f "${out}.new" "$tmp"; return 1; }
+    chmod 755 "${out}.new"
+    mv -f "${out}.new" "$out" || { rm -f "${out}.new" "$tmp"; return 1; }
     rm -f "$tmp"
 }
 
@@ -769,6 +771,7 @@ systemctl enable trip
 #SERVICE VMESS
 # // Installing UDP Mini
 mkdir -p /usr/local/kyt/
+systemctl stop udp-mini-1 udp-mini-2 udp-mini-3 2>/dev/null
 get_b64 "${REPO}limit/udp-mini.b64" /usr/local/kyt/udp-mini
 chmod +x /usr/local/kyt/udp-mini
 wget -q -O /etc/systemd/system/udp-mini-1.service "${REPO}limit/udp-mini-1.service"
@@ -969,6 +972,7 @@ print_success "Fail2ban"
 function ins_epro(){
 clear
 print_install "Menginstall ePro WebSocket Proxy"
+    systemctl stop ws 2>/dev/null
     get_b64 "${REPO}limit/ws.b64" /usr/bin/ws
     wget -O /usr/bin/tun.conf "${REPO}limit/tun.conf" >/dev/null 2>&1
     wget -O /etc/systemd/system/ws.service "${REPO}limit/ws.service" >/dev/null 2>&1
