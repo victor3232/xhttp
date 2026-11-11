@@ -77,6 +77,8 @@ BERKAS="
 /etc/xray/isp
 /etc/xray/dns
 /etc/kyt-dns-mode
+/usr/local/sbin/slowdns-router
+/etc/systemd/system/slowdns-router.service
 /etc/xray/xray.crt
 /etc/xray/xray.key
 /etc/haproxy/haproxy.cfg
