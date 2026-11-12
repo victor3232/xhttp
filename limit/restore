@@ -173,22 +173,63 @@ if [ "$PENTING" = "0" ]; then
     menu-backup
     exit 1
 fi
+# Tolak zip yang berisi path aneh (zip-slip) sebelum diekstrak.
+if unzip -Z1 "$ZIP" 2>/dev/null | grep -Eq '(^/|(^|/)\.\.(/|$))'; then
+    echo -e " ${RED}Zip berisi path tidak aman (../ atau absolut). Restore dibatalkan.${NC}"
+    read -n 1 -s -r -p " Tekan apa saja untuk kembali"
+    menu-backup
+    exit 1
+fi
 echo -e "       -> ${GREEN}zip valid${NC}"
 
 # ---------- 2. cadangkan data sekarang ----------
 echo -e " ${CYAN}[2/5]${NC} Mencadangkan data SEKARANG..."
 CAD="/root/backup/sebelum-restore-$(date +%Y%m%d-%H%M%S)"
 mkdir -p "$CAD"
-for f in /etc/passwd /etc/group /etc/shadow /etc/gshadow \
-         /etc/xray/config.json /etc/l2tp/.l2tp.db /etc/l2tp/psk \
-         /etc/ppp/chap-secrets /etc/ipsec.secrets \
-         /etc/vmess/.vmess.db /etc/vless/.vless.db \
-         /etc/trojan/.trojan.db /etc/shadowsocks/.shadowsocks.db; do
-    [ -f "$f" ] || continue
-    mkdir -p "$CAD$(dirname "$f")" 2>/dev/null
-    cp -a "$f" "$CAD$f" 2>/dev/null
+
+# Cadangan pengaman seluas data yang akan ditimpa. Kalau restore gagal,
+# isi folder ini bisa dikembalikan manual tanpa kehilangan data lama.
+for _d in /etc /opt/kyt-web /usr/local/sbin /usr/bin/kyt /root/slowdns \
+          /root/akun /root/udp /var/www/html /var/lib/kyt; do
+    [ -e "$_d" ] || continue
+    mkdir -p "$CAD$(dirname "$_d")" 2>/dev/null
+    cp -a "$_d" "$CAD/" 2>/dev/null
 done
-[ -f /usr/bin/kyt/database.db ] && cp -a /usr/bin/kyt/database.db "$CAD/database.db" 2>/dev/null
+
+# Database disalin dengan SQLite backup API (bukan cp mentah) supaya
+# cadangan pengaman juga konsisten walau web/bot sedang menulis.
+snapshot_cad() {
+    local asal="$1" tuj="$2" label="$3"
+    [ -f "$asal" ] || return 0
+    if command -v python3 >/dev/null 2>&1; then
+        mkdir -p "$(dirname "$tuj")" 2>/dev/null
+        rm -f "$tuj" "$tuj-wal" "$tuj-shm"
+        if python3 - "$asal" "$tuj" "$label" <<'PY'
+import sqlite3, sys
+src = sqlite3.connect("file:%s?mode=ro" % sys.argv[1], uri=True, timeout=30)
+dst = sqlite3.connect(sys.argv[2], timeout=30)
+try:
+    with dst:
+        src.backup(dst)
+    dst.execute("PRAGMA journal_mode=DELETE")
+    if str(dst.execute("PRAGMA integrity_check").fetchone()[0]).lower() != "ok":
+        raise RuntimeError("integrity_check gagal")
+finally:
+    dst.close()
+    src.close()
+print("cadangan %s: ok" % sys.argv[3])
+PY
+        then
+            rm -f "$tuj-wal" "$tuj-shm"
+            return 0
+        fi
+        echo -e " ${YELLOW}Peringatan: cadangan database $label gagal, lanjut dengan salinan biasa.${NC}"
+    fi
+    mkdir -p "$(dirname "$tuj")" 2>/dev/null
+    cp -a "$asal" "$tuj" 2>/dev/null
+}
+snapshot_cad /opt/kyt-web/data/web.db "$CAD/opt/kyt-web/data/web.db" "website"
+snapshot_cad /usr/bin/kyt/database.db "$CAD/usr/bin/kyt/database.db" "bot"
 echo -e "       -> ${GREEN}${CAD}${NC}"
 
 # ---------- 3. ekstrak ----------
@@ -225,10 +266,115 @@ if [ -f "$AKAR/etc/shadow" ]; then
     fi
 fi
 
+# ---------- verifikasi manifest SEBELUM menyentuh sistem ----------
+verifikasi_backup() {
+    # $1 = root hasil ekstrak, $2 = full|db, $3 = path manifest (opsional)
+    local root="$1" mode="${2:-full}"
+    local man="${3:-$root/kyt-backup-manifest.json}"
+    if [ ! -f "$man" ]; then
+        echo -e " ${YELLOW}Backup lama (tanpa manifest) - verifikasi checksum dilewati.${NC}"
+        return 0
+    fi
+    python3 - "$root" "$mode" "$man" <<'PY'
+import hashlib
+import json
+import os
+import sqlite3
+import sys
+
+root, mode, man = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    with open(man, encoding="utf-8") as f:
+        data = json.load(f)
+except Exception as e:
+    print("manifest tidak bisa dibaca: %s" % e)
+    sys.exit(1)
+
+err = []
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for blok in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(blok)
+    return h.hexdigest()
+
+if mode == "full":
+    for rel, info in (data.get("hashes") or {}).items():
+        p = os.path.join(root, rel)
+        tipe = info.get("type")
+        if tipe == "file":
+            if not os.path.isfile(p):
+                err.append("hilang: %s" % rel)
+            elif os.path.getsize(p) != info.get("size"):
+                err.append("ukuran berubah: %s" % rel)
+            elif sha256(p) != info.get("sha256"):
+                err.append("checksum tidak cocok: %s" % rel)
+        elif tipe == "symlink":
+            if not os.path.islink(p):
+                err.append("symlink hilang: %s" % rel)
+            elif os.readlink(p) != info.get("target"):
+                err.append("target symlink berubah: %s" % rel)
+        elif tipe == "error":
+            err.append("file gagal dibaca saat backup: %s" % rel)
+
+def cek_db(nama):
+    info = data.get(nama)
+    if not info:
+        return
+    p = os.path.join(root, info.get("path", ""))
+    if not os.path.isfile(p):
+        err.append("%s tidak ada di backup" % nama)
+        return
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % p, uri=True, timeout=30)
+        integ = con.execute("PRAGMA integrity_check").fetchone()
+        if not integ or str(integ[0]).lower() != "ok":
+            err.append("%s rusak: %s" % (nama, integ))
+        for tabel, jumlah in (info.get("counts") or {}).items():
+            try:
+                sekarang = con.execute(
+                    'SELECT COUNT(*) FROM "%s"' % tabel.replace('"', '""')
+                ).fetchone()[0]
+                if sekarang != jumlah:
+                    err.append("%s.%s: backup %s, sekarang %s"
+                               % (nama, tabel, jumlah, sekarang))
+            except Exception as e:
+                err.append("%s.%s tidak bisa dibaca: %s" % (nama, tabel, e))
+        con.close()
+    except Exception as e:
+        err.append("%s tidak bisa dibuka: %s" % (nama, e))
+    print("%s: %s" % (nama, json.dumps(info.get("counts") or {}, sort_keys=True)))
+
+cek_db("web_db")
+cek_db("bot_db")
+if err:
+    for e in err[:25]:
+        print("  - %s" % e)
+    sys.exit(1)
+print("manifest cocok: %d file + database utuh" % len(data.get("hashes") or {}))
+PY
+}
+
+echo -e " ${CYAN}[4/5]${NC} Memeriksa manifest & database ..."
+if ! verifikasi_backup "$AKAR" full; then
+    echo -e " ${RED}Backup tidak lolos verifikasi. Restore dibatalkan (data lama tidak diubah).${NC}"
+    rm -rf "$TMP"
+    read -n 1 -s -r -p " Tekan apa saja untuk kembali"
+    menu-backup
+    exit 1
+fi
+
 # ---------- salin ----------
 echo -e "       -> menyalin data..."
-# Hentikan web agar web.db tidak berubah saat ditimpa.
-systemctl stop kyt-web >/dev/null 2>&1 || true
+# Hentikan web & bot agar database tidak berubah saat ditimpa.
+for _svc in kyt-web kyt kyt-bot slowdns slowdns-router; do
+    systemctl stop "$_svc" >/dev/null 2>&1 || true
+done
+# WAL/journal lama WAJIB dibuang. Kalau tidak, SQLite bisa memutar ulang
+# transaksi lama di atas database hasil restore (data balik/reset/korup).
+rm -f /opt/kyt-web/data/web.db-wal /opt/kyt-web/data/web.db-shm /opt/kyt-web/data/web.db-journal
+rm -f /usr/bin/kyt/database.db-wal /usr/bin/kyt/database.db-shm /usr/bin/kyt/database.db-journal
 DIPULIHKAN=0
 
 salin() {
@@ -266,6 +412,16 @@ if [ -d "$AKAR/etc" ]; then
     [ -d "$AKAR/etc/ssl/kyt-web" ]   && salin "$AKAR/etc/ssl/kyt-web"   "/etc/ssl/kyt-web"
     [ -d "$AKAR/etc/default" ]      && salin "$AKAR/etc/default"      "/etc/default"
     [ -f "$AKAR/etc/kyt.txt" ]      && salin "$AKAR/etc/kyt.txt"      "/etc/kyt.txt"
+    [ -f "$AKAR/etc/kyt-theme.conf" ] && salin "$AKAR/etc/kyt-theme.conf" "/etc/kyt-theme.conf"
+    [ -f "$AKAR/etc/kyt-license.conf" ] && salin "$AKAR/etc/kyt-license.conf" "/etc/kyt-license.conf"
+    [ -d "$AKAR/etc/kyt" ]          && salin "$AKAR/etc/kyt"          "/etc/kyt"
+    [ -d "$AKAR/etc/limit" ]        && salin "$AKAR/etc/limit"        "/etc/limit"
+    [ -d "$AKAR/etc/dropbear" ]     && salin "$AKAR/etc/dropbear"     "/etc/dropbear"
+    [ -d "$AKAR/etc/bot" ]          && salin "$AKAR/etc/bot"          "/etc/bot"
+    [ -d "$AKAR/etc/cron.d" ]       && salin "$AKAR/etc/cron.d"       "/etc/cron.d"
+    [ -f "$AKAR/etc/sysctl.conf" ]  && salin "$AKAR/etc/sysctl.conf"  "/etc/sysctl.conf"
+    [ -f "$AKAR/etc/sysctl.d/99-slowdns.conf" ] && salin "$AKAR/etc/sysctl.d/99-slowdns.conf" "/etc/sysctl.d/99-slowdns.conf"
+    [ -d "$AKAR/var/spool/cron/crontabs" ] && salin "$AKAR/var/spool/cron/crontabs" "/var/spool/cron/crontabs"
     [ -d "$AKAR/etc/kyt/jeda-mullog" ] && salin "$AKAR/etc/kyt/jeda-mullog" "/etc/kyt/jeda-mullog"
     [ -d "$AKAR/etc/kyt/trial" ] && salin "$AKAR/etc/kyt/trial" "/etc/kyt/trial"
     [ -f "$AKAR/etc/kyt/jeda-mullog.conf" ] && salin "$AKAR/etc/kyt/jeda-mullog.conf" "/etc/kyt/jeda-mullog.conf"
@@ -274,12 +430,20 @@ if [ -d "$AKAR/etc" ]; then
     [ -f "$AKAR/usr/local/sbin/kyt-trial-expire" ] && salin "$AKAR/usr/local/sbin/kyt-trial-expire" "/usr/local/sbin/kyt-trial-expire"
     [ -f "$AKAR/usr/local/sbin/trial" ] && salin "$AKAR/usr/local/sbin/trial" "/usr/local/sbin/trial"
     [ -f "$AKAR/usr/local/sbin/trial-install.sh" ] && salin "$AKAR/usr/local/sbin/trial-install.sh" "/usr/local/sbin/trial-install.sh"
+    [ -f "$AKAR/usr/local/sbin/slowdns-router" ] && salin "$AKAR/usr/local/sbin/slowdns-router" "/usr/local/sbin/slowdns-router"
+    [ -f "$AKAR/usr/local/sbin/slowdns-rcvbuf" ] && salin "$AKAR/usr/local/sbin/slowdns-rcvbuf" "/usr/local/sbin/slowdns-rcvbuf"
+    [ -f "$AKAR/usr/local/sbin/slowdns" ] && salin "$AKAR/usr/local/sbin/slowdns" "/usr/local/sbin/slowdns"
+    [ -f "$AKAR/usr/local/sbin/slowdns-mode" ] && salin "$AKAR/usr/local/sbin/slowdns-mode" "/usr/local/sbin/slowdns-mode"
+    [ -f "$AKAR/usr/local/sbin/slowdns-info" ] && salin "$AKAR/usr/local/sbin/slowdns-info" "/usr/local/sbin/slowdns-info"
+    [ -f "$AKAR/usr/local/sbin/dns" ] && salin "$AKAR/usr/local/sbin/dns" "/usr/local/sbin/dns"
     [ -f "$AKAR/usr/local/sbin/jeda-mullog" ] && salin "$AKAR/usr/local/sbin/jeda-mullog" "/usr/local/sbin/jeda-mullog"
     [ -f "$AKAR/usr/local/sbin/setting-jeda" ] && salin "$AKAR/usr/local/sbin/setting-jeda" "/usr/local/sbin/setting-jeda"
     [ -f "$AKAR/usr/local/sbin/utility" ] && salin "$AKAR/usr/local/sbin/utility" "/usr/local/sbin/utility"
     [ -f "$AKAR/usr/bin/limit-ip" ] && salin "$AKAR/usr/bin/limit-ip" "/usr/bin/limit-ip"
     [ -f "$AKAR/etc/xray/limit.ssh" ] && salin "$AKAR/etc/xray/limit.ssh" "/etc/xray/limit.ssh"
-    for _unit in jeda-mullog vmip vlip trip limitssh kyt-web kyt-trial-expire ssip; do
+    [ -d "$AKAR/etc/systemd/system/slowdns.service.d" ] && salin "$AKAR/etc/systemd/system/slowdns.service.d" "/etc/systemd/system/slowdns.service.d"
+    for _unit in jeda-mullog vmip vlip trip limitssh kyt-web kyt-trial-expire ssip \
+                 slowdns slowdns-router kyt kyt-bot; do
         [ -f "$AKAR/etc/systemd/system/${_unit}.service" ] && salin "$AKAR/etc/systemd/system/${_unit}.service" "/etc/systemd/system/${_unit}.service"
     done
     for _f in kyt-web-cert-sync issue-cert.sh kyt-web-wait-dns kyt-web-configure-edge vpnfree.conf.tpl; do
@@ -300,8 +464,10 @@ if [ -d "$AKAR/etc" ]; then
     [ -d "$AKAR/var/lib/kyt" ]      && salin "$AKAR/var/lib/kyt"      "/var/lib/kyt"
     [ -d "$AKAR/root/akun" ]        && salin "$AKAR/root/akun"        "/root/akun"
     [ -d "$AKAR/root/udp" ]         && salin "$AKAR/root/udp"         "/root/udp"
+    [ -d "$AKAR/root/slowdns" ]     && salin "$AKAR/root/slowdns"     "/root/slowdns"
     [ -f "$AKAR/usr/bin/kyt/database.db" ] && salin "$AKAR/usr/bin/kyt/database.db" "/usr/bin/kyt/database.db"
     [ -f "$AKAR/usr/bin/kyt/var.txt" ]     && salin "$AKAR/usr/bin/kyt/var.txt"     "/usr/bin/kyt/var.txt"
+    [ -f "$AKAR/usr/bin/ddsdswl.session" ] && salin "$AKAR/usr/bin/ddsdswl.session" "/usr/bin/ddsdswl.session"
 fi
 
 # --- gaya 2: nama pendek (passwd, xray/, html/, l2tp/) untuk zip lama ---
@@ -328,23 +494,71 @@ if [ -f "$AKAR/passwd" ]; then
     [ -f "$AKAR/ipsec.conf" ]    && salin "$AKAR/ipsec.conf"    "/etc/ipsec.conf"
 fi
 
-rm -rf "$TMP"
+# Database tidak boleh membawa WAL/journal lama setelah ditimpa.
+rm -f /opt/kyt-web/data/web.db-wal /opt/kyt-web/data/web.db-shm /opt/kyt-web/data/web.db-journal
+rm -f /usr/bin/kyt/database.db-wal /usr/bin/kyt/database.db-shm /usr/bin/kyt/database.db-journal
+
 echo -e "       -> ${GREEN}${DIPULIHKAN} data dipulihkan${NC}"
+
+# ---------- verifikasi database SETELAH copy ----------
+echo -e " ${CYAN}[4/5]${NC} Memeriksa database hasil restore ..."
+if ! verifikasi_backup "/" db "$AKAR/kyt-backup-manifest.json"; then
+    echo -e " ${RED}Database hasil restore tidak cocok. Mengembalikan database lama...${NC}"
+    for _pair in "web:/opt/kyt-web/data/web.db" "bot:/usr/bin/kyt/database.db"; do
+        _jenis="${_pair%%:*}"; _tuj="${_pair#*:}"
+        case "$_jenis" in
+            web) _cad="$CAD/opt/kyt-web/data/web.db" ;;
+            bot) _cad="$CAD/usr/bin/kyt/database.db" ;;
+        esac
+        rm -f "$_tuj-wal" "$_tuj-shm" "$_tuj-journal"
+        if [ -f "$_cad" ]; then
+            cp -a "$_cad" "$_tuj" 2>/dev/null
+        else
+            rm -f "$_tuj" 2>/dev/null
+        fi
+    done
+    echo -e " ${YELLOW}Database lama dikembalikan. Data lain tidak diubah.${NC}"
+    rm -rf "$TMP"
+    read -n 1 -s -r -p " Tekan apa saja untuk kembali"
+    menu-backup
+    exit 1
+fi
+
+rm -rf "$TMP"
 
 # ---------- perbaiki hak akses ----------
 for f in /etc/shadow /etc/gshadow; do
     [ -f "$f" ] && chmod 640 "$f" 2>/dev/null
 done
-for f in /etc/ipsec.secrets /etc/ppp/chap-secrets /etc/xray/xray.key /etc/haproxy/hap.pem /etc/kyt-web-mail.key; do
+for f in /etc/ipsec.secrets /etc/ppp/chap-secrets /etc/xray/xray.key /etc/haproxy/hap.pem \
+         /etc/kyt-web-mail.key /etc/kyt-web.conf /opt/kyt-web/data/web.db \
+         /usr/bin/kyt/database.db /usr/bin/kyt/var.txt /usr/bin/ddsdswl.session \
+         /root/slowdns/slowdns.env; do
     [ -f "$f" ] && chmod 600 "$f" 2>/dev/null
 done
-for f in /usr/local/sbin/jeda-mullog /usr/local/sbin/setting-jeda /usr/local/sbin/utility /usr/local/sbin/kyt-web-configure-edge /usr/local/sbin/setting-web /usr/bin/limit-ip /etc/xray/limit.ssh; do
+[ -d /opt/kyt-web/data ] && chmod 700 /opt/kyt-web/data 2>/dev/null
+[ -d /root/slowdns ] && chmod 700 /root/slowdns 2>/dev/null
+for f in /usr/local/sbin/jeda-mullog /usr/local/sbin/setting-jeda /usr/local/sbin/utility \
+         /usr/local/sbin/kyt-web-configure-edge /usr/local/sbin/setting-web /usr/bin/limit-ip \
+         /etc/xray/limit.ssh /usr/local/sbin/slowdns-router /usr/local/sbin/slowdns-rcvbuf \
+         /usr/local/sbin/slowdns /usr/local/sbin/slowdns-mode /usr/local/sbin/slowdns-info \
+         /usr/local/sbin/dns /usr/local/sbin/backup /usr/local/sbin/restore \
+         /usr/local/sbin/trial /usr/local/sbin/kyt-trial /usr/local/sbin/kyt-trial-expire \
+         /usr/local/sbin/trial-install.sh; do
     [ -f "$f" ] && chmod 755 "$f" 2>/dev/null
 done
 [ -f /usr/local/sbin/vpnfree.conf.tpl ] && chmod 644 /usr/local/sbin/vpnfree.conf.tpl 2>/dev/null
-for f in /etc/systemd/system/jeda-mullog.service /etc/systemd/system/vmip.service /etc/systemd/system/vlip.service /etc/systemd/system/trip.service /etc/systemd/system/limitssh.service; do
+[ -f /etc/kyt-theme.conf ] && chmod 644 /etc/kyt-theme.conf 2>/dev/null
+[ -f /etc/sysctl.d/99-slowdns.conf ] && chmod 644 /etc/sysctl.d/99-slowdns.conf 2>/dev/null
+for f in /etc/systemd/system/jeda-mullog.service /etc/systemd/system/vmip.service \
+         /etc/systemd/system/vlip.service /etc/systemd/system/trip.service \
+         /etc/systemd/system/limitssh.service /etc/systemd/system/kyt-web.service \
+         /etc/systemd/system/kyt-trial-expire.service /etc/systemd/system/ssip.service \
+         /etc/systemd/system/slowdns.service /etc/systemd/system/slowdns-router.service \
+         /etc/systemd/system/kyt.service /etc/systemd/system/kyt-bot.service; do
     [ -f "$f" ] && chmod 644 "$f" 2>/dev/null
 done
+[ -f /etc/systemd/system/slowdns.service.d/rcvbuf.conf ] && chmod 644 /etc/systemd/system/slowdns.service.d/rcvbuf.conf 2>/dev/null
 
 # hap.pem disusun ulang dari sertifikat (biar TLS 443 tetap jalan)
 if [ -f /etc/xray/xray.crt ] && [ -f /etc/xray/xray.key ]; then
@@ -378,8 +592,12 @@ fi
 echo -e " ${CYAN}[5/5]${NC} Me-restart layanan VPN..."
 systemctl daemon-reload >/dev/null 2>&1
 GAGAL_SVC=""
-for svc in xray haproxy nginx xl2tpd strongswan-starter ipsec openvpn dropbear udp-custom ws jeda-mullog limitssh vmip vlip trip ssip kyt-trial-expire kyt-web; do
-    systemctl list-unit-files "${svc}.service" >/dev/null 2>&1 || [ -f "/etc/init.d/$svc" ] || continue
+for svc in xray haproxy nginx xl2tpd strongswan-starter ipsec openvpn dropbear udp-custom ws \
+           jeda-mullog limitssh vmip vlip trip ssip kyt-trial-expire kyt-web kyt kyt-bot slowdns; do
+    if ! systemctl list-unit-files --no-legend "${svc}.service" 2>/dev/null | grep -q . \
+       && [ ! -f "/etc/init.d/$svc" ]; then
+        continue
+    fi
     if ! systemctl restart "$svc" >/dev/null 2>&1; then
         # xl2tpd di Debian 13 pakai init.d
         if [ -x "/etc/init.d/$svc" ]; then
@@ -389,9 +607,22 @@ for svc in xray haproxy nginx xl2tpd strongswan-starter ipsec openvpn dropbear u
         fi
     fi
 done
-for svc in jeda-mullog limitssh vmip vlip trip ssip kyt-trial-expire kyt-web; do
-    systemctl list-unit-files "${svc}.service" >/dev/null 2>&1 && systemctl enable "$svc" >/dev/null 2>&1
+for svc in jeda-mullog limitssh vmip vlip trip ssip kyt-trial-expire kyt-web kyt kyt-bot slowdns; do
+    systemctl list-unit-files --no-legend "${svc}.service" 2>/dev/null | grep -q . \
+        && systemctl enable "$svc" >/dev/null 2>&1
 done
+
+# SlowDNS mengikuti mode yang tersimpan di backup. Router hanya hidup di AUTO.
+DNS_MODE=$(cat /etc/kyt-dns-mode 2>/dev/null || echo off)
+if [ "$DNS_MODE" = "xray-auto" ]; then
+    systemctl list-unit-files --no-legend slowdns-router.service 2>/dev/null | grep -q . \
+        && { systemctl enable slowdns-router >/dev/null 2>&1; systemctl restart slowdns-router >/dev/null 2>&1; }
+else
+    systemctl disable --now slowdns-router >/dev/null 2>&1 || true
+fi
+if [ "$DNS_MODE" = "off" ]; then
+    systemctl disable --now slowdns >/dev/null 2>&1 || true
+fi
 ipsec rereadsecrets >/dev/null 2>&1
 ipsec reload >/dev/null 2>&1
 
@@ -404,6 +635,64 @@ AKUN_TR=$(hitung "#!"  /etc/xray/config.json)
 AKUN_SS=$(hitung "#!#" /etc/xray/config.json)
 AKUN_L2=$(hitung "###" /etc/l2tp/.l2tp.db)
 
+ringkas_db() {
+    # $1 = path database, $2 = tipe (web|bot)
+    [ -f "$1" ] || { echo "belum terpasang"; return 0; }
+    python3 - "$1" "$2" 2>/dev/null <<'PY'
+import os, sqlite3, sys
+path, tipe = sys.argv[1], sys.argv[2]
+if not os.path.isfile(path):
+    print("belum terpasang")
+    sys.exit(0)
+try:
+    con = sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=20)
+except Exception as e:
+    print("(tidak bisa dibuka: %s)" % e)
+    sys.exit(0)
+
+def ada(t):
+    return con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (t,)).fetchone()
+
+def n(t):
+    return con.execute('SELECT COUNT(*) FROM "%s"' % t).fetchone()[0] if ada(t) else 0
+
+def s(t, k):
+    if not ada(t):
+        return 0
+    try:
+        return con.execute('SELECT COALESCE(SUM("%s"),0) FROM "%s"' % (k, t)).fetchone()[0] or 0
+    except Exception:
+        return 0
+
+if tipe == "web":
+    print("pengguna=%d | akun=%d | invoice=%d | deposit=%d | produk=%d | saldo=Rp%s"
+          % (n("users"), n("accounts"), n("orders"), n("deposits"),
+             n("premium_products"), format(s("users", "balance_milli") // 1000, ",").replace(",", ".")))
+else:
+    print("buyer=%d | produk=%d | pesanan=%d | deposit=%d | saldo=Rp%s"
+          % (n("store_user"), n("produk"), n("pesanan"), n("deposit"),
+             format(s("store_user", "saldo"), ",").replace(",", ".")))
+con.close()
+PY
+}
+WEB_RINGKAS=$(ringkas_db /opt/kyt-web/data/web.db web)
+BOT_RINGKAS=$(ringkas_db /usr/bin/kyt/database.db bot)
+WEB_ACTIVE=$(systemctl is-active kyt-web 2>/dev/null || true)
+WEB_ACTIVE=${WEB_ACTIVE%%$'\n'*}
+[ -z "$WEB_ACTIVE" ] && WEB_ACTIVE="tidak-ada"
+BOT_ACTIVE=""
+for _b in kyt kyt-bot; do
+    if systemctl list-unit-files --no-legend "${_b}.service" 2>/dev/null | grep -q .; then
+        BOT_ACTIVE=$(systemctl is-active "$_b" 2>/dev/null || true)
+        BOT_ACTIVE=${BOT_ACTIVE%%$'\n'*}
+        break
+    fi
+done
+[ -z "$BOT_ACTIVE" ] && BOT_ACTIVE="tidak-ada"
+DNS_ACTIVE=$(systemctl is-active slowdns 2>/dev/null || true)
+DNS_ACTIVE=${DNS_ACTIVE%%$'\n'*}
+[ -z "$DNS_ACTIVE" ] && DNS_ACTIVE="tidak-ada"
+
 echo ""
 kytline 50
 echo -e "  \033[1;97;42m                RESTORE SELESAI                 \033[0m"
@@ -414,6 +703,10 @@ kytline 50
 echo -e "  ${CYAN}Akun terbaca di VPS:${NC}"
 echo -e "     SSH `printf '\033[0;32m%s\033[0m' "$AKUN_SSH"`  |  VMess `printf '\033[0;32m%s\033[0m' "$AKUN_VM"`  |  VLESS `printf '\033[0;32m%s\033[0m' "$AKUN_VL"`  |  Trojan `printf '\033[0;32m%s\033[0m' "$AKUN_TR"`"
 echo -e "     Shadowsocks `printf '\033[0;32m%s\033[0m' "$AKUN_SS"`  |  L2TP `printf '\033[0;32m%s\033[0m' "$AKUN_L2"`"
+kytline 50
+echo -e "  ${CYAN}Data website:${NC} ${GREEN}${WEB_RINGKAS}${NC}"
+echo -e "  ${CYAN}Data bot    :${NC} ${GREEN}${BOT_RINGKAS}${NC}"
+echo -e "  ${CYAN}Layanan     :${NC} web=${GREEN}${WEB_ACTIVE}${NC}  bot=${GREEN}${BOT_ACTIVE}${NC}  slowdns=${GREEN}${DNS_ACTIVE}${NC}"
 kytline 50
 if [ -n "$GAGAL_SVC" ]; then
     echo -e "  ${RED}Layanan gagal restart:${GAGAL_SVC}${NC}"

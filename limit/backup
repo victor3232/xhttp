@@ -87,6 +87,8 @@ BERKAS="
 /etc/nginx/conf.d/xray.conf
 /etc/default/dropbear
 /etc/kyt.txt
+/etc/kyt-theme.conf
+/etc/kyt-license.conf
 /etc/kyt/jeda-mullog.conf
 /etc/kyt/trial.conf
 /etc/xray/limit.ssh
@@ -103,6 +105,12 @@ BERKAS="
 /usr/local/sbin/kyt-trial
 /usr/local/sbin/kyt-trial-expire
 /usr/local/sbin/trial-install.sh
+/usr/local/sbin/slowdns
+/usr/local/sbin/slowdns-mode
+/usr/local/sbin/slowdns-info
+/usr/local/sbin/dns
+/etc/systemd/system/kyt.service
+/etc/systemd/system/kyt-bot.service
 /etc/systemd/system/jeda-mullog.service
 /etc/systemd/system/vmip.service
 /etc/systemd/system/vlip.service
@@ -129,6 +137,7 @@ BERKAS="
 /usr/local/sbin/setting-web
 /etc/bot/.bot.db
 /usr/bin/kyt/gomerch_token.json
+/usr/bin/ddsdswl.session
 /etc/ssl/kyt-web/vpnfree.crt
 /etc/ssl/kyt-web/vpnfree.key
 "
@@ -144,15 +153,21 @@ FOLDER="
 /root/akun
 /root/slowdns
 /var/lib/kyt
-/etc/kyt/jeda-mullog
-/etc/kyt/trial
+/etc/kyt
+/etc/limit
+/etc/ssh
+/etc/dropbear
+/etc/bot
+/etc/cron.d
+/etc/xray
+/etc/nginx
+/etc/haproxy
+/var/spool/cron/crontabs
 /usr/bin/kyt/database.db
 /usr/bin/kyt/var.txt
 /opt/kyt-web
 /etc/ssl/kyt-web
-/etc/letsencrypt/live
-/etc/letsencrypt/archive
-/etc/letsencrypt/renewal
+/etc/letsencrypt
 "
 
 echo -e " ${CYAN}[1/4]${NC} Mengumpulkan data akun..."
@@ -168,7 +183,11 @@ siapkan() {
         local sz
         sz=$(stat -c%s "$p" 2>/dev/null || echo 0)
         if [ "$sz" -gt "$BATAS_FILE" ]; then
-            LEWAT="$LEWAT $p"
+            # database web/bot tetap ikut lewat snapshot SQLite di bawah
+            case "$p" in
+                /opt/kyt-web/data/web.db|/usr/bin/kyt/database.db|/usr/bin/database.db|/usr/local/kyt/database.db|/root/kyt/database.db) ;;
+                *) LEWAT="$LEWAT $p" ;;
+            esac
             return 0
         fi
     fi
@@ -197,25 +216,66 @@ while IFS= read -r f; do
     siapkan "$f"
 done < <(find /etc/letsencrypt/live -type l 2>/dev/null)
 
-# Snapshot konsisten database website (SQLite WAL-safe).
-# Kalau ada user mendaftar saat backup berjalan, data tetap ikut.
-if [ -f /opt/kyt-web/data/web.db ] && command -v python3 >/dev/null 2>&1; then
-    mkdir -p "$SEMENTARA/opt/kyt-web/data"
-    python3 - "$SEMENTARA/opt/kyt-web/data/web.db" >/dev/null 2>&1 <<'PY' || true
+# Snapshot konsisten database (SQLite backup API).
+# Database TIDAK pernah disalin mentah: kalau ada user/pesanan baru saat
+# backup berjalan, data tetap utuh dan file tidak korup.
+snapshot_db() {
+    # $1 = database asli, $2 = tujuan di dalam SEMENTARA, $3 = label
+    local asal="$1" tuj="$2" label="$3"
+    [ -f "$asal" ] || return 0
+    command -v python3 >/dev/null 2>&1 || {
+        echo -e " ${RED}python3 tidak ditemukan: database $label tidak bisa dibackup aman.${NC}"
+        return 1
+    }
+    mkdir -p "$(dirname "$tuj")" 2>/dev/null
+    rm -f "$tuj" "$tuj-wal" "$tuj-shm"
+    if python3 - "$asal" "$tuj" "$label" <<'PY'
 import sqlite3
 import sys
 
-src = sqlite3.connect("file:/opt/kyt-web/data/web.db?mode=ro", uri=True, timeout=20)
-dst = sqlite3.connect(sys.argv[1], timeout=20)
+src_path, dst_path, label = sys.argv[1], sys.argv[2], sys.argv[3]
+src = sqlite3.connect("file:%s?mode=ro" % src_path, uri=True, timeout=30)
+dst = sqlite3.connect(dst_path, timeout=30)
 try:
     with dst:
         src.backup(dst)
+    dst.execute("PRAGMA journal_mode=DELETE")
+    hasil = dst.execute("PRAGMA integrity_check").fetchone()
+    if not hasil or str(hasil[0]).lower() != "ok":
+        raise RuntimeError("integrity_check: %s" % (hasil,))
 finally:
     dst.close()
     src.close()
+print("snapshot %s: ok" % label)
 PY
-    rm -f "$SEMENTARA/opt/kyt-web/data/web.db-wal" "$SEMENTARA/opt/kyt-web/data/web.db-shm"
-    chmod 600 "$SEMENTARA/opt/kyt-web/data/web.db" 2>/dev/null || true
+    then
+        rm -f "$tuj-wal" "$tuj-shm"
+        chmod 600 "$tuj" 2>/dev/null || true
+        JUMLAH=$((JUMLAH + 1))
+        return 0
+    fi
+    rm -f "$tuj" "$tuj-wal" "$tuj-shm"
+    echo -e " ${RED}Gagal membuat snapshot database $label. Backup dibatalkan.${NC}"
+    return 1
+}
+
+WEB_DB_ASAL="/opt/kyt-web/data/web.db"
+BOT_DB_ASAL=""
+for _p in /usr/bin/kyt/database.db /usr/bin/database.db /usr/local/kyt/database.db /root/kyt/database.db; do
+    [ -f "$_p" ] && { BOT_DB_ASAL="$_p"; break; }
+done
+
+if ! snapshot_db "$WEB_DB_ASAL" "$SEMENTARA/opt/kyt-web/data/web.db" "website"; then
+    rm -rf "$SEMENTARA"
+    read -n 1 -s -r -p " Tekan apa saja untuk kembali"
+    menu-backup
+    exit 1
+fi
+if ! snapshot_db "$BOT_DB_ASAL" "$SEMENTARA/usr/bin/kyt/database.db" "bot"; then
+    rm -rf "$SEMENTARA"
+    read -n 1 -s -r -p " Tekan apa saja untuk kembali"
+    menu-backup
+    exit 1
 fi
 
 if [ "$JUMLAH" = "0" ]; then
@@ -229,10 +289,107 @@ fi
 echo -e "       -> ${GREEN}${JUMLAH} berkas${NC} terkumpul"
 [ -n "$LEWAT" ] && echo -e "       -> dilewati (terlalu besar):${YELLOW}${LEWAT}${NC}"
 
+# ---------- manifest: checksum + jumlah data (anti file korup/hilang) ----------
+MANIFEST="$SEMENTARA/kyt-backup-manifest.json"
+echo -e " ${CYAN}[2/4]${NC} Membuat manifest & memeriksa database ..."
+if ! python3 - "$SEMENTARA" "$MANIFEST" "$(hostname 2>/dev/null || echo vps)" "$JUMLAH" <<'PY'
+import datetime as DT
+import hashlib
+import json
+import os
+import sqlite3
+import sys
+
+root, manifest_path, host, jumlah = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for blok in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(blok)
+    return h.hexdigest()
+
+def db_info(rel):
+    path = os.path.join(root, rel)
+    if not os.path.isfile(path):
+        return None
+    info = {"path": rel, "size": os.path.getsize(path), "sha256": sha256(path)}
+    try:
+        con = sqlite3.connect("file:%s?mode=ro" % path, uri=True, timeout=30)
+        integ = con.execute("PRAGMA integrity_check").fetchone()
+        info["integrity"] = str(integ[0]) if integ else "unknown"
+        tabel = [r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")]
+        counts = {}
+        for t in tabel:
+            try:
+                counts[t] = con.execute('SELECT COUNT(*) FROM "%s"' % t.replace('"', '""')).fetchone()[0]
+            except Exception:
+                pass
+        info["counts"] = counts
+        if "store_user" in counts:
+            try:
+                info["saldo"] = con.execute(
+                    "SELECT COALESCE(SUM(saldo),0) FROM store_user").fetchone()[0]
+            except Exception:
+                pass
+        if "users" in counts:
+            try:
+                info["saldo_milli"] = con.execute(
+                    "SELECT COALESCE(SUM(balance_milli),0) FROM users").fetchone()[0]
+            except Exception:
+                pass
+        con.close()
+    except Exception as e:
+        info["integrity"] = "ERROR: %s" % e
+    return info
+
+hashes = {}
+for walk_root, _dirs, files in os.walk(root):
+    for fn in files:
+        p = os.path.join(walk_root, fn)
+        rel = os.path.relpath(p, root).replace(os.sep, "/")
+        if rel == "kyt-backup-manifest.json":
+            continue
+        try:
+            if os.path.islink(p):
+                hashes[rel] = {"type": "symlink", "target": os.readlink(p)}
+            elif os.path.isfile(p):
+                hashes[rel] = {"type": "file", "size": os.path.getsize(p),
+                               "sha256": sha256(p)}
+        except Exception as e:
+            hashes[rel] = {"type": "error", "error": str(e)}
+
+data = {
+    "format": "kyt-backup-v2",
+    "created": DT.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    "host": host,
+    "files": len(hashes),
+    "web_db": db_info("opt/kyt-web/data/web.db"),
+    "bot_db": db_info("usr/bin/kyt/database.db"),
+    "hashes": hashes,
+}
+with open(manifest_path, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=1, sort_keys=True)
+print("manifest: %d file, web_db=%s, bot_db=%s" % (
+    len(hashes),
+    "ya" if data["web_db"] else "tidak ada",
+    "ya" if data["bot_db"] else "tidak ada"))
+PY
+then
+    echo -e " ${RED}Gagal membuat manifest. Backup dibatalkan.${NC}"
+    rm -rf "$SEMENTARA"
+    read -n 1 -s -r -p " Tekan apa saja untuk kembali"
+    menu-backup
+    exit 1
+fi
+# jumlah berkas unik (bukan hitungan ganda dari file+folder)
+JUMLAH=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("files", 0))' "$MANIFEST" 2>/dev/null || echo "$JUMLAH")
+
 # ---------- buat zip ----------
-echo -e " ${CYAN}[2/4]${NC} Membuat file .zip ..."
+echo -e " ${CYAN}[3/4]${NC} Membuat file .zip ..."
 cd "$SEMENTARA" || exit 1
-if ! zip -rq "$ZIP" . -x "*.pyc" >/dev/null 2>&1; then
+if ! zip -rqy "$ZIP" . -x "*.pyc" >/dev/null 2>&1; then
     echo -e " ${RED}Gagal membuat zip.${NC}"
     cd /; rm -rf "$SEMENTARA"
     read -n 1 -s -r -p " Tekan apa saja untuk kembali"
@@ -240,6 +397,16 @@ if ! zip -rq "$ZIP" . -x "*.pyc" >/dev/null 2>&1; then
     exit 1
 fi
 cd /; rm -rf "$SEMENTARA"
+
+# ---------- verifikasi file zip setelah dibuat ----------
+if ! unzip -t "$ZIP" >/dev/null 2>&1; then
+    echo -e " ${RED}File zip hasil backup RUSAK. Backup dibatalkan.${NC}"
+    rm -f "$ZIP"
+    read -n 1 -s -r -p " Tekan apa saja untuk kembali"
+    menu-backup
+    exit 1
+fi
+echo -e "       -> ${GREEN}zip terverifikasi utuh${NC}"
 
 UKURAN=$(stat -c%s "$ZIP" 2>/dev/null || echo 0)
 if [ "$UKURAN" -lt 1024 ]; then
@@ -251,7 +418,7 @@ else
 fi
 
 # ---------- ringkasan isi ----------
-echo -e " ${CYAN}[3/4]${NC} Memeriksa isi zip ..."
+echo -e " ${CYAN}[4/4]${NC} Memeriksa isi zip ..."
 ISI=$(unzip -l "$ZIP" 2>/dev/null)
 cek_isi() {
     if echo "$ISI" | grep -q "$1"; then
@@ -272,6 +439,12 @@ cek_isi "etc/xray/config.json"       "konfigurasi Xray"
 cek_isi "etc/xray/xray.key"          "sertifikat TLS Xray"
 cek_isi "etc/haproxy/hap.pem"        "sertifikat haproxy"
 cek_isi "usr/bin/kyt/database.db"    "database bot (saldo/pesanan)"
+cek_isi "etc/kyt-theme.conf"         "tema warna menu/UI"
+cek_isi "etc/kyt/limit"               "pemakaian kuota & IP akun"
+cek_isi "etc/limit"                   "pemakaian kuota akun"
+cek_isi "root/slowdns"                "konfigurasi SlowDNS (domain/key)"
+cek_isi "etc/bot/.bot.db"             "token & admin bot Telegram"
+cek_isi "kyt-backup-manifest.json"    "manifest checksum + jumlah data"
 cek_isi "etc/kyt-web.conf"           "konfigurasi website + Turnstile"
 cek_isi "etc/kyt-web-mail.key"       "API key email verifikasi (Brevo)"
 cek_isi "opt/kyt-web/app.py"         "aplikasi website"
