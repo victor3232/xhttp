@@ -63,7 +63,7 @@ case $menu in
     add-bot-panel
     ;;    
 4) clear ;   
-    wget -4 "${UPDATE}update.sh?v=$(date +%s)" && chmod +x update.sh && ./update.sh
+    wget -4 -O update.sh "${UPDATE}update.sh?v=$(date +%s)" && chmod +x update.sh && ./update.sh
     ;;
 5) clear ;    
     reset
