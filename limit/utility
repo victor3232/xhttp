@@ -43,7 +43,7 @@ echo -e " $(sopt2 8 "FIX POINTING DOMAIN")$(sopt2 18 "AUTO REBOOT")"
 echo -e " $(sopt2 9 "CLEAR LOGS")$(sopt2 19 "INFO PORT")"
 echo -e " $(sopt2 10 "CLEAR CACHE")$(sopt2 20 "FIX / RESTART HAPROXY")"
 echo -e " $(sopt2 21 "GANTI TEMA WARNA UI")$(sopt2 22 "CHECK BANDWIDTH")"
-echo -e " $(sopt2 23 "LIMIT SPEED")$(sopt2 24 "SLOWDNS SETTING ON/OFF")"
+echo -e " $(sopt2 23 "LIMIT SPEED")$(sopt2 24 "SLOWDNS ON/OFF")"
 echo -e " $(sopt2 25 "TIMER MULLOG")$(sopt2 26 "SETTING WEBSITE")"
 echo -e " $(sopt2 27 "TRIAL MANAGER")"
 sline
