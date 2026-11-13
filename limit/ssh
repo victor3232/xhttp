@@ -33,10 +33,32 @@ IPs: ${ips}
 Action: ${action}" >/dev/null 2>&1 || true
 }
 
+# Port SSH/Dropbear yang benar-benar menerima koneksi client.
+# Socket tunnel/forward (port lokal ephemeral) TIDAK boleh dihitung sebagai IP login.
+listener_ports() {
+    local ports
+    ports=$(ss -tlnpH 2>/dev/null | awk '
+      /sshd|dropbear/ {
+        local=$4
+        if (local ~ /^\[/) { sub(/^.*\]:/,"",local) } else { sub(/^.*:/,"",local) }
+        gsub(/[^0-9].*/,"",local)
+        if (local != "") print local
+      }' | sort -u | tr '\n' ' ')
+    printf '%s' "${ports:-22 2222 2223 109 143}"
+}
+
 # Print: pid<TAB>user<TAB>remote_ip for live SSH/Dropbear sockets.
 live_sessions() {
-    ss -tnpH 2>/dev/null | awk '
+    ss -tnpH 2>/dev/null | awk -v ports="${SSH_PORTS:-22 2222 2223 109 143}" '
+      BEGIN { n=split(ports,a," "); for (i=1; i<=n; i++) ok[a[i]]=1 }
       /ESTAB|SYN-RECV/ {
+        # Hanya socket yang local port-nya port listener SSH/Dropbear.
+        # Ini mencegah koneksi keluar dari tunnel user (mis. bot/curl) ikut
+        # dihitung sebagai IP login dan memicu suspend palsu.
+        local=$4
+        if (local ~ /^\[/) { sub(/^.*\]:/,"",local) } else { sub(/^.*:/,"",local) }
+        gsub(/[^0-9].*/,"",local)
+        if (!(local in ok)) next
         peer=$5
         # Extract source port safely for IPv4 and bracketed IPv6.
         if (peer ~ /^\[/) { port=peer; sub(/^.*\]:/,"",port); gsub(/[^0-9].*/,"",port); sub(/^\[[^]]+\].*/,"",peer); gsub(/^\[|\]$/,"",peer) }
@@ -97,6 +119,7 @@ log_sessions() {
 check_once() {
     [ -d "$DIR" ] || return 0
     declare -A PIDS IPS
+    SSH_PORTS=$(listener_ports)
     while IFS=$'\t' read -r pid user ip; do
         [ -n "$user" ] && [ -n "$ip" ] || continue
         PIDS["$user"]+=" $pid"
