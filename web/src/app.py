@@ -1817,20 +1817,35 @@ def payg_create_account(user_id: int, service: str, protocol: str, ip: str, user
     if payg_existing(int(user_id), service, protocol):
         raise ValueError("Anda sudah punya akun Pay As You Go untuk layanan ini. Kelola dari dashboard.")
     min_balance = _setting_int(settings, "payg_min_balance", 1000) * 1000
-    if wallet_balance_milli(int(user_id)) < min_balance:
+    balance_milli = wallet_balance_milli(int(user_id))
+    if balance_milli < min_balance:
         raise ValueError(f"Saldo minimal {rupiah_milli(min_balance)} untuk membuat akun Pay As You Go.")
 
     ip_limit = _setting_int(settings, f"payg_{service}_ip_limit", 2)
     quota_gb = _setting_int(settings, f"payg_{service}_quota_gb", 0)
     username = make_username(service, protocol)
     password = make_password() if service == "ssh" else ""
+    # Tampilkan estimasi masa pakai saldo di notifikasi, bukan 3650 hari
+    # (angka internal 3650 hanya supaya akun PAYG tidak ikut expiry otomatis).
+    try:
+        estimate_days = max(1, int(round(float(balance_milli) / float(payg_rates(service, settings)["day_milli"]))))
+    except Exception:
+        estimate_days = 30
+    payg_env = {
+        "KYT_MASA_LABEL": f"Pay As You Go · estimasi ±{estimate_days} hari",
+        "KYT_EXPIRES_LABEL": "Mengikuti saldo (tanpa masa aktif tetap)",
+    }
     account_id = 0
     payg_id = 0
     with CREATE_LOCK:
         if service == "ssh":
-            ok, output, log = create_ssh_account(username, password, 3650, ip_limit, quota_gb)
+            ok, output, log = create_ssh_account(
+                username, password, 3650, ip_limit, quota_gb, extra_env=payg_env
+            )
         else:
-            ok, output, log = create_xray_account(protocol, username, 3650, ip_limit, quota_gb)
+            ok, output, log = create_xray_account(
+                protocol, username, 3650, ip_limit, quota_gb, extra_env=payg_env
+            )
         if not ok:
             raise ValueError(output or "Gagal membuat akun VPN. Coba lagi.")
         now = int(time.time())
@@ -2616,9 +2631,16 @@ def send_reset_email(user: sqlite3.Row, raw_token: str) -> tuple[bool, str]:
 # VPS account operations
 # ---------------------------------------------------------------------------
 
-def run_panel_script(args: list[str], answers: list[str], timeout: int = 120) -> tuple[int, str]:
+def run_panel_script(
+    args: list[str],
+    answers: list[str],
+    timeout: int = 120,
+    extra_env: dict[str, str] | None = None,
+) -> tuple[int, str]:
     env = os.environ.copy()
     env.update({"TERM": "dumb", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"})
+    if extra_env:
+        env.update({str(k): str(v) for k, v in extra_env.items()})
     payload = "\n".join(str(a) for a in answers) + "\n"
     proc = subprocess.Popen(
         args,
@@ -2798,7 +2820,7 @@ def slowdns_info(kind: str) -> list[tuple[str, str]]:
         info.append(("Mode SlowDNS", label))
     return info
 
-def format_ssh_output(raw: str) -> str:
+def format_ssh_output(raw: str, expiry_label: str | None = None) -> str:
     """Rapikan output akun SSH ke format kartu klasik HITS SSH.
 
     Host Slowdns, Pub Key, dan Port SlowDNS diambil otomatis dari mode DNS
@@ -2819,6 +2841,8 @@ def format_ssh_output(raw: str) -> str:
     expiry = _ssh_field(raw, "Berakhir Pada") or _ssh_field(raw, "Expired until")
     if not expiry and _ssh_field(raw, "Aktif Selama"):
         expiry = _ssh_field(raw, "Aktif Selama")
+    if expiry_label is not None:
+        expiry = expiry_label
     dns_info = slowdns_info("ssh")
 
     ports = [
@@ -2917,9 +2941,10 @@ def format_xray_output(raw: str, protocol: str = "") -> str:
     block.append(SSH_BOX_SEP)
     return "\n".join(block) + "\n" + raw
 
-def format_account_output(service: str, protocol: str, raw: str) -> str:
+def format_account_output(service: str, protocol: str, raw: str, kind: str = "") -> str:
     if service == "ssh":
-        return format_ssh_output(raw)
+        expiry_label = "Pay As You Go · tanpa masa aktif tetap" if kind == "payg" else None
+        return format_ssh_output(raw, expiry_label=expiry_label)
     if service == "xray":
         return format_xray_output(raw, protocol)
     return clean_output(raw or "")
@@ -3013,15 +3038,26 @@ def remove_xray_account(protocol: str, user: str) -> None:
         subprocess.run(["systemctl", "restart", "xray"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def create_ssh_account(user: str, password: str, days: int, ip_limit: int, quota_gb: int) -> tuple[bool, str, str]:
+def create_ssh_account(
+    user: str,
+    password: str,
+    days: int,
+    ip_limit: int,
+    quota_gb: int,
+    extra_env: dict[str, str] | None = None,
+) -> tuple[bool, str, str]:
     rc, log = run_panel_script(
         [SSH_SCRIPT],
         [user, password, str(ip_limit), str(quota_gb), str(days)],
         timeout=120,
+        extra_env=extra_env,
     )
     ok, reason = verify_ssh(user, password)
     if ok:
-        output = format_ssh_output(read_account_output("ssh", user))
+        output = format_ssh_output(
+            read_account_output("ssh", user),
+            expiry_label=(extra_env or {}).get("KYT_EXPIRES_LABEL"),
+        )
         try:
             output_path = HTML_DIR / f"ssh-{user}.txt"
             output_path.write_text(output + "\n", encoding="utf-8")
@@ -3034,12 +3070,20 @@ def create_ssh_account(user: str, password: str, days: int, ip_limit: int, quota
     return False, reason, log
 
 
-def create_xray_account(protocol: str, user: str, days: int, ip_limit: int, quota_gb: int) -> tuple[bool, str, str]:
+def create_xray_account(
+    protocol: str,
+    user: str,
+    days: int,
+    ip_limit: int,
+    quota_gb: int,
+    extra_env: dict[str, str] | None = None,
+) -> tuple[bool, str, str]:
     cfg = PROTOCOLS[protocol]
     rc, log = run_panel_script(
         [cfg["script"]],
         [user, str(days), str(quota_gb), str(ip_limit)],
         timeout=120,
+        extra_env=extra_env,
     )
     ok, reason = verify_xray(protocol, user)
     if ok:
@@ -4894,7 +4938,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
         if download:
             download_output = format_account_output(
-                row["service"], row["protocol"], row["output"] or ""
+                row["service"], row["protocol"], row["output"] or "", row["kind"]
             )
             body = download_output.encode("utf-8")
             self._send(
@@ -7353,7 +7397,12 @@ def render_account_card(account: dict) -> str:
     badge_class, badge_text = _account_badge(account)
     output = account.get("output") or ""
     if output:
-        output = format_account_output(account["service"], account["protocol"], output)
+        output = format_account_output(
+            account["service"],
+            account["protocol"],
+            output,
+            "payg" if account.get("source") == "payg" else "",
+        )
     output_id = "acct-" + re.sub(r"[^A-Za-z0-9_-]", "-", f"{account['source']}-{username}")
     expires = int(account.get("expires_at") or 0)
     remaining = max(0, int((expires - time.time()) // 86400) + (1 if expires > time.time() else 0))
@@ -7958,7 +8007,7 @@ def render_result(row: sqlite3.Row) -> str:
     protocol = PROTOCOLS.get(row["protocol"], {}).get("label", "")
     label = service["label"] + (f" · {protocol}" if protocol else "")
     raw_output = row["output"] or ""
-    raw_output = format_account_output(row["service"], row["protocol"], raw_output)
+    raw_output = format_account_output(row["service"], row["protocol"], raw_output, row["kind"])
     output = e(raw_output)
     expires = fmt_ts(row["expires_at"], "%d %b %Y · %H:%M WIB")
     try:
