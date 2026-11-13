@@ -2743,13 +2743,70 @@ def _ssh_field(raw: str, key: str) -> str:
     return match.group(1).strip() if match else ""
 
 
+DNS_MODE_FILE = Path("/etc/kyt-dns-mode")
+SLOWDNS_DOMAIN_FILES = (Path("/etc/xray/dns"), Path("/root/slowdns/dns_domain"))
+SLOWDNS_PUB_FILES = (Path("/root/slowdns/server.pub"), Path("/etc/slowdns/server.pub"))
+XRAY_DNS_LABELS = {
+    "xray-tls": "Xray TLS (443)",
+    "xray-auto": "Xray AUTO (80+443)",
+    "xray-ntls": "Xray NTLS (80)",
+}
+SLOWDNS_FIELD_RE = re.compile(
+    r"(?m)^[ \t]*(?:Host Slowdns|Pub(?:lic)? Key|Mode SlowDNS)[ \t]*:[^\n]*\n?"
+)
+
+def _read_first(paths: tuple[Path, ...]) -> str:
+    for path in paths:
+        try:
+            value = path.read_text(encoding="utf-8", errors="ignore").strip()
+        except OSError:
+            continue
+        if value:
+            return value
+    return ""
+
+def dns_mode() -> str:
+    """Mode SlowDNS aktif, mengikuti /etc/kyt-dns-mode dari menu VPS."""
+    try:
+        return DNS_MODE_FILE.read_text(errors="ignore").strip() or "off"
+    except OSError:
+        return "off"
+
+def slowdns_info(kind: str) -> list[tuple[str, str]]:
+    """Info Host Slowdns/Pub Key yang sama dengan `slowdns-info` di VPS.
+
+    kind="ssh"  -> hanya tampil saat mode DNS = ssh.
+    kind="xray" -> hanya tampil saat mode DNS = xray-*.
+    """
+    mode = dns_mode()
+    label = ""
+    if kind == "ssh":
+        if mode != "ssh":
+            return []
+    else:
+        label = XRAY_DNS_LABELS.get(mode, "")
+        if not label:
+            return []
+    host = _read_first(SLOWDNS_DOMAIN_FILES)
+    pubkey = _read_first(SLOWDNS_PUB_FILES)
+    info: list[tuple[str, str]] = []
+    if host:
+        info.append(("Host Slowdns", host))
+    if pubkey:
+        info.append(("Pub Key", pubkey))
+    if label and (host or pubkey):
+        info.append(("Mode SlowDNS", label))
+    return info
+
 def format_ssh_output(raw: str) -> str:
-    """Rapikan output akun SSH ke format kartu klasik HITS SSH."""
+    """Rapikan output akun SSH ke format kartu klasik HITS SSH.
+
+    Host Slowdns, Pub Key, dan Port SlowDNS diambil otomatis dari mode DNS
+    yang sedang aktif di VPS, jadi output lama ikut menyesuaikan saat mode
+    diganti lewat menu.
+    """
     raw = clean_output(raw or "")
     if not raw:
-        return raw
-    head = raw.lstrip()
-    if head.startswith(SSH_BOX_SEP) and "SSH OVPN Account" in head[:120]:
         return raw
 
     username = _ssh_field(raw, "Username")
@@ -2759,11 +2816,10 @@ def format_ssh_output(raw: str) -> str:
 
     settings = get_settings()
     host = _ssh_field(raw, "Host") or (settings.get("domain") or "").strip()
-    slowdns = _ssh_field(raw, "Host Slowdns")
-    pubkey = _ssh_field(raw, "Pub Key")
     expiry = _ssh_field(raw, "Berakhir Pada") or _ssh_field(raw, "Expired until")
     if not expiry and _ssh_field(raw, "Aktif Selama"):
         expiry = _ssh_field(raw, "Aktif Selama")
+    dns_info = slowdns_info("ssh")
 
     ports = [
         ("Port OpenSSH", "443, 80, 22"),
@@ -2772,7 +2828,6 @@ def format_ssh_output(raw: str) -> str:
         ("Port SSH WS", "80, 8080, 8081-9999"),
         ("Port SSH SSL WS", "443"),
         ("HCR", "8811 (TLS + Plain; akun SSH)"),
-        ("Port SlowDNS", "53, 80, 443"),
         ("Port SSL/TLS", "400-900"),
         ("Port OVPN WS SSL", "443"),
         ("Port OVPN SSL", "443"),
@@ -2805,15 +2860,15 @@ def format_ssh_output(raw: str) -> str:
     out.append(f" {'Password':<17}: {password}")
     if host:
         out.append(f" {'Host':<17}: {host}")
-    if slowdns:
-        out.append(f" {'Host Slowdns':<17}: {slowdns}")
-    if pubkey:
-        out.append(f" {'Pub Key':<17}: {pubkey}")
+    for label, value in dns_info:
+        out.append(f" {label:<17}: {value}")
     for label, default in ports:
         value = _ssh_field(raw, label) or default
         if label == "Port OVPN TCP" and value and "443" not in value:
             value = f"443, {value}"
         out.append(f" {label:<17}: {value}")
+        if label == "HCR" and dns_info:
+            out.append(f" {'Port SlowDNS':<17}: 53, 80, 443")
     out += [SSH_BOX_SEP, " Payload SSH WS", SSH_BOX_SEP, payload_ssh]
     out += [SSH_BOX_SEP, " Payload WS ENHANCED", SSH_BOX_SEP, payload_enh]
     out += [SSH_BOX_SEP, " CF-RAY without proxy & port", SSH_BOX_SEP, payload_cfray]
@@ -2829,6 +2884,45 @@ def format_ssh_output(raw: str) -> str:
         out.append(SSH_BOX_SEP)
     return "\n".join(out)
 
+
+def _xray_output_host(raw: str) -> str:
+    match = re.search(
+        r"(?m)^[ \t]*(?:server|sni|host)[ \t]*:[ \t]*([^\s#]+)",
+        raw,
+        re.IGNORECASE,
+    )
+    return match.group(1).strip() if match else ""
+
+def format_xray_output(raw: str, protocol: str = "") -> str:
+    """Tambahkan info SlowDNS ke output Xray sesuai mode DNS yang aktif.
+
+    Mode xray-*  -> tampil Host, Host Slowdns, Pub Key, dan Mode SlowDNS.
+    Mode ssh/off -> baris SlowDNS lama dibuang supaya tidak menyesatkan.
+    """
+    raw = clean_output(raw or "")
+    raw = SLOWDNS_FIELD_RE.sub("", raw)
+    raw = re.sub(r"\n{3,}", "\n\n", raw).strip("\n")
+    if not raw:
+        return raw
+    info = slowdns_info("xray")
+    if not info:
+        return raw
+    settings = get_settings()
+    host = (settings.get("domain") or "").strip() or _xray_output_host(raw)
+    block: list[str] = [SSH_BOX_SEP, " Xray DNS Account", SSH_BOX_SEP]
+    if host:
+        block.append(f" {'Host':<17}: {host}")
+    for label, value in info:
+        block.append(f" {label:<17}: {value}")
+    block.append(SSH_BOX_SEP)
+    return "\n".join(block) + "\n" + raw
+
+def format_account_output(service: str, protocol: str, raw: str) -> str:
+    if service == "ssh":
+        return format_ssh_output(raw)
+    if service == "xray":
+        return format_xray_output(raw, protocol)
+    return clean_output(raw or "")
 
 def read_account_output(service: str, user: str, protocol: str = "") -> str:
     name = f"ssh-{user}.txt" if service == "ssh" else f"{protocol}-{user}.txt"
@@ -4799,9 +4893,9 @@ class Handler(BaseHTTPRequestHandler):
                 self.html(404, render_not_found(), head_only=head_only)
                 return
         if download:
-            download_output = row["output"] or ""
-            if row["service"] == "ssh":
-                download_output = format_ssh_output(download_output)
+            download_output = format_account_output(
+                row["service"], row["protocol"], row["output"] or ""
+            )
             body = download_output.encode("utf-8")
             self._send(
                 200,
@@ -5298,9 +5392,11 @@ class Handler(BaseHTTPRequestHandler):
                 f"Dibayar : {fmt_ts(row['paid_at'], '%d %b %Y %H:%M WIB')}\n"
                 "----------------------------------------\n\n"
             ).replace(",", ".")
-            download_output = row["account_output"] or ""
-            if row["protocol"] == "ssh":
-                download_output = format_ssh_output(download_output)
+            download_output = format_account_output(
+                "ssh" if row["protocol"] == "ssh" else "xray",
+                row["protocol"],
+                row["account_output"] or "",
+            )
             body = (header + download_output).encode("utf-8")
             self._send(
                 200,
@@ -5343,9 +5439,13 @@ class Handler(BaseHTTPRequestHandler):
             "expires_at": row["expires_at"],
             "username": row["account_username"] if status == "COMPLETED" else "",
             "account": (
-                format_ssh_output(row["account_output"])
-                if status == "COMPLETED" and row["protocol"] == "ssh"
-                else (row["account_output"] if status == "COMPLETED" else "")
+                format_account_output(
+                    "ssh" if row["protocol"] == "ssh" else "xray",
+                    row["protocol"],
+                    row["account_output"] or "",
+                )
+                if status == "COMPLETED" and row["account_output"]
+                else ""
             ),
             "error": row["provision_error"] if status == "FAILED" else "",
         }
@@ -7252,8 +7352,8 @@ def render_account_card(account: dict) -> str:
     username = account["username"]
     badge_class, badge_text = _account_badge(account)
     output = account.get("output") or ""
-    if account["service"] == "ssh" and output:
-        output = format_ssh_output(output)
+    if output:
+        output = format_account_output(account["service"], account["protocol"], output)
     output_id = "acct-" + re.sub(r"[^A-Za-z0-9_-]", "-", f"{account['source']}-{username}")
     expires = int(account.get("expires_at") or 0)
     remaining = max(0, int((expires - time.time()) // 86400) + (1 if expires > time.time() else 0))
@@ -7858,8 +7958,7 @@ def render_result(row: sqlite3.Row) -> str:
     protocol = PROTOCOLS.get(row["protocol"], {}).get("label", "")
     label = service["label"] + (f" · {protocol}" if protocol else "")
     raw_output = row["output"] or ""
-    if row["service"] == "ssh":
-        raw_output = format_ssh_output(raw_output)
+    raw_output = format_account_output(row["service"], row["protocol"], raw_output)
     output = e(raw_output)
     expires = fmt_ts(row["expires_at"], "%d %b %Y · %H:%M WIB")
     try:
@@ -8911,8 +9010,11 @@ def render_invoice(row: sqlite3.Row, new: bool = False) -> str:
       </div>
     </div>"""
     invoice_output = row["account_output"] or ""
-    if row["protocol"] == "ssh":
-        invoice_output = format_ssh_output(invoice_output)
+    invoice_output = format_account_output(
+        "ssh" if row["protocol"] == "ssh" else "xray",
+        row["protocol"],
+        invoice_output,
+    )
     completed_block = f"""
     <div class="invoice-done">
       <div class="success-mark">✓</div>
