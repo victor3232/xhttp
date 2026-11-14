@@ -32,4 +32,4 @@ chmod 700 "$script"
 echo "Installer: $script"
 echo "Jika SSH putus, sambungkan kembali sebagai root: tmux attach -t $SESSION"
 echo 'Installer bersifat interaktif dan mungkin meminta reboot.'
-tmux new-session -s "$SESSION" "bash '$script'; status=$?; printf '\nInstaller keluar dengan status %s. Tekan Enter untuk menutup.\n' "$status"; read -r"
+tmux new-session -s "$SESSION" "bash '$script'; status=\$?; printf '\nInstaller keluar dengan status %s. Tekan Enter untuk menutup.\n' \"\$status\"; read -r"
