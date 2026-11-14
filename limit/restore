@@ -538,6 +538,9 @@ for f in /etc/ipsec.secrets /etc/ppp/chap-secrets /etc/xray/xray.key /etc/haprox
 done
 [ -d /opt/kyt-web/data ] && chmod 700 /opt/kyt-web/data 2>/dev/null
 [ -d /root/slowdns ] && chmod 700 /root/slowdns 2>/dev/null
+# Pulihkan execute bit binary slowdns (bisa hilang setelah extract zip)
+[ -f /root/slowdns/slowdns ] && chmod 755 /root/slowdns/slowdns 2>/dev/null
+[ -f /root/slowdns/install.sh ] && chmod 755 /root/slowdns/install.sh 2>/dev/null
 for f in /usr/local/sbin/jeda-mullog /usr/local/sbin/setting-jeda /usr/local/sbin/utility \
          /usr/local/sbin/kyt-web-configure-edge /usr/local/sbin/setting-web /usr/bin/limit-ip \
          /etc/xray/limit.ssh /usr/local/sbin/slowdns-router /usr/local/sbin/slowdns-rcvbuf \
