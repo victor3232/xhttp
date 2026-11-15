@@ -342,6 +342,7 @@ DEFAULTS = {
     "payg_xray_ip_limit": "2",
     "payg_xray_quota_gb": "0",
     "payg_idle_minutes": "15",
+    "payg_offline_grace_min": "15",
     "popup_enabled": "0",
     "popup_title": "Informasi Penting",
     "popup_message": "",
@@ -375,6 +376,7 @@ INT_SETTINGS = {
     "payg_xray_ip_limit": (0, 100),
     "payg_xray_quota_gb": (0, 10000),
     "payg_idle_minutes": (1, 1440),
+    "payg_offline_grace_min": (1, 1440),
 }
 
 USER_RE = re.compile(r"^[a-z][a-z0-9]{7,14}$")
@@ -655,6 +657,7 @@ def init_db() -> None:
                 spent_milli INTEGER NOT NULL DEFAULT 0,
                 total_seconds INTEGER NOT NULL DEFAULT 0,
                 last_error TEXT NOT NULL DEFAULT '',
+                offline_since INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(user_id, service, protocol)
             );
             CREATE INDEX IF NOT EXISTS idx_payg_user ON payg_accounts(user_id);
@@ -752,6 +755,8 @@ def init_nodes() -> None:
                 free_enabled TEXT NOT NULL DEFAULT '1',
                 premium_enabled TEXT NOT NULL DEFAULT '1',
                 payg_enabled TEXT NOT NULL DEFAULT '1',
+                payg_base_ssh INTEGER NOT NULL DEFAULT 0,
+                payg_base_xray INTEGER NOT NULL DEFAULT 0,
                 ssh_enabled TEXT NOT NULL DEFAULT '1',
                 xray_enabled TEXT NOT NULL DEFAULT '1',
                 vmess_enabled TEXT NOT NULL DEFAULT '1',
@@ -847,6 +852,9 @@ def init_nodes() -> None:
             ("payg_accounts", "server_id", "INTEGER NOT NULL DEFAULT 0"),
             ("usage_daily", "server_id", "INTEGER NOT NULL DEFAULT 0"),
             ("node_account_status", "order_id", "INTEGER NOT NULL DEFAULT 0"),
+            ("server_settings", "payg_base_ssh", "INTEGER NOT NULL DEFAULT 0"),
+            ("server_settings", "payg_base_xray", "INTEGER NOT NULL DEFAULT 0"),
+            ("payg_accounts", "offline_since", "INTEGER NOT NULL DEFAULT 0"),
         ):
             _ensure_column(conn, table, column, ddl)
         conn.commit()
@@ -909,7 +917,8 @@ def server_settings_for(server_id: int, settings: dict | None = None) -> dict:
         "maintenance", "mullog_enabled",
     )
     defaults = {key: str(settings.get(key, "1")) for key in keys}
-    for key in ("free_ip_limit", "free_quota_gb", "max_accounts_per_user"):
+    for key in ("free_ip_limit", "free_quota_gb", "max_accounts_per_user",
+                "payg_base_ssh", "payg_base_xray"):
         try:
             defaults[key] = str(int(settings.get(key, "0") or 0))
         except Exception:
@@ -921,7 +930,8 @@ def server_settings_for(server_id: int, settings: dict | None = None) -> dict:
     finally:
         conn.close()
     if row:
-        for key in keys + ("free_ip_limit", "free_quota_gb", "max_accounts_per_user"):
+        for key in keys + ("free_ip_limit", "free_quota_gb", "max_accounts_per_user",
+                          "payg_base_ssh", "payg_base_xray"):
             if key in row.keys():
                 defaults[key] = str(row[key])
     defaults["max_slots"] = 0
@@ -2534,13 +2544,25 @@ def _setting_int(settings: dict[str, str], key: str, default: int = 0) -> int:
     except (TypeError, ValueError):
         return int(default)
 
-def payg_base_price(service: str, settings: dict[str, str] | None = None) -> int:
+def payg_base_price(service: str, settings: dict[str, str] | None = None,
+                    server_id: int = 0) -> int:
     settings = settings or get_settings()
+    sid = int(server_id or 0)
+    if sid >= 0:
+        ss = server_settings_for(sid, settings)
+        key = "payg_base_ssh" if service == "ssh" else "payg_base_xray"
+        try:
+            override = int(ss.get(key) or 0)
+        except Exception:
+            override = 0
+        if override >= 1000:
+            return min(10000000, override)
     key = "payg_base_ssh_30d" if service == "ssh" else "payg_base_xray_30d"
     return max(1000, _setting_int(settings, key, 10000))
 
-def payg_rates(service: str, settings: dict[str, str] | None = None) -> dict:
-    base = payg_base_price(service, settings)
+def payg_rates(service: str, settings: dict[str, str] | None = None,
+               server_id: int = 0) -> dict:
+    base = payg_base_price(service, settings, server_id)
     return {
         "base": base,
         "day_milli": decimal.Decimal(base) * 1000 / decimal.Decimal(30),
@@ -2913,7 +2935,7 @@ def payg_create_account(user_id: int, service: str, protocol: str, ip: str, user
     # Tampilkan estimasi masa pakai saldo di notifikasi, bukan 3650 hari
     # (angka internal 3650 hanya supaya akun PAYG tidak ikut expiry otomatis).
     try:
-        estimate_days = max(1, int(round(float(balance_milli) / float(payg_rates(service, settings)["day_milli"]))))
+        estimate_days = max(1, int(round(float(balance_milli) / float(payg_rates(service, settings, server_id)["day_milli"]))))
     except Exception:
         estimate_days = 30
     payg_env = {
@@ -3018,7 +3040,8 @@ def payg_start(payg_id: int, user_id: int) -> sqlite3.Row:
     try:
         conn.execute(
             "UPDATE payg_accounts SET state=?, started_at=?, stopped_at=NULL, last_billed_at=?,"
-            " last_seen_at=?, bill_remainder_num=0, last_error='' WHERE id=? AND user_id=?",
+            " last_seen_at=?, bill_remainder_num=0, last_error='', offline_since=0"
+            " WHERE id=? AND user_id=?",
             (PAYG_RUNNING, now, now, now, int(payg_id), int(user_id)),
         )
         conn.commit()
@@ -3034,22 +3057,104 @@ def payg_stop(payg_id: int, user_id: int) -> sqlite3.Row:
     if row["state"] == PAYG_RUNNING:
         payg_bill_one(int(payg_id), int(time.time()))
         row = payg_row_by_id(payg_id, user_id)
-    ok, err = payg_hold_account(row["service"], row["protocol"], row["username"],
-                                int(row["server_id"] or 0))
-    if not ok:
+    sid = int(row["server_id"] or 0)
+    ok, err = payg_hold_account(row["service"], row["protocol"], row["username"], sid)
+    if not ok and not (sid > 0 and node_offline_state(sid)):
         raise ValueError("Gagal menghentikan akun. Coba lagi atau hubungi admin.")
-    new_state = PAYG_SUSPENDED if wallet_balance_milli(int(user_id)) <= 0 else PAYG_PAUSED
+    latest = payg_row_by_id(payg_id, user_id)
+    if latest and latest["state"] == PAYG_SUSPENDED:
+        new_state = PAYG_SUSPENDED
+    else:
+        new_state = PAYG_SUSPENDED if wallet_balance_milli(int(user_id)) <= 0 else PAYG_PAUSED
+    note = "" if ok else "Node offline · akun akan dikunci saat node kembali"
     conn = db_connect()
     try:
         conn.execute(
-            "UPDATE payg_accounts SET state=?, stopped_at=?, last_billed_at=?, last_seen_at=0 WHERE id=? AND user_id=?",
-            (new_state, int(time.time()), int(time.time()), int(payg_id), int(user_id)),
+            "UPDATE payg_accounts SET state=?, stopped_at=?, last_billed_at=?, last_seen_at=0,"
+            " offline_since=0, last_error=? WHERE id=? AND user_id=?",
+            (new_state, int(time.time()), int(time.time()), note[:240], int(payg_id), int(user_id)),
         )
         conn.commit()
     finally:
         conn.close()
     audit_user(int(user_id), "payg_stop", f"{row['service']}/{row['protocol'] or '-'} {row['username']} {new_state}")
     return payg_row_by_id(payg_id, user_id)
+
+NODE_OFFLINE_STALE = 300
+
+def node_offline_state(server_id: int, now: int | None = None) -> bool:
+    """True bila node remote dianggap tidak terhubung (dari cache poller)."""
+    sid = int(server_id or 0)
+    if sid <= 0:
+        return False
+    now = int(now or time.time())
+    conn = db_connect()
+    try:
+        health = conn.execute(
+            "SELECT ok,updated_at FROM node_health WHERE server_id=?", (sid,)
+        ).fetchone()
+        server = conn.execute(
+            "SELECT last_seen FROM servers WHERE id=?", (sid,)
+        ).fetchone()
+    finally:
+        conn.close()
+    if health and now - int(health["updated_at"] or 0) <= NODE_OFFLINE_STALE:
+        return int(health["ok"] or 0) != 1
+    if server and int(server["last_seen"] or 0) >= now - NODE_OFFLINE_STALE:
+        return False
+    return True
+
+def payg_offline_grace_seconds(settings: dict[str, str] | None = None) -> int:
+    settings = settings or get_settings()
+    try:
+        minutes = max(1, min(1440, int(settings.get("payg_offline_grace_min", "15"))))
+    except (TypeError, ValueError):
+        minutes = 15
+    return minutes * 60
+
+def _payg_offline_pause(row, now: int, settings: dict[str, str]) -> None:
+    """Jeda billing saat node offline; suspend setelah grace."""
+    grace = payg_offline_grace_seconds(settings)
+    state = PAYG_RUNNING
+    suspended = False
+    conn = db_connect()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        fresh = conn.execute(
+            "SELECT state,stopped_at,offline_since,last_error FROM payg_accounts WHERE id=?",
+            (int(row["id"]),),
+        ).fetchone()
+        if not fresh or fresh["state"] != PAYG_RUNNING:
+            conn.rollback()
+            return
+        since = int(fresh["offline_since"] or 0) or now
+        stopped = fresh["stopped_at"]
+        error = "Node offline · billing dijeda"
+        if now - since >= grace:
+            state = PAYG_SUSPENDED
+            stopped = now
+            suspended = True
+            error = "Node offline melebihi grace %d menit" % (grace // 60)
+        conn.execute(
+            "UPDATE payg_accounts SET state=?, stopped_at=?, last_billed_at=?,"
+            " offline_since=?, last_error=? WHERE id=?",
+            (state, stopped, now, since, error[:240], int(row["id"])),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    if suspended:
+        telegram_send(
+            f"<b>⛔ PAY AS YOU GO BERHENTI</b>\n"
+            f"Akun   : <code>{e(row['username'])}</code>\n"
+            f"Layanan: <code>{e(row['service'])}/{e(row['protocol'] or '-')}</code>\n"
+            f"Alasan : <code>node offline &gt; {grace // 60} menit</code>\n"
+            f"Node   : <code>{int(row['server_id'] or 0)}</code>"
+        )
+        audit("payg_suspend", f"{row['username']} node offline grace", "")
 
 def payg_bill_one(payg_id: int, now: int | None = None) -> None:
     now = int(now or time.time())
@@ -3058,60 +3163,116 @@ def payg_bill_one(payg_id: int, now: int | None = None) -> None:
         if not row or row["state"] != PAYG_RUNNING:
             return
         sid = int(row["server_id"] or 0)
-        held = (remote_is_held(sid, row["service"], row["protocol"], row["username"])
-                if sid > 0 else bool(payg_jeda_state(row["service"], row["protocol"], row["username"])))
+        settings = get_settings()
+        offline = node_offline_state(sid, now)
+        held = False
+        if not offline:
+            if sid > 0:
+                held_raw = remote_is_held(sid, row["service"], row["protocol"], row["username"])
+                if held_raw is None:
+                    offline = True
+                else:
+                    held = bool(held_raw)
+            else:
+                held = bool(payg_jeda_state(row["service"], row["protocol"], row["username"]))
+        if offline:
+            _payg_offline_pause(row, now, settings)
+            return
         if held:
             conn = db_connect()
             try:
-                conn.execute("UPDATE payg_accounts SET last_billed_at=? WHERE id=?", (now, int(payg_id)))
+                conn.execute(
+                    "UPDATE payg_accounts SET last_billed_at=?, offline_since=0, last_error='' WHERE id=?",
+                    (now, int(payg_id)),
+                )
                 conn.commit()
             finally:
                 conn.close()
             return
+
         last = int(row["last_billed_at"] or now)
         elapsed = max(0, now - last)
         if elapsed <= 0:
             return
-        settings = get_settings()
-        base = payg_base_price(row["service"], settings)
+        base = payg_base_price(row["service"], settings, sid)
         numerator = elapsed * base * 1000 + int(row["bill_remainder_num"] or 0)
         cost_milli = numerator // PAYG_SECONDS_30D
         remainder = numerator % PAYG_SECONDS_30D
-        if cost_milli > 0:
-            actual, new_balance = wallet_deduct(
-                int(row["user_id"]),
-                cost_milli,
-                "payg",
-                ref=f"payg:{payg_id}",
-                note=f"{row['username']} {elapsed}s @ {rupiah(base)}/30h",
-            )
-        else:
-            actual = 0
-            new_balance = wallet_balance_milli(int(row["user_id"]))
-        state = row["state"]
+
+        state = PAYG_RUNNING
         stopped = row["stopped_at"]
-        last_error = row["last_error"] or ""
-        if new_balance <= 0:
-            state = PAYG_SUSPENDED
-            stopped = now
-            remainder = 0
-            last_error = "Saldo habis"
-        conn = db_connect()
-        try:
-            conn.execute(
-                "UPDATE payg_accounts SET state=?, stopped_at=?, last_billed_at=?, bill_remainder_num=?,"
-                " spent_milli=spent_milli+?, total_seconds=total_seconds+?, last_error=? WHERE id=?",
-                (state, stopped, now, remainder, abs(int(actual)), elapsed, last_error[:240], int(payg_id)),
-            )
-            conn.commit()
-        finally:
-            conn.close()
+        new_balance = 0
+        actual = 0
+        with WALLET_LOCK:
+            conn = db_connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                fresh = conn.execute(
+                    "SELECT state,user_id,stopped_at FROM payg_accounts WHERE id=?",
+                    (int(payg_id),),
+                ).fetchone()
+                if not fresh or fresh["state"] != PAYG_RUNNING:
+                    conn.rollback()
+                    return
+                wallet = conn.execute(
+                    "SELECT balance_milli FROM users WHERE id=?", (int(row["user_id"]),)
+                ).fetchone()
+                if not wallet:
+                    conn.rollback()
+                    return
+                old_balance = int(wallet["balance_milli"] or 0)
+                new_balance = max(0, old_balance - int(cost_milli))
+                actual = new_balance - old_balance
+                error = ""
+                if new_balance <= 0:
+                    state = PAYG_SUSPENDED
+                    stopped = now
+                    remainder = 0
+                    error = "Saldo habis"
+                if actual != 0:
+                    conn.execute(
+                        "UPDATE users SET balance_milli=?, updated_at=? WHERE id=?",
+                        (new_balance, now, int(row["user_id"])),
+                    )
+                    conn.execute(
+                        "INSERT INTO wallet_ledger(user_id,at,kind,amount_milli,"
+                        "balance_after_milli,ref,note) VALUES(?,?,?,?,?,?,?)",
+                        (int(row["user_id"]), now, "payg", int(actual), new_balance,
+                         f"payg:{payg_id}",
+                         f"{row['username']} {elapsed}s @ {rupiah(base)}/30h")[:240],
+                    )
+                conn.execute(
+                    "UPDATE payg_accounts SET state=?, stopped_at=?, last_billed_at=?,"
+                    " bill_remainder_num=?, spent_milli=spent_milli+?,"
+                    " total_seconds=total_seconds+?, last_error=?, offline_since=0 WHERE id=?",
+                    (state, stopped, now, remainder, abs(int(actual)), elapsed,
+                     error[:240], int(payg_id)),
+                )
+                if cost_milli > 0:
+                    hour_start = now - (now % 3600)
+                    key = f"payg:{int(payg_id)}:{hour_start}"
+                    conn.execute(
+                        "INSERT INTO payg_billing(payg_id,period_start,period_end,usage_bytes,"
+                        "amount_milli,idempotency_key,created_at) VALUES(?,?,?,?,?,?,?) "
+                        "ON CONFLICT(idempotency_key) DO UPDATE SET "
+                        "period_end=excluded.period_end,"
+                        "amount_milli=payg_billing.amount_milli+excluded.amount_milli",
+                        (int(payg_id), hour_start, now, 0, int(abs(actual)), key, now),
+                    )
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
         if state == PAYG_SUSPENDED:
             ok, err = payg_hold_account(row["service"], row["protocol"], row["username"], sid)
             if not ok:
                 conn = db_connect()
                 try:
-                    conn.execute("UPDATE payg_accounts SET last_error=? WHERE id=?", (err[:240], int(payg_id)))
+                    conn.execute("UPDATE payg_accounts SET last_error=? WHERE id=?",
+                                 (err[:240], int(payg_id)))
                     conn.commit()
                 finally:
                     conn.close()
@@ -3134,6 +3295,8 @@ def payg_enforce_holds() -> None:
     finally:
         conn.close()
     for row in rows:
+        if int(row["server_id"] or 0) > 0 and node_offline_state(int(row["server_id"]), int(time.time())):
+            continue
         blocked, _reason = payg_account_is_blocked(row["service"], row["protocol"], row["username"])
         if blocked:
             continue
@@ -3170,6 +3333,8 @@ def payg_idle_check(now: int | None = None) -> None:
     for row in rows:
         try:
             sid = int(row["server_id"] or 0)
+            if sid > 0 and node_offline_state(sid, now):
+                continue
             if sid > 0:
                 active = remote_online_count(sid, row["service"], row["protocol"], row["username"])
             elif row["service"] == "ssh":
@@ -5795,7 +5960,7 @@ def user_accounts(user_id: int) -> list[dict]:
             "payg_spent_milli": int(row["payg_spent_milli"] or 0),
             "payg_total_seconds": int(row["payg_total_seconds"] or 0),
             "payg_last_error": row["payg_last_error"] or "",
-            "payg_rate": payg_rates(row["service"]),
+            "payg_rate": payg_rates(row["service"], server_id=sid),
             "server_id": sid,
             "server_label": labels.get(sid, ""),
             "_cached_sessions": sessions,
@@ -7538,6 +7703,8 @@ class Handler(BaseHTTPRequestHandler):
             "free_quota_gb": number("free_quota_gb", 0, 0, 10000),
             "max_accounts_per_user": number("max_accounts_per_user", 0, 0, 100),
             "max_slots": number("max_slots", 0, 0, 10000),
+            "payg_base_ssh": number("payg_base_ssh", 0, 0, 10000000),
+            "payg_base_xray": number("payg_base_xray", 0, 0, 10000000),
         }
         now = int(time.time())
         conn = db_connect()
@@ -7545,8 +7712,9 @@ class Handler(BaseHTTPRequestHandler):
             conn.execute(
                 "INSERT INTO server_settings(server_id,free_enabled,premium_enabled,payg_enabled,"
                 "ssh_enabled,xray_enabled,vmess_enabled,vless_enabled,trojan_enabled,maintenance,"
-                "free_ip_limit,free_quota_gb,max_accounts_per_user,updated_at,max_slots) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "free_ip_limit,free_quota_gb,max_accounts_per_user,updated_at,max_slots,"
+                "payg_base_ssh,payg_base_xray) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                 "ON CONFLICT(server_id) DO UPDATE SET free_enabled=excluded.free_enabled,"
                 "premium_enabled=excluded.premium_enabled,payg_enabled=excluded.payg_enabled,"
                 "ssh_enabled=excluded.ssh_enabled,xray_enabled=excluded.xray_enabled,"
@@ -7554,13 +7722,15 @@ class Handler(BaseHTTPRequestHandler):
                 "trojan_enabled=excluded.trojan_enabled,maintenance=excluded.maintenance,"
                 "free_ip_limit=excluded.free_ip_limit,free_quota_gb=excluded.free_quota_gb,"
                 "max_accounts_per_user=excluded.max_accounts_per_user,updated_at=excluded.updated_at,"
-                "max_slots=excluded.max_slots",
+                "max_slots=excluded.max_slots,payg_base_ssh=excluded.payg_base_ssh,"
+                "payg_base_xray=excluded.payg_base_xray",
                 (
                     sid, values["free_enabled"], values["premium_enabled"], values["payg_enabled"],
                     values["ssh_enabled"], values["xray_enabled"], values["vmess_enabled"],
                     values["vless_enabled"], values["trojan_enabled"], values["maintenance"],
                     values["free_ip_limit"], values["free_quota_gb"],
                     values["max_accounts_per_user"], now, values["max_slots"],
+                    values["payg_base_ssh"], values["payg_base_xray"],
                 ),
             )
             if sid > 0:
@@ -7995,7 +8165,7 @@ class Handler(BaseHTTPRequestHandler):
             "payg_min_balance", "payg_min_topup", "payg_max_topup",
             "payg_ssh_ip_limit", "payg_ssh_quota_gb",
             "payg_xray_ip_limit", "payg_xray_quota_gb",
-            "payg_idle_minutes",
+            "payg_idle_minutes", "payg_offline_grace_min",
         ):
             low, high = INT_SETTINGS[key]
             try:
@@ -8281,7 +8451,7 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
 <meta name="theme-color" content="{UI_THEME_COLORS.get(b['theme'], '#fffaf2')}">
 {robots}
 {favicon}
-<link rel="stylesheet" href="/static/style.css?v=20261115servers2">
+<link rel="stylesheet" href="/static/style.css?v=20261115servers3">
 {turnstile_script}
 </head>
 <body>
@@ -8289,7 +8459,7 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
 {body}
 {footer}
 {popup_html}
-<script src="/static/app.js?v=20261115servers2" defer></script>
+<script src="/static/app.js?v=20261115servers3" defer></script>
 </body>
 </html>"""
 
@@ -8466,7 +8636,7 @@ def _premium_context(settings: dict[str, str], server_id: int = 0) -> dict:
                 "service": service,
                 "label": "SSH" if proto == "ssh" else PROTOCOLS[proto]["label"],
                 "sub": SERVICES[service]["sub"],
-                "rates": payg_rates(service, settings),
+                "rates": payg_rates(service, settings, server_id),
                 "existing": existing,
             })
     balance_milli = wallet_balance_milli(int(cu["user_id"])) if cu else 0
@@ -9146,7 +9316,8 @@ def _payg_html(account: dict) -> str:
     if account.get("source") != "payg":
         return ""
     state = account.get("payg_state") or PAYG_PAUSED
-    rates = account.get("payg_rate") or payg_rates(account.get("service", "ssh"))
+    rates = account.get("payg_rate") or payg_rates(account.get("service", "ssh"),
+                                                    server_id=int(account.get("server_id") or 0))
     balance = int(account.get("balance_milli") or 0)
     min_balance = int(account.get("payg_min_balance_milli") or 0)
     spent = int(account.get("payg_spent_milli") or 0)
@@ -9211,7 +9382,8 @@ def _payg_html(account: dict) -> str:
         </div>
         {argo}
         <div class="payg-actions">{action}<a class="btn btn-small btn-ghost" href="/dashboard/saldo">Riwayat saldo</a></div>
-        <small class="payg-foot">Minimal saldo untuk Start: <b>{rupiah_milli(min_balance)}</b> · tarif mengikuti harga patokan admin.</small>
+        <small class="payg-foot">Minimal saldo untuk Start: <b>{rupiah_milli(min_balance)}</b> · tarif mengikuti harga server.</small>
+        {('<small class="payg-foot">Catatan: ' + e(account.get('payg_last_error')) + '</small>') if account.get('payg_last_error') else ''}
       </div>"""
 
 def _suspended_html(account: dict) -> str:
@@ -10052,6 +10224,8 @@ def render_server_settings_page(session: sqlite3.Row, server_id: int, msg: str =
         {num("free_ip_limit", "Limit IP akun gratis (0 = ikut global)", ss.get("free_ip_limit", 0), 0, 100)}
         {num("free_quota_gb", "Kuota gratis GB (0 = ikut global)", ss.get("free_quota_gb", 0), 0, 10000)}
         {num("max_accounts_per_user", "Maks akun gratis / user (0 = tanpa batas)", ss.get("max_accounts_per_user", 0), 0, 100)}
+        {num("payg_base_ssh", "Harga PAYG SSH / 30 hari (0 = global)", ss.get("payg_base_ssh", 0), 0, 10000000)}
+        {num("payg_base_xray", "Harga PAYG Xray / 30 hari (0 = global)", ss.get("payg_base_xray", 0), 0, 10000000)}
         {remote_fields}
       </div>
       <div class="form-actions"><button class="btn btn-primary btn-small" type="submit">Simpan pengaturan</button></div>
@@ -10566,6 +10740,7 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
           <label>Minimal top up (Rp)<input type="number" name="payg_min_topup" min="1000" max="10000000" value="{e(settings.get('payg_min_topup', '5000'))}"></label>
           <label>Maksimal top up (Rp)<input type="number" name="payg_max_topup" min="1000" max="100000000" value="{e(settings.get('payg_max_topup', '1000000'))}"></label>
           <label>Auto-off jika tidak ada login (menit)<input type="number" name="payg_idle_minutes" min="1" max="1440" value="{e(settings.get('payg_idle_minutes', '15'))}"><small>Akun OFF otomatis jika tidak ada sesi aktif selama ini.</small></label>
+          <label>Grace saat node offline (menit)<input type="number" name="payg_offline_grace_min" min="1" max="1440" value="{e(settings.get('payg_offline_grace_min', '15'))}"><small>Billing dijeda saat node tidak terhubung. Lewat grace, akun PAYG di node itu disuspend.</small></label>
           <label class="switch"><input type="checkbox" name="payg_enabled" value="1" {'checked' if settings.get('payg_enabled', '1') == '1' else ''}><span>Buka Pay As You Go</span></label>
         </fieldset>
       </div>
