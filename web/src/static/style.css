@@ -4435,3 +4435,21 @@ html, body {
   box-shadow: 0 0 0 3px var(--accent-ring);
   background: var(--accent-bg);
 }
+
+/* ---------- admin: server price banner ---------- */
+.server-price-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  background: linear-gradient(135deg, var(--accent-bg), var(--paper));
+  border-color: var(--line-strong);
+}
+.server-price-copy { display: flex; flex-direction: column; gap: 4px; }
+.server-price-copy h2 { margin: 0; font-size: 1.35rem; }
+.server-price-copy p { margin: 0; color: var(--muted); font-size: .9rem; max-width: 620px; }
+.server-price-btn { flex: 0 0 auto; white-space: nowrap; }
+@media (max-width: 720px) {
+  .server-price-banner { flex-direction: column; align-items: stretch; gap: 14px; }
+  .server-price-btn { width: 100%; text-align: center; }
+}
