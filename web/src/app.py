@@ -907,23 +907,41 @@ def server_settings_for(server_id: int, settings: dict | None = None) -> dict:
         "maintenance", "mullog_enabled",
     )
     defaults = {key: str(settings.get(key, "1")) for key in keys}
+    for key in ("free_ip_limit", "free_quota_gb", "max_accounts_per_user"):
+        try:
+            defaults[key] = str(int(settings.get(key, "0") or 0))
+        except Exception:
+            defaults[key] = "0"
     sid = int(server_id or 0)
-    if sid <= 0:
-        return defaults
     conn = db_connect()
     try:
         row = conn.execute("SELECT * FROM server_settings WHERE server_id=?", (sid,)).fetchone()
     finally:
         conn.close()
     if row:
-        for key in keys:
+        for key in keys + ("free_ip_limit", "free_quota_gb", "max_accounts_per_user"):
             if key in row.keys():
                 defaults[key] = str(row[key])
     defaults["max_slots"] = 0
-    server = server_by_id(sid)
-    if server:
-        defaults["max_slots"] = int(server["max_slots"] or 0)
+    if sid > 0:
+        server = server_by_id(sid)
+        if server:
+            defaults["max_slots"] = int(server["max_slots"] or 0)
+            defaults["price_multiplier"] = float(server["price_multiplier"] or 1)
+    else:
+        defaults["price_multiplier"] = 1.0
     return defaults
+
+def server_user_active_count(user_id: int, server_id: int) -> int:
+    conn = db_connect()
+    try:
+        return int(conn.execute(
+            "SELECT COUNT(*) AS n FROM accounts WHERE user_id=? AND server_id=? "
+            "AND status='active' AND kind='free'",
+            (int(user_id), int(server_id)),
+        ).fetchone()["n"])
+    finally:
+        conn.close()
 
 def server_choice_list(kind: str = "free", settings: dict | None = None) -> list[dict]:
     """Daftar server yang boleh dipilih user untuk kategori free/premium/payg."""
@@ -1403,6 +1421,7 @@ def render_admin_nodes(session: sqlite3.Row, msg: str = "", test_id: int = 0) ->
             "<td><code>%s</code><small>key %s</small></td>"
             "<td>%s<small>%s · %s</small>%s</td>"
             "<td>%s</td><td>%.2f×</td><td>"
+            '<a class="btn btn-tiny btn-ghost" href="/admin/nodes/settings?id=%s">Atur</a>'
             '<form method="post" action="/admin/nodes/test" class="inline-form">'
             '<input type="hidden" name="_csrf" value="%s">'
             '<input type="hidden" name="id" value="%s">'
@@ -1427,7 +1446,8 @@ def render_admin_nodes(session: sqlite3.Row, msg: str = "", test_id: int = 0) ->
                e(s["base_url"]),
                (e(str(s["api_key"])[:10]) + "…") if s["api_key"] else "legacy",
                badge, e(s["last_version"] or "-"), e(last), err, int(s["max_slots"]),
-               float(s["price_multiplier"] or 1), e(session["csrf"]), int(s["id"]),
+               float(s["price_multiplier"] or 1), int(s["id"]),
+               e(session["csrf"]), int(s["id"]),
                e(session["csrf"]), int(s["id"]), e(session["csrf"]), int(s["id"]),
                e(session["csrf"]), int(s["id"]))
         )
@@ -1478,6 +1498,19 @@ def render_admin_nodes(session: sqlite3.Row, msg: str = "", test_id: int = 0) ->
     <a class="btn btn-ghost btn-small" href="/admin">‹ Dashboard</a>
   </div>
   {notice}
+  <section class="panel admin-panel">
+    <div class="panel-head"><div><span class="mini-label">VPS UTAMA</span><h2>Server lokal (A)</h2></div>
+      <span class="panel-hint">Akun tanpa server_id berjalan di sini.</span></div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Server</th><th>ISP / Region</th><th>Status</th><th></th></tr></thead>
+      <tbody><tr>
+        <td><b>{e(server_info()['name'])}</b><small>utama</small></td>
+        <td>{e(local_isp_name())}<small>{e(server_info()['city'] or server_info()['code'])}</small></td>
+        <td><span class="badge badge-ok">Lokal</span></td>
+        <td><a class="btn btn-tiny btn-ghost" href="/admin/nodes/settings?id=0">Atur</a></td>
+      </tr></tbody>
+    </table></div>
+  </section>
   <section class="panel admin-panel">
     <div class="panel-head"><div><span class="mini-label">NODE TERDAFTAR</span><h2>Server cabang</h2></div>
       <span class="panel-hint">Token tidak pernah ditampilkan.</span></div>
@@ -3959,13 +3992,14 @@ def create_account(service: str, protocol: str, days: int, ip: str, user_agent: 
         raise ValueError(f"Protokol {PROTOCOLS[protocol]['label']} sedang ditutup admin.")
     server_id = int(server_id or 0)
     server = user_server(server_id, "free")
-    if server:
-        # Pengaturan per server, bila admin membedakan protokol di node tertentu.
-        ss = server_settings_for(server_id, settings)
-        if ss.get(f"{service}_enabled", "1") != "1":
-            raise ValueError(f"Layanan {SERVICES[service]['label']} di server ini sedang ditutup.")
-        if service == "xray" and ss.get(f"{protocol}_enabled", "1") != "1":
-            raise ValueError(f"Protokol {PROTOCOLS[protocol]['label']} di server ini sedang ditutup.")
+    ss = server_settings_for(server_id, settings)
+    if ss.get(f"{service}_enabled", "1") != "1":
+        raise ValueError(f"Layanan {SERVICES[service]['label']} di server ini sedang ditutup.")
+    if service == "xray" and ss.get(f"{protocol}_enabled", "1") != "1":
+        raise ValueError(f"Protokol {PROTOCOLS[protocol]['label']} di server ini sedang ditutup.")
+    max_user = int(ss.get("max_accounts_per_user") or 0)
+    if max_user > 0 and server_user_active_count(int(user_id or 0), server_id) >= max_user:
+        raise ValueError("Batas akun gratis Anda di server ini sudah tercapai.")
     q = quota["services"][service][str(days)]
     if q["limit"] <= 0 or q["remaining"] <= 0:
         raise ValueError(
@@ -3979,8 +4013,8 @@ def create_account(service: str, protocol: str, days: int, ip: str, user_agent: 
             "Coba lagi setelah pukul 00.00 WIB."
         )
 
-    ip_limit = int(settings.get(f"{service}_ip_limit", "0") or 0)
-    quota_gb = int(settings.get(f"{service}_quota_gb", "0") or 0)
+    ip_limit = int(ss.get("free_ip_limit") or 0) or int(settings.get(f"{service}_ip_limit", "0") or 0)
+    quota_gb = int(ss.get("free_quota_gb") or 0) or int(settings.get(f"{service}_quota_gb", "0") or 0)
     username = make_username(service, protocol)
     password = make_password() if service == "ssh" else ""
 
@@ -3992,6 +4026,8 @@ def create_account(service: str, protocol: str, days: int, ip: str, user_agent: 
             raise ValueError("Kuota hari ini baru saja habis. Silakan coba lagi besok.")
         if per_ip_limit > 0 and per_ip_used(ip, service) >= per_ip_limit:
             raise ValueError("Batas pembuatan akun dari IP Anda hari ini sudah tercapai.")
+        if max_user > 0 and server_user_active_count(int(user_id or 0), server_id) >= max_user:
+            raise ValueError("Batas akun gratis Anda di server ini sudah tercapai.")
         if server and not server_capacity_ok(server):
             raise ValueError("Slot server %s sudah penuh. Pilih server lain." % server["name"])
 
@@ -4493,6 +4529,55 @@ def premium_product(code: str, active_only: bool = True) -> sqlite3.Row | None:
         conn.close()
 
 
+def _server_product_overrides(server_id: int) -> dict:
+    sid = int(server_id or 0)
+    if sid <= 0:
+        return {}
+    conn = db_connect()
+    try:
+        rows = conn.execute("SELECT * FROM server_products WHERE server_id=?", (sid,)).fetchall()
+    finally:
+        conn.close()
+    return {(str(r["protocol"]), int(r["days"])): r for r in rows}
+
+def premium_products_for_server(server_id: int, active_only: bool = True) -> list[dict]:
+    """Paket premium dengan harga/limit khusus server. Fallback ke paket global."""
+    sid = int(server_id or 0)
+    overrides = _server_product_overrides(sid)
+    server = server_by_id(sid) if sid > 0 else None
+    multiplier = float(server["price_multiplier"] or 1) if server else 1.0
+    result = []
+    for row in premium_products(active_only=False):
+        if active_only and not int(row["active"] or 0):
+            continue
+        ov = overrides.get((str(row["protocol"]), int(row["days"])))
+        if ov is not None and active_only and not int(ov["active"] or 0):
+            continue
+        price = int(ov["price"]) if ov is not None else int(row["price"])
+        if ov is None and sid > 0:
+            price = int(round(price * multiplier))
+        result.append({
+            "id": int(row["id"]),
+            "code": str(row["code"]),
+            "protocol": str(row["protocol"]),
+            "label": str((ov["label"] if ov is not None and ov["label"] else row["label"])),
+            "days": int(row["days"]),
+            "price": max(0, price),
+            "ip_limit": int(ov["ip_limit"]) if ov is not None else int(row["ip_limit"]),
+            "quota_gb": int(ov["quota_gb"]) if ov is not None else int(row["quota_gb"]),
+            "active": bool(int(row["active"] or 0)) and (ov is None or bool(int(ov["active"] or 0))),
+            "override": ov is not None,
+        })
+    return result
+
+def premium_product_for_server(server_id: int, code: str, active_only: bool = True) -> dict | None:
+    for item in premium_products_for_server(server_id, active_only=False):
+        if item["code"] == code:
+            if active_only and not item["active"]:
+                return None
+            return item
+    return None
+
 def premium_public_data() -> dict:
     products = []
     for row in premium_products(active_only=True):
@@ -4612,10 +4697,10 @@ def create_premium_order(product_code: str, ip: str, user_agent: str, user_id: i
         raise ValueError("Website sedang dalam perawatan. Silakan coba lagi nanti.")
     if settings.get("premium_enabled", "1") != "1":
         raise ValueError("Kategori Premium sedang ditutup admin.")
-    product = premium_product(product_code, active_only=True)
-    if not product:
-        raise ValueError("Paket premium tidak tersedia.")
     server_id = int(server_id or 0)
+    product = premium_product_for_server(server_id, product_code, active_only=True)
+    if not product:
+        raise ValueError("Paket premium tidak tersedia di server terpilih.")
     server = user_server(server_id, "premium")
     if server:
         ss = server_settings_for(server_id, settings)
@@ -5775,7 +5860,16 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 token, cookie = self.public_form_token()
                 scheme = (query.get("scheme", ["duration"])[0] or "duration").strip().lower()
-                self.html(200, render_premium_page(token, get_settings(), scheme), cookies=[cookie] if cookie else None, head_only=head_only)
+                try:
+                    server_id = int(query.get("server", ["0"])[0] or 0)
+                except ValueError:
+                    server_id = 0
+                try:
+                    user_server(server_id, "premium" if scheme != "payg" else "payg")
+                except ValueError:
+                    server_id = 0
+                self.html(200, render_premium_page(token, get_settings(), scheme, server_id),
+                          cookies=[cookie] if cookie else None, head_only=head_only)
                 return
             if path == "/deposit" or path == "/deposit/":
                 if not self.user_session():
@@ -5831,6 +5925,9 @@ class Handler(BaseHTTPRequestHandler):
                     extra_headers={"Cache-Control": "no-store", "X-Robots-Tag": "noindex, nofollow"},
                     head_only=head_only,
                 )
+                return
+            if path == "/admin/nodes/settings":
+                self.admin_nodes_settings_page(query, head_only)
                 return
             if path in ("/admin/nodes", "/admin/nodes/"):
                 self.admin_nodes_page(query, head_only)
@@ -6048,6 +6145,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/admin/server":
                 self.admin_server()
+                return
+            if path == "/admin/nodes/settings":
+                self.admin_nodes_settings_save()
                 return
             if path == "/admin/nodes/add":
                 self.admin_nodes_add()
@@ -7151,6 +7251,121 @@ class Handler(BaseHTTPRequestHandler):
             head_only=head_only,
         )
 
+    def admin_nodes_settings_page(self, query, head_only: bool = False) -> None:
+        session = self.admin_session()
+        if not session:
+            self.redirect("/admin/login")
+            return
+        try:
+            sid = int(query.get("id", ["0"])[0] or 0)
+        except ValueError:
+            sid = 0
+        if sid > 0 and not server_by_id(sid):
+            self.redirect("/admin/nodes?msg=invalid")
+            return
+        msg = (query.get("msg", [""])[0] or "")[:30]
+        self.html(
+            200,
+            render_server_settings_page(session, sid, msg),
+            extra_headers={"Cache-Control": "no-store", "X-Robots-Tag": "noindex, nofollow"},
+            head_only=head_only,
+        )
+
+    def admin_nodes_settings_save(self) -> None:
+        body = self.parse_body()
+        session = self.require_admin(body.get("_csrf", ""))
+        if not session:
+            return
+        try:
+            sid = int(body.get("id", "0") or 0)
+        except ValueError:
+            sid = 0
+        if sid > 0 and not server_by_id(sid):
+            self.redirect("/admin/nodes?msg=invalid")
+            return
+
+        def flag(name: str) -> str:
+            return "1" if body.get(name) == "1" else "0"
+
+        def number(name: str, default: int, minimum: int, maximum: int) -> int:
+            try:
+                return max(minimum, min(maximum, int(body.get(name, str(default)) or default)))
+            except (TypeError, ValueError):
+                return default
+
+        try:
+            multiplier = max(0.1, min(10.0, float(body.get("price_multiplier", "1") or 1)))
+        except ValueError:
+            multiplier = 1.0
+        values = {
+            "free_enabled": flag("free_enabled"),
+            "premium_enabled": flag("premium_enabled"),
+            "payg_enabled": flag("payg_enabled"),
+            "ssh_enabled": flag("ssh_enabled"),
+            "xray_enabled": flag("xray_enabled"),
+            "vmess_enabled": flag("vmess_enabled"),
+            "vless_enabled": flag("vless_enabled"),
+            "trojan_enabled": flag("trojan_enabled"),
+            "maintenance": flag("maintenance"),
+            "free_ip_limit": number("free_ip_limit", 0, 0, 100),
+            "free_quota_gb": number("free_quota_gb", 0, 0, 10000),
+            "max_accounts_per_user": number("max_accounts_per_user", 0, 0, 100),
+            "max_slots": number("max_slots", 0, 0, 10000),
+        }
+        now = int(time.time())
+        conn = db_connect()
+        try:
+            conn.execute(
+                "INSERT INTO server_settings(server_id,free_enabled,premium_enabled,payg_enabled,"
+                "ssh_enabled,xray_enabled,vmess_enabled,vless_enabled,trojan_enabled,maintenance,"
+                "free_ip_limit,free_quota_gb,max_accounts_per_user,updated_at,max_slots) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(server_id) DO UPDATE SET free_enabled=excluded.free_enabled,"
+                "premium_enabled=excluded.premium_enabled,payg_enabled=excluded.payg_enabled,"
+                "ssh_enabled=excluded.ssh_enabled,xray_enabled=excluded.xray_enabled,"
+                "vmess_enabled=excluded.vmess_enabled,vless_enabled=excluded.vless_enabled,"
+                "trojan_enabled=excluded.trojan_enabled,maintenance=excluded.maintenance,"
+                "free_ip_limit=excluded.free_ip_limit,free_quota_gb=excluded.free_quota_gb,"
+                "max_accounts_per_user=excluded.max_accounts_per_user,updated_at=excluded.updated_at,"
+                "max_slots=excluded.max_slots",
+                (
+                    sid, values["free_enabled"], values["premium_enabled"], values["payg_enabled"],
+                    values["ssh_enabled"], values["xray_enabled"], values["vmess_enabled"],
+                    values["vless_enabled"], values["trojan_enabled"], values["maintenance"],
+                    values["free_ip_limit"], values["free_quota_gb"],
+                    values["max_accounts_per_user"], now, values["max_slots"],
+                ),
+            )
+            if sid > 0:
+                conn.execute("UPDATE servers SET max_slots=?, price_multiplier=? WHERE id=?",
+                             (values["max_slots"], multiplier, sid))
+                for row in conn.execute("SELECT * FROM premium_products WHERE active=1").fetchall():
+                    pid = int(row["id"])
+                    price_raw = body.get("price_%d" % pid)
+                    if price_raw is None:
+                        continue
+                    try:
+                        price = max(1000, min(10000000, int(price_raw)))
+                    except ValueError:
+                        price = int(row["price"])
+                    ip_limit = number("ip_%d" % pid, int(row["ip_limit"]), 0, 100)
+                    quota_gb = number("quota_%d" % pid, int(row["quota_gb"]), 0, 10000)
+                    active = 1 if body.get("active_%d" % pid) == "1" else 0
+                    conn.execute(
+                        "INSERT INTO server_products(server_id,protocol,days,label,price,ip_limit,"
+                        "quota_gb,active,sort,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?) "
+                        "ON CONFLICT(server_id,protocol,days) DO UPDATE SET label=excluded.label,"
+                        "price=excluded.price,ip_limit=excluded.ip_limit,quota_gb=excluded.quota_gb,"
+                        "active=excluded.active,sort=excluded.sort,updated_at=excluded.updated_at",
+                        (sid, row["protocol"], int(row["days"]), row["label"], price,
+                         ip_limit, quota_gb, active, int(row["sort"] or 0), now),
+                    )
+            conn.commit()
+        finally:
+            conn.close()
+        audit("nodes", "settings %s saved" % sid, self.client_ip())
+        self.redirect("/admin/nodes/settings?id=%d&msg=saved" % sid)
+
     def admin_nodes_add(self) -> None:
         body = self.parse_body()
         session = self.require_admin(body.get("_csrf", ""))
@@ -7839,7 +8054,7 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
 <meta name="theme-color" content="{UI_THEME_COLORS.get(b['theme'], '#fffaf2')}">
 {robots}
 {favicon}
-<link rel="stylesheet" href="/static/style.css?v=20261115servers1">
+<link rel="stylesheet" href="/static/style.css?v=20261115servers2">
 {turnstile_script}
 </head>
 <body>
@@ -7847,7 +8062,7 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
 {body}
 {footer}
 {popup_html}
-<script src="/static/app.js?v=20261115servers1" defer></script>
+<script src="/static/app.js?v=20261115servers2" defer></script>
 </body>
 </html>"""
 
@@ -7930,16 +8145,30 @@ def _free_context(settings: dict[str, str]) -> dict:
     }
 
 
-def _premium_context(settings: dict[str, str]) -> dict:
+def _premium_context(settings: dict[str, str], server_id: int = 0) -> dict:
     maintenance = settings.get("maintenance") == "1"
     free_on = settings.get("free_enabled", "1") == "1"
-    ssh_global = settings.get("ssh_enabled", "1") == "1"
-    proto_on = {p: settings.get(f"{p}_enabled", "1") == "1" for p in PROTOCOLS}
-    xray_global = settings.get("xray_enabled", "1") == "1" and any(proto_on.values())
-    premium_on = settings.get("premium_enabled", "1") == "1" and not maintenance
+    server_id = int(server_id or 0)
+    ss = server_settings_for(server_id, settings)
+    ssh_global = settings.get("ssh_enabled", "1") == "1" and ss.get("ssh_enabled", "1") == "1"
+    proto_on = {
+        p: (settings.get(f"{p}_enabled", "1") == "1" and ss.get(f"{p}_enabled", "1") == "1")
+        for p in PROTOCOLS
+    }
+    xray_global = (
+        settings.get("xray_enabled", "1") == "1"
+        and ss.get("xray_enabled", "1") == "1"
+        and any(proto_on.values())
+    )
+    premium_on = (
+        settings.get("premium_enabled", "1") == "1"
+        and ss.get("premium_enabled", "1") == "1"
+        and ss.get("maintenance", "0") != "1"
+        and not maintenance
+    )
     rows = []
     if premium_on:
-        for row in premium_products(active_only=True):
+        for row in premium_products_for_server(server_id, active_only=True):
             if row["protocol"] == "ssh" and not ssh_global:
                 continue
             if row["protocol"] in PROTOCOLS and (
@@ -7963,6 +8192,7 @@ def _premium_context(settings: dict[str, str]) -> dict:
             for row in rows
         ],
         "expiry_min": int(settings.get("premium_expiry_min", "15")),
+        "server_id": server_id,
     }
 
     cards = ""
@@ -7983,12 +8213,17 @@ def _premium_context(settings: dict[str, str]) -> dict:
     if maintenance:
         notice = '<div class="notice notice-warn"><strong>Mode perawatan.</strong> Pembelian premium ditutup sementara.</div>'
     elif not premium_on or not rows:
-        notice = '<div class="notice notice-warn"><strong>Premium sedang ditutup.</strong> Admin belum membuka paket jualan.</div>'
+        notice = '<div class="notice notice-warn"><strong>Premium sedang ditutup.</strong> Admin belum membuka paket jualan untuk server ini.</div>'
 
     cheapest_all = min((int(row["price"]) for row in rows), default=0)
     cu = current_user()
     payg_rows = []
-    payg_on = settings.get("payg_enabled", "1") == "1" and not maintenance
+    payg_on = (
+        settings.get("payg_enabled", "1") == "1"
+        and ss.get("payg_enabled", "1") == "1"
+        and ss.get("maintenance", "0") != "1"
+        and not maintenance
+    )
     if payg_on:
         for proto in ("ssh", "vmess", "vless", "trojan"):
             service = "ssh" if proto == "ssh" else "xray"
@@ -8026,7 +8261,6 @@ def _premium_context(settings: dict[str, str]) -> dict:
         "payg_min_balance_milli": _setting_int(settings, "payg_min_balance", 1000) * 1000,
         "payg_min_topup": _setting_int(settings, "payg_min_topup", 5000),
     }
-
 
 def _page_hero(eyebrow: str, title_html: str, lead: str, chips: str = "") -> str:
     chip_html = f'<div class="page-hero-chips">{chips}</div>' if chips else ""
@@ -8318,14 +8552,16 @@ def render_free_page(form_token: str, settings: dict[str, str]) -> str:
     return page_shell("Buat Akun Gratis", body, active="free", turnstile=ts_on)
 
 
-def render_premium_page(form_token: str, settings: dict[str, str], scheme: str = "duration") -> str:
-    pc = _premium_context(settings)
+def render_premium_page(form_token: str, settings: dict[str, str], scheme: str = "duration",
+                        server_id: int = 0) -> str:
+    server_id = int(server_id or 0)
+    pc = _premium_context(settings, server_id)
     b = branding()
     scheme = "payg" if scheme == "payg" else "duration"
     premium_json = json.dumps(pc["data"], ensure_ascii=False).replace("</", "<\\/")
     ts_site, _ts_secret, ts_on = turnstile_config()
-    server_pick_duration = server_picker_html("premium", settings=settings)
-    server_pick_payg = server_picker_html("payg", settings=settings)
+    server_pick_duration = server_picker_html("premium", selected=server_id, settings=settings)
+    server_pick_payg = server_picker_html("payg", selected=server_id, settings=settings)
     ts_widget = (
         '<div class="turnstile-box premium-turnstile">'
         f'<div class="cf-turnstile" data-sitekey="{e(ts_site)}" data-theme="light" data-language="id" data-size="flexible"></div>'
@@ -9464,6 +9700,140 @@ def render_admin_login(form_token: str, error: str) -> str:
 """
     return page_shell("Admin", body, admin=True, noindex=True)
 
+
+def render_server_settings_page(session: sqlite3.Row, server_id: int, msg: str = "") -> str:
+    sid = int(server_id or 0)
+    settings = get_settings()
+    if sid > 0:
+        server = server_by_id(sid)
+        if not server:
+            return render_not_found()
+        name = str(server["name"] or server["code"])
+        code = str(server["code"] or "")
+        isp = str(server["isp"] or "-")
+        base_url = str(server["base_url"] or "")
+        status = str(server["status"] or "")
+    else:
+        info = server_info()
+        name = info.get("name") or "VPS Utama"
+        code = "utama"
+        isp = local_isp_name()
+        base_url = "VPS utama (lokal)"
+        status = "active"
+    ss = server_settings_for(sid, settings)
+
+    messages = {
+        "saved": ("ok", "Pengaturan server disimpan dan langsung dipakai."),
+        "invalid": ("error", "Pengaturan tidak valid. Periksa angka yang diisi."),
+    }
+    notice = ""
+    if msg in messages:
+        kind, text = messages[msg]
+        notice = '<div class="notice notice-%s"><b>%s</b></div>' % (
+            "ok" if kind == "ok" else "error", e(text))
+
+    def sw(name: str, label: str, value: str) -> str:
+        return (
+            '<label class="switch"><input type="checkbox" name="%s" value="1"%s>'
+            '<span>%s</span></label>' % (name, " checked" if value == "1" else "", e(label))
+        )
+
+    def num(name: str, label: str, value, minimum: int = 0, maximum: int = 10000) -> str:
+        return (
+            '<label>%s<input type="number" name="%s" min="%d" max="%d" value="%s"></label>'
+            % (e(label), name, minimum, maximum, e(str(value)))
+        )
+
+    toggles = "".join([
+        sw("free_enabled", "Buka kategori gratis di server ini", ss.get("free_enabled", "1")),
+        sw("premium_enabled", "Buka kategori premium", ss.get("premium_enabled", "1")),
+        sw("payg_enabled", "Buka Pay As You Go", ss.get("payg_enabled", "1")),
+        sw("ssh_enabled", "Layanan SSH", ss.get("ssh_enabled", "1")),
+        sw("xray_enabled", "Layanan Xray", ss.get("xray_enabled", "1")),
+        sw("vmess_enabled", "Protokol VMess", ss.get("vmess_enabled", "1")),
+        sw("vless_enabled", "Protokol VLESS", ss.get("vless_enabled", "1")),
+        sw("trojan_enabled", "Protokol Trojan", ss.get("trojan_enabled", "1")),
+        sw("maintenance", "Mode perawatan khusus server ini", ss.get("maintenance", "0")),
+    ])
+
+    remote_fields = ""
+    if sid > 0:
+        remote_fields = (
+            num("max_slots", "Maksimal akun aktif di server", ss.get("max_slots", 0), 0, 10000)
+            + '<label>Multiplier harga (jika paket belum di-override)'
+              '<input type="number" name="price_multiplier" min="0.1" max="10" step="0.01" value="%s"></label>'
+              % e("%.2f" % float(ss.get("price_multiplier") or 1))
+        )
+    else:
+        remote_fields = '<p class="panel-hint" style="grid-column:1/-1">Kapasitas VPS utama mengikuti kuota harian global. Harga premium utama diatur di Dashboard → Premium.</p>'
+
+    product_rows = ""
+    if sid > 0:
+        effective = {item["id"]: item for item in premium_products_for_server(sid, active_only=False)}
+        for row in premium_products(active_only=True):
+            pid = int(row["id"])
+            item = effective.get(pid)
+            if not item:
+                continue
+            proto = "SSH" if item["protocol"] == "ssh" else PROTOCOLS.get(
+                item["protocol"], {}).get("label", item["protocol"].upper())
+            product_rows += f"""
+            <tr>
+              <td><b>{e(proto)} · {int(item['days'])} hari</b><small>{e(item['code'])}</small></td>
+              <td><small class="muted">global {rupiah(int(row['price']))}</small></td>
+              <td><input class="mini-input" type="number" name="price_{pid}" min="1000" max="10000000" value="{int(item['price'])}"></td>
+              <td><input class="mini-input" type="number" name="ip_{pid}" min="0" max="100" value="{int(item['ip_limit'])}"></td>
+              <td><input class="mini-input" type="number" name="quota_{pid}" min="0" max="10000" value="{int(item['quota_gb'])}"></td>
+              <td class="center"><input type="checkbox" name="active_{pid}" value="1"{' checked' if item['active'] else ''}></td>
+            </tr>"""
+        if not product_rows:
+            product_rows = '<tr><td colspan="6" class="empty">Belum ada paket premium global. Tambahkan dari Dashboard → Premium.</td></tr>'
+
+    products_html = ""
+    if sid > 0:
+        products_html = f"""
+  <section class="panel admin-panel">
+    <div class="panel-head"><div><span class="mini-label">HARGA PREMIUM</span><h2>Paket &amp; limit khusus server ini</h2></div>
+      <span class="panel-hint">Kosongkan? Nilai diambil dari paket global.</span></div>
+    <form method="post" action="/admin/nodes/settings">
+      <input type="hidden" name="_csrf" value="{e(session['csrf'])}">
+      <input type="hidden" name="id" value="{sid}">
+      <div class="table-wrap"><table class="premium-table">
+        <thead><tr><th>Paket</th><th>Harga global</th><th>Harga server</th><th>Limit IP</th><th>Kuota GB</th><th>Aktif</th></tr></thead>
+        <tbody>{product_rows}</tbody>
+      </table></div>
+      <div class="form-actions"><button class="btn btn-primary btn-small" type="submit">Simpan harga server</button></div>
+    </form>
+  </section>"""
+
+    body = f"""
+<main class="admin-main wrap">
+  <div class="admin-head">
+    <div><span class="mini-label">PENGATURAN SERVER</span><h1>{e(name)}</h1>
+      <p><code>{e(code)}</code> · {e(isp)} · {e(base_url)} · <b>{e(status)}</b></p></div>
+    <a class="btn btn-ghost btn-small" href="/admin/nodes">‹ Multi-Server</a>
+  </div>
+  {notice}
+  <section class="panel admin-panel">
+    <div class="panel-head"><div><span class="mini-label">SAKELAR LAYANAN</span><h2>Kategori &amp; protokol</h2></div>
+      <span class="panel-hint">Berlaku hanya untuk server ini.</span></div>
+    <form method="post" action="/admin/nodes/settings">
+      <input type="hidden" name="_csrf" value="{e(session['csrf'])}">
+      <input type="hidden" name="id" value="{sid}">
+      <div class="settings-grid">
+        {toggles}
+        {num("free_ip_limit", "Limit IP akun gratis (0 = ikut global)", ss.get("free_ip_limit", 0), 0, 100)}
+        {num("free_quota_gb", "Kuota gratis GB (0 = ikut global)", ss.get("free_quota_gb", 0), 0, 10000)}
+        {num("max_accounts_per_user", "Maks akun gratis / user (0 = tanpa batas)", ss.get("max_accounts_per_user", 0), 0, 100)}
+        {remote_fields}
+      </div>
+      <div class="form-actions"><button class="btn btn-primary btn-small" type="submit">Simpan pengaturan</button></div>
+    </form>
+  </section>
+  {products_html}
+</main>
+"""
+    return page_shell("Pengaturan Server", body, admin=True, noindex=True)
 
 def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: str, q: str = "") -> str:
     quota = quota_state(settings)
