@@ -747,12 +747,109 @@ def init_nodes() -> None:
                 created_at INTEGER NOT NULL,
                 output TEXT NOT NULL DEFAULT ''
             );
+            CREATE TABLE IF NOT EXISTS server_settings (
+                server_id INTEGER PRIMARY KEY,
+                free_enabled TEXT NOT NULL DEFAULT '1',
+                premium_enabled TEXT NOT NULL DEFAULT '1',
+                payg_enabled TEXT NOT NULL DEFAULT '1',
+                ssh_enabled TEXT NOT NULL DEFAULT '1',
+                xray_enabled TEXT NOT NULL DEFAULT '1',
+                vmess_enabled TEXT NOT NULL DEFAULT '1',
+                vless_enabled TEXT NOT NULL DEFAULT '1',
+                trojan_enabled TEXT NOT NULL DEFAULT '1',
+                maintenance TEXT NOT NULL DEFAULT '0',
+                free_days INTEGER NOT NULL DEFAULT 0,
+                free_quota_gb INTEGER NOT NULL DEFAULT 0,
+                free_ip_limit INTEGER NOT NULL DEFAULT 0,
+                max_slots INTEGER NOT NULL DEFAULT 0,
+                max_accounts_per_user INTEGER NOT NULL DEFAULT 0,
+                expiry_notify_days INTEGER NOT NULL DEFAULT 3,
+                mullog_enabled TEXT NOT NULL DEFAULT '1',
+                mullog_default_minutes INTEGER NOT NULL DEFAULT 20,
+                updated_at INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS server_products (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                server_id INTEGER NOT NULL,
+                protocol TEXT NOT NULL,
+                days INTEGER NOT NULL,
+                label TEXT NOT NULL DEFAULT '',
+                price INTEGER NOT NULL,
+                ip_limit INTEGER NOT NULL DEFAULT 2,
+                quota_gb INTEGER NOT NULL DEFAULT 0,
+                active INTEGER NOT NULL DEFAULT 1,
+                sort INTEGER NOT NULL DEFAULT 0,
+                updated_at INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(server_id, protocol, days)
+            );
+            CREATE TABLE IF NOT EXISTS node_account_status (
+                account_id INTEGER PRIMARY KEY,
+                server_id INTEGER NOT NULL,
+                username TEXT NOT NULL DEFAULT '',
+                service TEXT NOT NULL DEFAULT '',
+                protocol TEXT NOT NULL DEFAULT '',
+                usage_bytes INTEGER NOT NULL DEFAULT 0,
+                quota_bytes INTEGER NOT NULL DEFAULT 0,
+                ip_limit INTEGER NOT NULL DEFAULT 0,
+                expires_at INTEGER NOT NULL DEFAULT 0,
+                online INTEGER NOT NULL DEFAULT 0,
+                sessions_json TEXT NOT NULL DEFAULT '[]',
+                mullog_json TEXT NOT NULL DEFAULT '{}',
+                updated_at INTEGER NOT NULL DEFAULT 0,
+                sync_error TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS node_health (
+                server_id INTEGER PRIMARY KEY,
+                ok INTEGER NOT NULL DEFAULT 0,
+                latency_ms INTEGER NOT NULL DEFAULT 0,
+                services_json TEXT NOT NULL DEFAULT '{}',
+                accounts_json TEXT NOT NULL DEFAULT '{}',
+                version TEXT NOT NULL DEFAULT '',
+                updated_at INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS payg_billing (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                payg_id INTEGER NOT NULL,
+                period_start INTEGER NOT NULL,
+                period_end INTEGER NOT NULL,
+                usage_bytes INTEGER NOT NULL DEFAULT 0,
+                amount_milli INTEGER NOT NULL DEFAULT 0,
+                idempotency_key TEXT UNIQUE NOT NULL,
+                created_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS node_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                server_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                idempotency_key TEXT UNIQUE NOT NULL,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                state TEXT NOT NULL DEFAULT 'PENDING',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL DEFAULT 0
+            );
             """
         )
+        for table, column, ddl in (
+            ("servers", "api_key", "TEXT NOT NULL DEFAULT ''"),
+            ("servers", "secret_enc", "TEXT NOT NULL DEFAULT ''"),
+            ("servers", "isp", "TEXT NOT NULL DEFAULT ''"),
+            ("servers", "country_code", "TEXT NOT NULL DEFAULT ''"),
+            ("servers", "city", "TEXT NOT NULL DEFAULT ''"),
+            ("servers", "last_latency_ms", "INTEGER NOT NULL DEFAULT 0"),
+            ("servers", "weight", "INTEGER NOT NULL DEFAULT 1"),
+            ("servers", "notes", "TEXT NOT NULL DEFAULT ''"),
+            ("accounts", "server_id", "INTEGER NOT NULL DEFAULT 0"),
+            ("orders", "server_id", "INTEGER NOT NULL DEFAULT 0"),
+            ("payg_accounts", "server_id", "INTEGER NOT NULL DEFAULT 0"),
+            ("usage_daily", "server_id", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            _ensure_column(conn, table, column, ddl)
         conn.commit()
     finally:
         conn.close()
-
 
 class NodeError(Exception):
     pass
@@ -788,6 +885,388 @@ def server_by_id(server_id: int):
         return conn.execute("SELECT * FROM servers WHERE id=?", (int(server_id),)).fetchone()
     finally:
         conn.close()
+
+def local_isp_name() -> str:
+    try:
+        value = Path("/etc/xray/isp").read_text(encoding="utf-8", errors="ignore").strip()
+    except Exception:
+        value = ""
+    if not value:
+        try:
+            value = str(get_settings().get("server_isp") or "").strip()
+        except Exception:
+            value = ""
+    return (value or "VPS Utama")[:80]
+
+def server_settings_for(server_id: int, settings: dict | None = None) -> dict:
+    """Pengaturan per server. server_id=0 berarti VPS utama (A)."""
+    settings = settings or get_settings()
+    keys = (
+        "free_enabled", "premium_enabled", "payg_enabled",
+        "ssh_enabled", "xray_enabled", "vmess_enabled", "vless_enabled", "trojan_enabled",
+        "maintenance", "mullog_enabled",
+    )
+    defaults = {key: str(settings.get(key, "1")) for key in keys}
+    sid = int(server_id or 0)
+    if sid <= 0:
+        return defaults
+    conn = db_connect()
+    try:
+        row = conn.execute("SELECT * FROM server_settings WHERE server_id=?", (sid,)).fetchone()
+    finally:
+        conn.close()
+    if row:
+        for key in keys:
+            if key in row.keys():
+                defaults[key] = str(row[key])
+    defaults["max_slots"] = 0
+    server = server_by_id(sid)
+    if server:
+        defaults["max_slots"] = int(server["max_slots"] or 0)
+    return defaults
+
+def server_choice_list(kind: str = "free", settings: dict | None = None) -> list[dict]:
+    """Daftar server yang boleh dipilih user untuk kategori free/premium/payg."""
+    kind = kind if kind in ("free", "premium", "payg") else "free"
+    enabled_key = kind + "_enabled"
+    now = int(time.time())
+    choices: list[dict] = []
+    info = server_info()
+    local_ss = server_settings_for(0, settings)
+    if local_ss.get(enabled_key, "1") == "1" and local_ss.get("maintenance", "0") != "1":
+        choices.append({
+            "id": 0,
+            "code": "utama",
+            "name": (info.get("name") or "VPS Utama")[:80],
+            "region": (info.get("name") or "")[:80],
+            "city": (info.get("city") or "")[:80],
+            "isp": local_isp_name(),
+            "country_code": (info.get("code") or "").upper(),
+            "flag": info.get("flag") or "🌐",
+            "online": True,
+            "local": True,
+            "last_seen": now,
+        })
+    conn = db_connect()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM servers WHERE status='active' ORDER BY is_default DESC, id"
+        ).fetchall()
+    finally:
+        conn.close()
+    for row in rows:
+        ss = server_settings_for(int(row["id"]), settings)
+        if ss.get(enabled_key, "1") != "1" or ss.get("maintenance", "0") == "1":
+            continue
+        last = int(row["last_seen"] or 0)
+        choices.append({
+            "id": int(row["id"]),
+            "code": str(row["code"] or ""),
+            "name": str(row["name"] or row["region"] or row["code"])[:80],
+            "region": str(row["region"] or "")[:80],
+            "city": str(row["city"] or "")[:80],
+            "isp": str(row["isp"] or "")[:80],
+            "country_code": str(row["country_code"] or "").upper(),
+            "flag": flag_emoji(str(row["country_code"] or "")),
+            "online": last > 0 and now - last < 300,
+            "local": False,
+            "last_seen": last,
+        })
+    return choices
+
+def server_picker_html(kind: str = "free", selected: int = 0,
+                       settings: dict | None = None) -> str:
+    choices = server_choice_list(kind, settings)
+    if not choices:
+        return (
+            '<div class="notice notice-warn"><strong>Belum ada server aktif.</strong> '
+            'Coba lagi nanti atau hubungi admin.</div>'
+        )
+    ids = [item["id"] for item in choices]
+    selected = int(selected or 0)
+    if selected not in ids:
+        selected = ids[0]
+    cards = []
+    for item in choices:
+        online = bool(item.get("online"))
+        subtitle = " · ".join(
+            part for part in (item.get("city") or item.get("region"), item.get("isp")) if part
+        )
+        badge = '<span class="server-pick-badge">Utama</span>' if item.get("local") else ""
+        state = (
+            '<span class="server-pick-state is-online">Online</span>'
+            if online
+            else '<span class="server-pick-state">Belum terhubung</span>'
+        )
+        cards.append(
+            f'<label class="server-pick-card{" selected" if item["id"] == selected else ""}">'
+            f'<input type="radio" name="server_id" value="{item["id"]}"'
+            f'{" checked" if item["id"] == selected else ""}>'
+            f'<span class="server-pick-flag" aria-hidden="true">{item["flag"]}</span>'
+            f'<span class="server-pick-copy"><b>{e(item["name"])} {badge}</b>'
+            f'<small>{e(subtitle or item["code"])}</small>'
+            f'<small class="server-pick-code">{e(item["code"])}</small></span>'
+            f'{state}<span class="server-pick-mark" aria-hidden="true">✓</span></label>'
+        )
+    return (
+        '<fieldset class="field-group server-pick">'
+        '<legend><span>03</span> Pilih server</legend>'
+        '<p class="mini-label">Pilih lokasi akun dibuat. Nama sama bisa berasal dari ISP berbeda.</p>'
+        '<div class="server-pick-grid">'
+        + "".join(cards)
+        + "</div></fieldset>"
+    )
+
+def server_label_map() -> dict[int, str]:
+    info = server_info()
+    labels = {0: "%s · %s" % (info.get("name") or "VPS Utama", local_isp_name())}
+    conn = db_connect()
+    try:
+        rows = conn.execute("SELECT id,name,region,isp,code FROM servers ORDER BY id").fetchall()
+    finally:
+        conn.close()
+    for row in rows:
+        name = str(row["name"] or row["region"] or row["code"])
+        isp = str(row["isp"] or "").strip()
+        labels[int(row["id"])] = (name + (" · " + isp if isp else ""))[:120]
+    return labels
+
+def user_server(server_id: int, kind: str) -> sqlite3.Row | None:
+    """Validasi server pilihan user. server_id=0 berarti VPS utama."""
+    sid = int(server_id or 0)
+    if sid <= 0:
+        ss = server_settings_for(0)
+        if ss.get(kind + "_enabled", "1") != "1":
+            raise ValueError("Kategori %s sedang ditutup admin." % kind)
+        if ss.get("maintenance", "0") == "1":
+            raise ValueError("Website sedang dalam perawatan.")
+        return None
+    server = server_by_id(sid)
+    if not server or str(server["status"]) != "active":
+        raise ValueError("Server yang dipilih sedang tidak aktif.")
+    ss = server_settings_for(sid)
+    if ss.get(kind + "_enabled", "1") != "1":
+        raise ValueError("Kategori %s di server %s sedang ditutup." % (kind, server["name"]))
+    if ss.get("maintenance", "0") == "1":
+        raise ValueError("Server %s sedang dalam perawatan." % server["name"])
+    return server
+
+def server_capacity_ok(server) -> bool:
+    if not server:
+        return True
+    max_slots = int(server["max_slots"] or 0)
+    if max_slots <= 0:
+        return True
+    conn = db_connect()
+    try:
+        used = int(conn.execute(
+            "SELECT COUNT(*) AS n FROM accounts WHERE server_id=? AND status='active'",
+            (int(server["id"]),),
+        ).fetchone()["n"])
+        used += int(conn.execute(
+            "SELECT COUNT(*) AS n FROM orders WHERE server_id=? AND status='COMPLETED'",
+            (int(server["id"]),),
+        ).fetchone()["n"])
+    finally:
+        conn.close()
+    return used < max_slots
+
+def node_account_path(service: str, protocol: str, username: str) -> str:
+    proto = "ssh" if service == "ssh" else (protocol or "")
+    return "/v1/accounts/%s/%s/%s" % (service, proto, username)
+
+def node_create_account(server, service: str, protocol: str, username: str, days: int,
+                        ip_limit: int, quota_gb: int, idempotency_key: str = "",
+                        timeout: int = 180) -> dict:
+    payload = {
+        "service": service,
+        "protocol": "ssh" if service == "ssh" else (protocol or ""),
+        "username": username,
+        "days": int(days),
+        "quota_gb": int(quota_gb),
+        "ip_limit": int(ip_limit),
+    }
+    return node_request(server, "POST", "/v1/accounts", payload,
+                        timeout=timeout, idempotency_key=idempotency_key)
+
+def remove_account_on_server(server_id: int, service: str, protocol: str, username: str) -> None:
+    sid = int(server_id or 0)
+    if sid <= 0:
+        if service == "ssh":
+            remove_ssh_account(username)
+        elif protocol in PROTOCOLS:
+            remove_xray_account(protocol, username)
+        return
+    server = server_by_id(sid)
+    if not server:
+        raise ValueError("Server akun tidak ditemukan.")
+    data = node_request(server, "DELETE", node_account_path(service, protocol, username), timeout=90)
+    if not data.get("ok") and data.get("code") != "not_found":
+        raise ValueError(str(data.get("error") or "Gagal menghapus akun di node."))
+
+def cache_node_account_status(account_id: int, server_id: int, username: str,
+                              service: str, protocol: str, data: dict) -> None:
+    sessions = data.get("sessions") if isinstance(data.get("sessions"), list) else []
+    mullog = data.get("mullog") if isinstance(data.get("mullog"), dict) else None
+    conn = db_connect()
+    try:
+        conn.execute(
+            "INSERT INTO node_account_status(account_id,server_id,username,service,protocol,"
+            "usage_bytes,quota_bytes,ip_limit,expires_at,online,sessions_json,mullog_json,"
+            "updated_at,sync_error) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'') "
+            "ON CONFLICT(account_id) DO UPDATE SET server_id=excluded.server_id,"
+            "username=excluded.username,service=excluded.service,protocol=excluded.protocol,"
+            "usage_bytes=excluded.usage_bytes,quota_bytes=excluded.quota_bytes,"
+            "ip_limit=excluded.ip_limit,expires_at=excluded.expires_at,online=excluded.online,"
+            "sessions_json=excluded.sessions_json,mullog_json=excluded.mullog_json,"
+            "updated_at=excluded.updated_at,sync_error=''",
+            (
+                int(account_id), int(server_id), username, service, protocol or "",
+                int(data.get("usage_bytes") or 0), int(data.get("quota_bytes") or 0),
+                int(data.get("ip_limit") or 0), int(data.get("expires_at") or 0),
+                1 if int(data.get("online") or 0) > 0 else 0,
+                json.dumps(sessions[:50], ensure_ascii=False),
+                json.dumps(mullog or {}, ensure_ascii=False),
+                int(time.time()),
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+def cached_node_account(account_id: int) -> dict | None:
+    conn = db_connect()
+    try:
+        row = conn.execute("SELECT * FROM node_account_status WHERE account_id=?",
+                           (int(account_id),)).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return None
+    try:
+        sessions = json.loads(row["sessions_json"] or "[]")
+    except Exception:
+        sessions = []
+    try:
+        mullog = json.loads(row["mullog_json"] or "{}")
+    except Exception:
+        mullog = {}
+    return {
+        "usage_bytes": int(row["usage_bytes"] or 0),
+        "quota_bytes": int(row["quota_bytes"] or 0),
+        "ip_limit": int(row["ip_limit"] or 0),
+        "expires_at": int(row["expires_at"] or 0),
+        "online": int(row["online"] or 0),
+        "sessions": sessions if isinstance(sessions, list) else [],
+        "mullog": mullog if isinstance(mullog, dict) else {},
+        "updated_at": int(row["updated_at"] or 0),
+        "sync_error": row["sync_error"] or "",
+    }
+
+_REMOTE_REFRESH_LOCK = threading.Lock()
+_REMOTE_REFRESHING: set[int] = set()
+
+def refresh_remote_account(account_id: int) -> None:
+    conn = db_connect()
+    try:
+        row = conn.execute("SELECT * FROM accounts WHERE id=?", (int(account_id),)).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return
+    sid = int(row["server_id"] or 0) if "server_id" in row.keys() else 0
+    if sid <= 0:
+        return
+    server = server_by_id(sid)
+    if not server:
+        return
+    try:
+        data = node_request(
+            server, "GET",
+            node_account_path(row["service"], row["protocol"], row["username"]),
+            timeout=8,
+        )
+        if data.get("ok"):
+            cache_node_account_status(int(row["id"]), sid, row["username"],
+                                     row["service"], row["protocol"], data)
+        else:
+            conn = db_connect()
+            try:
+                conn.execute(
+                    "UPDATE node_account_status SET sync_error=?, updated_at=? WHERE account_id=?",
+                    (str(data.get("error") or "not found")[:200], int(time.time()), int(row["id"])),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+    except NodeError as exc:
+        conn = db_connect()
+        try:
+            conn.execute(
+                "INSERT INTO node_account_status(account_id,server_id,username,service,protocol,"
+                "updated_at,sync_error) VALUES(?,?,?,?,?,?,?) "
+                "ON CONFLICT(account_id) DO UPDATE SET sync_error=excluded.sync_error,"
+                "updated_at=excluded.updated_at",
+                (int(row["id"]), sid, row["username"], row["service"], row["protocol"] or "",
+                 int(time.time()), str(exc)[:200]),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+def schedule_remote_refresh(account_id: int) -> None:
+    aid = int(account_id)
+    with _REMOTE_REFRESH_LOCK:
+        if aid in _REMOTE_REFRESHING:
+            return
+        _REMOTE_REFRESHING.add(aid)
+
+    def worker():
+        try:
+            refresh_remote_account(aid)
+        finally:
+            with _REMOTE_REFRESH_LOCK:
+                _REMOTE_REFRESHING.discard(aid)
+
+    threading.Thread(target=worker, name="node-account-refresh", daemon=True).start()
+
+def remote_online_count(server_id: int, service: str, protocol: str, username: str) -> int | None:
+    server = server_by_id(int(server_id))
+    if not server:
+        return None
+    try:
+        data = node_request(server, "GET", node_account_path(service, protocol, username), timeout=8)
+    except NodeError:
+        return None
+    if not data.get("ok"):
+        return 0
+    return max(int(data.get("online") or 0), len(data.get("sessions") or []))
+
+def remote_is_held(server_id: int, service: str, protocol: str, username: str) -> bool | None:
+    server = server_by_id(int(server_id))
+    if not server:
+        return None
+    try:
+        data = node_request(server, "GET", node_account_path(service, protocol, username), timeout=8)
+    except NodeError:
+        return None
+    if not data.get("ok"):
+        return False
+    return bool(data.get("mullog"))
+
+def remote_mullog(server_id: int, service: str, protocol: str, username: str,
+                  action: str) -> tuple[bool, str]:
+    server = server_by_id(int(server_id))
+    if not server:
+        return False, "Server tidak ditemukan."
+    try:
+        data = node_request(
+            server, "POST", node_account_path(service, protocol, username) + "/" + action,
+            {}, timeout=45,
+        )
+    except NodeError as exc:
+        return False, str(exc)
+    return bool(data.get("ok")), str(data.get("error") or "")
 
 
 def node_request(server, method: str, path: str, payload=None, timeout: int = 20,
@@ -836,7 +1315,25 @@ def node_request(server, method: str, path: str, payload=None, timeout: int = 20
         with urllib.request.urlopen(req, timeout=timeout,
                                     context=ssl.create_default_context()) as resp:
             raw = resp.read().decode("utf-8", "replace")
-            return json.loads(raw or "{}")
+            data = json.loads(raw or "{}")
+            try:
+                sid = int(server["id"])
+            except Exception:
+                sid = 0
+            if sid > 0:
+                try:
+                    conn = db_connect()
+                    try:
+                        conn.execute(
+                            "UPDATE servers SET last_seen=?, last_version=?, last_error='' WHERE id=?",
+                            (int(time.time()), str(data.get("version") or "")[:30], sid),
+                        )
+                        conn.commit()
+                    finally:
+                        conn.close()
+                except Exception:
+                    logger.warning("gagal update last_seen node %s", sid)
+            return data
     except urllib.error.HTTPError as exc:
         raw = exc.read().decode("utf-8", "replace")
         try:
@@ -1212,6 +1709,7 @@ def server_info() -> dict:
         "city": city,
         "note": note,
         "flag": flag_emoji(code),
+        "isp": local_isp_name(),
         "source": (settings.get("server_source") or "").strip(),
         "last_check": (settings.get("server_last_check") or "").strip(),
     }
@@ -2046,8 +2544,11 @@ def payg_account_is_blocked(service: str, protocol: str, username: str) -> tuple
             pass
     return True, ""
 
-def payg_hold_account(service: str, protocol: str, username: str) -> tuple[bool, str]:
+def payg_hold_account(service: str, protocol: str, username: str,
+                      server_id: int = 0) -> tuple[bool, str]:
     """Kunci akun tanpa timer otomatis + verifikasi config benar-benar tercabut."""
+    if int(server_id or 0) > 0:
+        return remote_mullog(int(server_id), service, protocol, username, "suspend")
     state = payg_jeda_state(service, protocol, username)
     if state and not state.get("hold"):
         _jeda_call(*_jeda_args("release", service, protocol, username))
@@ -2065,7 +2566,10 @@ def payg_hold_account(service: str, protocol: str, username: str) -> tuple[bool,
         return False, reason
     return True, ""
 
-def payg_release_account(service: str, protocol: str, username: str) -> tuple[bool, str]:
+def payg_release_account(service: str, protocol: str, username: str,
+                         server_id: int = 0) -> tuple[bool, str]:
+    if int(server_id or 0) > 0:
+        return remote_mullog(int(server_id), service, protocol, username, "resume")
     rc, out = _jeda_call(*_jeda_args("release", service, protocol, username))
     if rc not in (0, 3):
         return False, out or f"exit {rc}"
@@ -2113,7 +2617,8 @@ def payg_existing(user_id: int, service: str, protocol: str) -> sqlite3.Row | No
     finally:
         conn.close()
 
-def payg_create_account(user_id: int, service: str, protocol: str, ip: str, user_agent: str) -> sqlite3.Row:
+def payg_create_account(user_id: int, service: str, protocol: str, ip: str, user_agent: str,
+                        server_id: int = 0) -> sqlite3.Row:
     settings = get_settings()
     if settings.get("maintenance") == "1":
         raise ValueError("Website sedang dalam perawatan. Silakan coba lagi nanti.")
@@ -2125,6 +2630,14 @@ def payg_create_account(user_id: int, service: str, protocol: str, ip: str, user
         raise ValueError("Pilih protokol Xray terlebih dahulu.")
     if service == "ssh":
         protocol = ""
+    server_id = int(server_id or 0)
+    server = user_server(server_id, "payg")
+    if server:
+        ss = server_settings_for(server_id, settings)
+        if ss.get(f"{service}_enabled", "1") != "1":
+            raise ValueError("Layanan ini di server terpilih sedang ditutup.")
+        if service == "xray" and ss.get(f"{protocol}_enabled", "1") != "1":
+            raise ValueError("Protokol ini di server terpilih sedang ditutup.")
     if settings.get(f"{service}_enabled", "1") != "1":
         raise ValueError(f"Layanan {SERVICES[service]['label']} sedang dinonaktifkan admin.")
     if service == "xray" and settings.get(f"{protocol}_enabled", "1") != "1":
@@ -2153,7 +2666,19 @@ def payg_create_account(user_id: int, service: str, protocol: str, ip: str, user
     account_id = 0
     payg_id = 0
     with CREATE_LOCK:
-        if service == "ssh":
+        if server and not server_capacity_ok(server):
+            raise ValueError("Slot server %s sudah penuh. Pilih server lain." % server["name"])
+        if server:
+            try:
+                data = node_create_account(
+                    server, service, protocol, username, 3650, ip_limit, quota_gb,
+                    idempotency_key="payg-%s-%s" % (int(user_id), username),
+                )
+            except NodeError as exc:
+                raise ValueError("Gagal membuat akun di %s: %s" % (server["name"], exc))
+            ok = bool(data.get("ok"))
+            output = str(data.get("profile") or data.get("error") or "")
+        elif service == "ssh":
             ok, output, log = create_ssh_account(
                 username, password, 3650, ip_limit, quota_gb, extra_env=payg_env
             )
@@ -2170,25 +2695,26 @@ def payg_create_account(user_id: int, service: str, protocol: str, ip: str, user
             conn.execute("BEGIN IMMEDIATE")
             cur = conn.execute(
                 "INSERT INTO accounts(token,username,service,protocol,days,ip,created_at,created_day,"
-                "expires_at,status,output,error,user_agent,user_id,kind) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'payg')",
+                "expires_at,status,output,error,user_agent,user_id,kind,server_id) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'payg',?)",
                 (
                     token, username, service, protocol, 0, ip, now, today_key(),
-                    now + 3650 * 86400, "active", output, "", (user_agent or "")[:300], int(user_id),
+                    now + 3650 * 86400, "active", output, "", (user_agent or "")[:300],
+                    int(user_id), server_id,
                 ),
             )
             account_id = int(cur.lastrowid)
             cur_payg = conn.execute(
-                "INSERT INTO payg_accounts(user_id,account_id,service,protocol,username,state,created_at)"
-                " VALUES(?,?,?,?,?,?,?)",
-                (int(user_id), account_id, service, protocol, username, PAYG_PAUSED, now),
+                "INSERT INTO payg_accounts(user_id,account_id,service,protocol,username,state,created_at,server_id)"
+                " VALUES(?,?,?,?,?,?,?,?)",
+                (int(user_id), account_id, service, protocol, username, PAYG_PAUSED, now, server_id),
             )
             payg_id = int(cur_payg.lastrowid)
             conn.commit()
         except Exception as exc:
             conn.rollback()
             try:
-                remove_ssh_account(username) if service == "ssh" else remove_xray_account(protocol, username)
+                remove_account_on_server(server_id, service, protocol, username)
             except Exception:
                 logger.warning("gagal hapus akun PAYG setelah insert gagal: %s", traceback.format_exc())
             if isinstance(exc, sqlite3.IntegrityError):
@@ -2196,10 +2722,10 @@ def payg_create_account(user_id: int, service: str, protocol: str, ip: str, user
             raise
         finally:
             conn.close()
-    held, err = payg_hold_account(service, protocol, username)
+    held, err = payg_hold_account(service, protocol, username, server_id)
     if not held:
         try:
-            remove_ssh_account(username) if service == "ssh" else remove_xray_account(protocol, username)
+            remove_account_on_server(server_id, service, protocol, username)
         except Exception:
             logger.warning("gagal hapus akun PAYG setelah hold gagal: %s", traceback.format_exc())
         conn = db_connect()
@@ -2226,7 +2752,8 @@ def payg_start(payg_id: int, user_id: int) -> sqlite3.Row:
     state = payg_jeda_state(row["service"], row["protocol"], row["username"])
     if state and not state.get("hold"):
         raise ValueError("Akun sedang dibekukan mullog. Tunggu sampai pulih lalu coba lagi.")
-    ok, err = payg_release_account(row["service"], row["protocol"], row["username"])
+    ok, err = payg_release_account(row["service"], row["protocol"], row["username"],
+                                   int(row["server_id"] or 0))
     if not ok:
         raise ValueError("Gagal menyalakan akun. Coba lagi atau hubungi admin.")
     now = int(time.time())
@@ -2250,7 +2777,8 @@ def payg_stop(payg_id: int, user_id: int) -> sqlite3.Row:
     if row["state"] == PAYG_RUNNING:
         payg_bill_one(int(payg_id), int(time.time()))
         row = payg_row_by_id(payg_id, user_id)
-    ok, err = payg_hold_account(row["service"], row["protocol"], row["username"])
+    ok, err = payg_hold_account(row["service"], row["protocol"], row["username"],
+                                int(row["server_id"] or 0))
     if not ok:
         raise ValueError("Gagal menghentikan akun. Coba lagi atau hubungi admin.")
     new_state = PAYG_SUSPENDED if wallet_balance_milli(int(user_id)) <= 0 else PAYG_PAUSED
@@ -2272,7 +2800,10 @@ def payg_bill_one(payg_id: int, now: int | None = None) -> None:
         row = payg_row_by_id(payg_id)
         if not row or row["state"] != PAYG_RUNNING:
             return
-        if payg_jeda_state(row["service"], row["protocol"], row["username"]):
+        sid = int(row["server_id"] or 0)
+        held = (remote_is_held(sid, row["service"], row["protocol"], row["username"])
+                if sid > 0 else bool(payg_jeda_state(row["service"], row["protocol"], row["username"])))
+        if held:
             conn = db_connect()
             try:
                 conn.execute("UPDATE payg_accounts SET last_billed_at=? WHERE id=?", (now, int(payg_id)))
@@ -2319,7 +2850,7 @@ def payg_bill_one(payg_id: int, now: int | None = None) -> None:
         finally:
             conn.close()
         if state == PAYG_SUSPENDED:
-            ok, err = payg_hold_account(row["service"], row["protocol"], row["username"])
+            ok, err = payg_hold_account(row["service"], row["protocol"], row["username"], sid)
             if not ok:
                 conn = db_connect()
                 try:
@@ -2340,7 +2871,7 @@ def payg_enforce_holds() -> None:
     conn = db_connect()
     try:
         rows = conn.execute(
-            "SELECT id, service, protocol, username, state FROM payg_accounts WHERE state IN (?,?)",
+            "SELECT id, service, protocol, username, state, server_id FROM payg_accounts WHERE state IN (?,?)",
             (PAYG_PAUSED, PAYG_SUSPENDED),
         ).fetchall()
     finally:
@@ -2349,7 +2880,8 @@ def payg_enforce_holds() -> None:
         blocked, _reason = payg_account_is_blocked(row["service"], row["protocol"], row["username"])
         if blocked:
             continue
-        ok, err = payg_hold_account(row["service"], row["protocol"], row["username"])
+        ok, err = payg_hold_account(row["service"], row["protocol"], row["username"],
+                                    int(row["server_id"] or 0))
         conn = db_connect()
         try:
             if ok:
@@ -2373,14 +2905,17 @@ def payg_idle_check(now: int | None = None) -> None:
     conn = db_connect()
     try:
         rows = conn.execute(
-            "SELECT id,user_id,service,protocol,username,last_seen_at FROM payg_accounts WHERE state=?",
+            "SELECT id,user_id,service,protocol,username,last_seen_at,server_id FROM payg_accounts WHERE state=?",
             (PAYG_RUNNING,),
         ).fetchall()
     finally:
         conn.close()
     for row in rows:
         try:
-            if row["service"] == "ssh":
+            sid = int(row["server_id"] or 0)
+            if sid > 0:
+                active = remote_online_count(sid, row["service"], row["protocol"], row["username"])
+            elif row["service"] == "ssh":
                 active = ssh_active_session_count(row["username"])
             else:
                 active = xray_online_count(row["username"])
@@ -3410,7 +3945,8 @@ def create_xray_account(
     return False, reason, log
 
 
-def create_account(service: str, protocol: str, days: int, ip: str, user_agent: str, user_id: int = 0) -> dict:
+def create_account(service: str, protocol: str, days: int, ip: str, user_agent: str,
+                   user_id: int = 0, server_id: int = 0) -> dict:
     settings = get_settings()
     quota = quota_state(settings)
     if settings.get("maintenance") == "1":
@@ -3421,6 +3957,15 @@ def create_account(service: str, protocol: str, days: int, ip: str, user_agent: 
         raise ValueError(f"Layanan {SERVICES[service]['label']} sedang dinonaktifkan admin.")
     if service == "xray" and settings.get(f"{protocol}_enabled", "1") != "1":
         raise ValueError(f"Protokol {PROTOCOLS[protocol]['label']} sedang ditutup admin.")
+    server_id = int(server_id or 0)
+    server = user_server(server_id, "free")
+    if server:
+        # Pengaturan per server, bila admin membedakan protokol di node tertentu.
+        ss = server_settings_for(server_id, settings)
+        if ss.get(f"{service}_enabled", "1") != "1":
+            raise ValueError(f"Layanan {SERVICES[service]['label']} di server ini sedang ditutup.")
+        if service == "xray" and ss.get(f"{protocol}_enabled", "1") != "1":
+            raise ValueError(f"Protokol {PROTOCOLS[protocol]['label']} di server ini sedang ditutup.")
     q = quota["services"][service][str(days)]
     if q["limit"] <= 0 or q["remaining"] <= 0:
         raise ValueError(
@@ -3447,20 +3992,40 @@ def create_account(service: str, protocol: str, days: int, ip: str, user_agent: 
             raise ValueError("Kuota hari ini baru saja habis. Silakan coba lagi besok.")
         if per_ip_limit > 0 and per_ip_used(ip, service) >= per_ip_limit:
             raise ValueError("Batas pembuatan akun dari IP Anda hari ini sudah tercapai.")
-
-        if service == "ssh":
-            ok, output, log = create_ssh_account(username, password, days, ip_limit, quota_gb)
-        else:
-            ok, output, log = create_xray_account(protocol, username, days, ip_limit, quota_gb)
+        if server and not server_capacity_ok(server):
+            raise ValueError("Slot server %s sudah penuh. Pilih server lain." % server["name"])
 
         now = int(time.time())
+        expires_at = now + days * 86400
+        if server:
+            try:
+                data = node_create_account(
+                    server, service, protocol, username, days, ip_limit, quota_gb,
+                    idempotency_key="free-%s-%s" % (int(user_id or 0), username),
+                )
+            except NodeError as exc:
+                raise ValueError("Gagal membuat akun di %s: %s" % (server["name"], exc))
+            ok = bool(data.get("ok"))
+            output = str(data.get("profile") or data.get("error") or "")
+            expires_at = int(data.get("expires_at") or expires_at)
+            if not ok:
+                logger.error("pembuatan akun node gagal %s: %s", username, output)
+                raise ValueError(
+                    "Pembuatan akun di %s gagal: %s" % (server["name"], output[:200] or "tanpa keterangan")
+                )
+        else:
+            if service == "ssh":
+                ok, output, log = create_ssh_account(username, password, days, ip_limit, quota_gb)
+            else:
+                ok, output, log = create_xray_account(protocol, username, days, ip_limit, quota_gb)
+
         token = secrets.token_urlsafe(32)
         conn = db_connect()
         try:
-            conn.execute(
+            cur = conn.execute(
                 "INSERT INTO accounts(token,username,service,protocol,days,ip,created_at,"
-                "created_day,expires_at,status,output,error,user_agent,user_id) "
-                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "created_day,expires_at,status,output,error,user_agent,user_id,server_id) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     token,
                     username,
@@ -3470,24 +4035,23 @@ def create_account(service: str, protocol: str, days: int, ip: str, user_agent: 
                     ip,
                     now,
                     today_key(),
-                    now + days * 86400,
+                    expires_at,
                     "active" if ok else "failed",
                     output if ok else "",
                     "" if ok else output or "gagal",
                     user_agent[:300],
                     int(user_id or 0),
+                    server_id,
                 ),
             )
+            account_id = int(cur.lastrowid)
             conn.commit()
         except Exception:
             logger.error("gagal menyimpan akun %s ke database: %s", username, traceback.format_exc())
             if ok:
                 # Jangan tinggalkan akun yatim kalau database gagal ditulis.
                 try:
-                    if service == "ssh":
-                        remove_ssh_account(username)
-                    elif protocol in PROTOCOLS:
-                        remove_xray_account(protocol, username)
+                    remove_account_on_server(server_id, service, protocol, username)
                 except Exception:
                     logger.error("gagal rollback akun %s: %s", username, traceback.format_exc())
             raise
@@ -3497,9 +4061,15 @@ def create_account(service: str, protocol: str, days: int, ip: str, user_agent: 
         if not ok:
             logger.error("pembuatan akun gagal %s/%s: %s", service, username, output)
             raise ValueError("Pembuatan akun gagal di server. Silakan coba lagi atau hubungi admin.")
+        if server:
+            cache_node_account_status(account_id, server_id, username, service, protocol, {
+                "ok": True, "quota_bytes": quota_gb * 1024 ** 3,
+                "ip_limit": ip_limit, "expires_at": expires_at, "online": 0,
+                "sessions": [], "mullog": None,
+            })
         audit(
             "create",
-            f"{service}/{protocol or '-'} {username} {days}d ip={ip}",
+            f"{service}/{protocol or '-'} {username} {days}d ip={ip} server={server['code'] if server else 'utama'}",
             ip,
         )
         return {
@@ -3508,19 +4078,18 @@ def create_account(service: str, protocol: str, days: int, ip: str, user_agent: 
             "service": service,
             "protocol": protocol,
             "days": days,
-            "expires_at": now + days * 86400,
+            "expires_at": expires_at,
             "output": output,
+            "server_id": server_id,
         }
-
 
 def delete_account_record(row: sqlite3.Row) -> None:
     user = row["username"]
     if not USER_RE.match(user):
         raise ValueError("Username tidak aman untuk dihapus")
-    if row["service"] == "ssh":
-        remove_ssh_account(user)
-    elif row["service"] == "xray" and row["protocol"] in PROTOCOLS:
-        remove_xray_account(row["protocol"], user)
+    sid = int(row["server_id"] or 0) if "server_id" in row.keys() else 0
+    if row["service"] == "ssh" or (row["service"] == "xray" and row["protocol"] in PROTOCOLS):
+        remove_account_on_server(sid, row["service"], row["protocol"], user)
     else:
         raise ValueError("Data akun tidak valid")
     conn = db_connect()
@@ -4036,7 +4605,8 @@ def order_by_invoice(invoice: str) -> sqlite3.Row | None:
         conn.close()
 
 
-def create_premium_order(product_code: str, ip: str, user_agent: str, user_id: int = 0) -> sqlite3.Row:
+def create_premium_order(product_code: str, ip: str, user_agent: str, user_id: int = 0,
+                         server_id: int = 0) -> sqlite3.Row:
     settings = get_settings()
     if settings.get("maintenance") == "1":
         raise ValueError("Website sedang dalam perawatan. Silakan coba lagi nanti.")
@@ -4045,6 +4615,19 @@ def create_premium_order(product_code: str, ip: str, user_agent: str, user_id: i
     product = premium_product(product_code, active_only=True)
     if not product:
         raise ValueError("Paket premium tidak tersedia.")
+    server_id = int(server_id or 0)
+    server = user_server(server_id, "premium")
+    if server:
+        ss = server_settings_for(server_id, settings)
+        if product["protocol"] == "ssh" and ss.get("ssh_enabled", "1") != "1":
+            raise ValueError("SSH di server ini sedang ditutup.")
+        if product["protocol"] in PROTOCOLS and (
+            ss.get("xray_enabled", "1") != "1"
+            or ss.get(product["protocol"] + "_enabled", "1") != "1"
+        ):
+            raise ValueError("Protokol %s di server ini sedang ditutup." % product["protocol"].upper())
+        if not server_capacity_ok(server):
+            raise ValueError("Slot server %s sudah penuh. Pilih server lain." % server["name"])
     if product["protocol"] == "ssh" and settings.get("ssh_enabled", "1") != "1":
         raise ValueError("Protokol SSH sedang ditutup admin.")
     if product["protocol"] in PROTOCOLS and (
@@ -4078,8 +4661,8 @@ def create_premium_order(product_code: str, ip: str, user_agent: str, user_id: i
         try:
             conn.execute(
                 "INSERT INTO orders(invoice,product_code,protocol,days,price,unique_code,total,"
-                "ip_limit,quota_gb,status,qr_string,buyer_ip,user_agent,created_at,expires_at,user_id) "
-                "VALUES(?,?,?,?,?,?,?,?,?,'PENDING',?,?,?,?,?,?)",
+                "ip_limit,quota_gb,status,qr_string,buyer_ip,user_agent,created_at,expires_at,user_id,server_id) "
+                "VALUES(?,?,?,?,?,?,?,?,?,'PENDING',?,?,?,?,?,?,?)",
                 (
                     invoice,
                     product["code"],
@@ -4096,6 +4679,7 @@ def create_premium_order(product_code: str, ip: str, user_agent: str, user_id: i
                     now,
                     expires,
                     int(user_id or 0),
+                    server_id,
                 ),
             )
             conn.commit()
@@ -4142,7 +4726,27 @@ def provision_premium_order(invoice: str) -> bool:
         if not row["reference"] and not row["paid_at"]:
             logger.warning("provision %s ditolak: belum ada pembayaran", invoice)
             return False
-        if row["protocol"] in PROTOCOLS:
+        sid = int(row["server_id"] or 0)
+        server = server_by_id(sid) if sid > 0 else None
+        if sid > 0 and (not server or str(server["status"]) != "active"):
+            username = ""
+            password = ""
+            ok, output = False, "Server premium tidak aktif."
+        elif sid > 0:
+            service = "ssh" if row["protocol"] == "ssh" else "xray"
+            username = make_username(service, "" if service == "ssh" else row["protocol"])
+            password = make_password() if service == "ssh" else ""
+            try:
+                data = node_create_account(
+                    server, service, row["protocol"], username, int(row["days"]),
+                    int(row["ip_limit"]), int(row["quota_gb"]),
+                    idempotency_key="premium-" + str(invoice),
+                )
+                ok = bool(data.get("ok"))
+                output = str(data.get("profile") or data.get("error") or "")
+            except NodeError as exc:
+                ok, output = False, str(exc)
+        elif row["protocol"] in PROTOCOLS:
             username = make_username("xray", row["protocol"])
             password = ""
             ok, output, log = create_xray_account(
@@ -4604,8 +5208,9 @@ def collect_ssh_ips(usernames: set[str], minutes: int = 30) -> dict[str, set[str
 
 
 def collect_online_ips(accounts: list[dict]) -> dict[str, list[str]]:
-    xray_users = {a["username"] for a in accounts if a["service"] == "xray"}
-    ssh_users = {a["username"] for a in accounts if a["service"] == "ssh"}
+    local = [a for a in accounts if int(a.get("server_id") or 0) == 0]
+    xray_users = {a["username"] for a in local if a["service"] == "xray"}
+    ssh_users = {a["username"] for a in local if a["service"] == "ssh"}
     merged: dict[str, set[str]] = {}
     for name, ips in collect_xray_ips(xray_users).items():
         merged.setdefault(name, set()).update(ips)
@@ -4618,12 +5223,13 @@ def usage_snapshot_once() -> None:
     conn = db_connect()
     try:
         rows = conn.execute(
-            "SELECT username, service, protocol, created_at FROM accounts WHERE status='active' "
+            "SELECT username, service, protocol, created_at FROM accounts "
+            "WHERE status='active' AND server_id=0 "
             "UNION ALL "
             "SELECT account_username AS username, "
             "CASE WHEN protocol='ssh' THEN 'ssh' ELSE 'xray' END AS service, "
             "protocol, COALESCE(paid_at, created_at) AS created_at FROM orders "
-            "WHERE status='COMPLETED' AND account_username<>''"
+            "WHERE status='COMPLETED' AND account_username<>'' AND server_id=0"
         ).fetchall()
     finally:
         conn.close()
@@ -4693,6 +5299,7 @@ def user_orders(user_id: int) -> list[sqlite3.Row]:
 def user_accounts(user_id: int) -> list[dict]:
     now = int(time.time())
     states = mullog_states()
+    labels = server_label_map()
     conn = db_connect()
     try:
         free_rows = conn.execute(
@@ -4718,13 +5325,30 @@ def user_accounts(user_id: int) -> list[dict]:
     accounts: list[dict] = []
     for row in free_rows:
         username = row["username"]
-        paths = account_paths(row["service"], row["protocol"], username)
-        quota = _int_file(paths["quota"])
-        usage = _int_file(paths["usage"])
-        ip_limit = _int_file(paths["ip"])
-        state = mullog_state_for(states, username, row["protocol"] if row["service"] == "xray" else "")
-        hold = bool(state.get("hold")) if state else False
-        expires = int(row["expires_at"] or 0)
+        sid = int(row["server_id"] or 0)
+        sessions: list[str] = []
+        state = None
+        if sid > 0:
+            cached = cached_node_account(int(row["id"]))
+            if not cached or now - int(cached.get("updated_at") or 0) > 60:
+                schedule_remote_refresh(int(row["id"]))
+            quota = int(cached.get("quota_bytes") or 0) if cached else 0
+            usage = int(cached.get("usage_bytes") or 0) if cached else 0
+            ip_limit = int(cached.get("ip_limit") or 0) if cached else 0
+            expires = int(cached.get("expires_at") or 0) if cached else int(row["expires_at"] or 0)
+            sessions = list(cached.get("sessions") or []) if cached else []
+            state = cached.get("mullog") if cached else None
+            today = 0
+            hold = bool(state and state.get("hold"))
+        else:
+            paths = account_paths(row["service"], row["protocol"], username)
+            quota = _int_file(paths["quota"])
+            usage = _int_file(paths["usage"])
+            ip_limit = _int_file(paths["ip"])
+            state = mullog_state_for(states, username, row["protocol"] if row["service"] == "xray" else "")
+            hold = bool(state.get("hold")) if state else False
+            expires = int(row["expires_at"] or 0)
+            today = usage_today(username, usage, int(row["created_at"] or 0))
         accounts.append({
             "source": "free",
             "username": username,
@@ -4740,11 +5364,14 @@ def user_accounts(user_id: int) -> list[dict]:
             "invoice": "",
             "quota_bytes": quota,
             "usage_bytes": usage,
-            "today_bytes": usage_today(username, usage, int(row["created_at"] or 0)),
+            "today_bytes": today,
             "ip_limit": ip_limit,
-            "suspended": None if hold else state,
+            "suspended": None if not hold else state,
             "hold": hold,
             "expired": expires < now,
+            "server_id": sid,
+            "server_label": labels.get(sid, ""),
+            "_cached_sessions": sessions,
         })
 
     for row in order_rows:
@@ -4752,18 +5379,32 @@ def user_accounts(user_id: int) -> list[dict]:
         if not username:
             continue
         service = "ssh" if row["protocol"] == "ssh" else "xray"
-        paths = account_paths(service, row["protocol"], username)
-        quota = _int_file(paths["quota"])
-        if quota <= 0 and int(row["quota_gb"] or 0) > 0:
-            quota = int(row["quota_gb"]) * 1024 ** 3
-        usage = _int_file(paths["usage"])
-        ip_limit = _int_file(paths["ip"])
-        if ip_limit <= 0 and int(row["ip_limit"] or 0) > 0:
-            ip_limit = int(row["ip_limit"])
-        base_time = int(row["paid_at"] or row["created_at"] or 0)
-        expires = base_time + int(row["days"] or 0) * 86400
-        state = mullog_state_for(states, username, row["protocol"] if service == "xray" else "")
-        hold = bool(state.get("hold")) if state else False
+        sid = int(row["server_id"] or 0)
+        if sid > 0:
+            quota = int(row["quota_gb"] or 0) * 1024 ** 3
+            usage = 0
+            ip_limit = int(row["ip_limit"] or 0)
+            sessions = []
+            hold = False
+            state = None
+            base_time = int(row["paid_at"] or row["created_at"] or 0)
+            expires = base_time + int(row["days"] or 0) * 86400
+            today = 0
+        else:
+            paths = account_paths(service, row["protocol"], username)
+            quota = _int_file(paths["quota"])
+            if quota <= 0 and int(row["quota_gb"] or 0) > 0:
+                quota = int(row["quota_gb"]) * 1024 ** 3
+            usage = _int_file(paths["usage"])
+            ip_limit = _int_file(paths["ip"])
+            if ip_limit <= 0 and int(row["ip_limit"] or 0) > 0:
+                ip_limit = int(row["ip_limit"])
+            base_time = int(row["paid_at"] or row["created_at"] or 0)
+            expires = base_time + int(row["days"] or 0) * 86400
+            state = mullog_state_for(states, username, row["protocol"] if service == "xray" else "")
+            hold = bool(state.get("hold")) if state else False
+            sessions = []
+            today = usage_today(username, usage, base_time)
         accounts.append({
             "source": "premium",
             "username": username,
@@ -4779,22 +5420,42 @@ def user_accounts(user_id: int) -> list[dict]:
             "invoice": row["invoice"],
             "quota_bytes": quota,
             "usage_bytes": usage,
-            "today_bytes": usage_today(username, usage, base_time),
+            "today_bytes": today,
             "ip_limit": ip_limit,
-            "suspended": None if hold else state,
+            "suspended": None if not hold else state,
             "hold": hold,
             "expired": expires < now,
+            "server_id": sid,
+            "server_label": labels.get(sid, ""),
+            "_cached_sessions": sessions,
         })
 
     for row in payg_rows:
         username = row["username"]
-        paths = account_paths(row["service"], row["protocol"], username)
-        quota = _int_file(paths["quota"])
-        usage = _int_file(paths["usage"])
-        ip_limit = _int_file(paths["ip"])
-        state = mullog_state_for(states, username, row["protocol"] if row["service"] == "xray" else "")
-        hold = bool(state.get("hold")) if state else False
-        expires = int(row["expires_at"] or 0)
+        sid = int(row["server_id"] or 0)
+        sessions: list[str] = []
+        state = None
+        if sid > 0:
+            cached = cached_node_account(int(row["id"]))
+            if not cached or now - int(cached.get("updated_at") or 0) > 60:
+                schedule_remote_refresh(int(row["id"]))
+            quota = int(cached.get("quota_bytes") or 0) if cached else 0
+            usage = int(cached.get("usage_bytes") or 0) if cached else 0
+            ip_limit = int(cached.get("ip_limit") or 0) if cached else 0
+            expires = int(cached.get("expires_at") or 0) if cached else int(row["expires_at"] or 0)
+            sessions = list(cached.get("sessions") or []) if cached else []
+            state = cached.get("mullog") if cached else None
+            hold = bool(state and state.get("hold"))
+            today = 0
+        else:
+            paths = account_paths(row["service"], row["protocol"], username)
+            quota = _int_file(paths["quota"])
+            usage = _int_file(paths["usage"])
+            ip_limit = _int_file(paths["ip"])
+            state = mullog_state_for(states, username, row["protocol"] if row["service"] == "xray" else "")
+            hold = bool(state.get("hold")) if state else False
+            expires = int(row["expires_at"] or 0)
+            today = usage_today(username, usage, int(row["created_at"] or 0))
         payg_state = str(row["payg_state"] or PAYG_PAUSED)
         accounts.append({
             "source": "payg",
@@ -4811,9 +5472,9 @@ def user_accounts(user_id: int) -> list[dict]:
             "invoice": "",
             "quota_bytes": quota,
             "usage_bytes": usage,
-            "today_bytes": usage_today(username, usage, int(row["created_at"] or 0)),
+            "today_bytes": today,
             "ip_limit": ip_limit,
-            "suspended": None if hold else state,
+            "suspended": None if not hold else state,
             "hold": hold,
             "expired": expires < now,
             "payg_id": int(row["payg_id"]),
@@ -4823,6 +5484,9 @@ def user_accounts(user_id: int) -> list[dict]:
             "payg_total_seconds": int(row["payg_total_seconds"] or 0),
             "payg_last_error": row["payg_last_error"] or "",
             "payg_rate": payg_rates(row["service"]),
+            "server_id": sid,
+            "server_label": labels.get(sid, ""),
+            "_cached_sessions": sessions,
         })
 
     balance_milli = wallet_balance_milli(user_id)
@@ -4836,9 +5500,12 @@ def user_accounts(user_id: int) -> list[dict]:
     accounts.sort(key=lambda item: item["created_at"], reverse=True)
     online = collect_online_ips(accounts)
     for item in accounts:
-        item["online_ips"] = online.get(item["username"], [])
+        cached_sessions = item.pop("_cached_sessions", None) or []
+        if int(item.get("server_id") or 0) > 0:
+            item["online_ips"] = cached_sessions
+        else:
+            item["online_ips"] = online.get(item["username"], [])
     return accounts
-
 
 def dashboard_data(user_id: int) -> dict:
     accounts = user_accounts(user_id)
@@ -5458,6 +6125,10 @@ class Handler(BaseHTTPRequestHandler):
             self.html(400, render_error(ts_msg, retry=True))
             return
         try:
+            try:
+                server_id = int(body.get("server_id", "0") or 0)
+            except ValueError:
+                server_id = 0
             account = create_account(
                 service,
                 protocol,
@@ -5465,6 +6136,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.client_ip(),
                 self.headers.get("User-Agent", ""),
                 int(session["user_id"]),
+                server_id=server_id,
             )
         except ValueError as exc:
             self.html(409, render_error(str(exc), retry=True))
@@ -5497,11 +6169,16 @@ class Handler(BaseHTTPRequestHandler):
             self.html(400, render_error("Paket premium tidak valid."))
             return
         try:
+            try:
+                server_id = int(body.get("server_id", "0") or 0)
+            except ValueError:
+                server_id = 0
             order = create_premium_order(
                 product_code,
                 self.client_ip(),
                 self.headers.get("User-Agent", ""),
                 int(session["user_id"]),
+                server_id=server_id,
             )
         except ValueError as exc:
             self.html(409, render_error(str(exc), retry=True))
@@ -5570,12 +6247,17 @@ class Handler(BaseHTTPRequestHandler):
         service = body.get("service", "")
         protocol = body.get("protocol", "")
         try:
+            try:
+                server_id = int(body.get("server_id", "0") or 0)
+            except ValueError:
+                server_id = 0
             row = payg_create_account(
                 int(session["user_id"]),
                 service,
                 protocol,
                 self.client_ip(),
                 self.headers.get("User-Agent", ""),
+                server_id=server_id,
             )
         except ValueError as exc:
             text = str(exc)
@@ -6538,15 +7220,22 @@ class Handler(BaseHTTPRequestHandler):
                 if str(row["country_code"] or "").upper() == cc
                 and _norm(row["isp"]) == _norm(isp)
             )
+            # VPS utama (A) tidak ada di tabel servers, tetapi ikut dihitung
+            # agar aturan "ISP + region sama -> v2" tetap konsisten.
+            local_info = server_info()
+            if (str(local_info.get("code") or "").upper() == cc
+                    and _norm(local_isp_name()) == _norm(isp)):
+                same += 1
             name = region if same == 0 else "%s v%d" % (region, same + 1)
             try:
                 conn.execute(
                     "INSERT INTO servers(code,name,region,isp,country_code,city,base_url,token,"
-                    "api_key,secret_enc,max_slots,price_multiplier,created_at) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "api_key,secret_enc,max_slots,price_multiplier,created_at,last_seen,last_version) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (code, name, region, isp, cc, city, base_url,
                      "" if api_key else token, api_key, secret_enc,
-                     max_slots, multiplier, int(time.time())),
+                     max_slots, multiplier, int(time.time()), int(time.time()),
+                     str(info.get("version") or "")[:30]),
                 )
                 conn.commit()
             except sqlite3.IntegrityError:
@@ -7150,7 +7839,7 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
 <meta name="theme-color" content="{UI_THEME_COLORS.get(b['theme'], '#fffaf2')}">
 {robots}
 {favicon}
-<link rel="stylesheet" href="/static/style.css?v=20261107signup1">
+<link rel="stylesheet" href="/static/style.css?v=20261115servers1">
 {turnstile_script}
 </head>
 <body>
@@ -7158,7 +7847,7 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
 {body}
 {footer}
 {popup_html}
-<script src="/static/app.js?v=20261107signup1" defer></script>
+<script src="/static/app.js?v=20261115servers1" defer></script>
 </body>
 </html>"""
 
@@ -7521,7 +8210,6 @@ def render_free_page(form_token: str, settings: dict[str, str]) -> str:
     fc = _free_context(settings)
     quota = fc["quota"]
     ts_site, _ts_secret, ts_on = turnstile_config()
-    server_strip = server_strip_html()
     ts_widget = (
         '<div class="turnstile-box">'
         f'<div class="cf-turnstile" data-sitekey="{e(ts_site)}" data-theme="light" data-language="id" data-size="flexible"></div>'
@@ -7597,7 +8285,7 @@ def render_free_page(form_token: str, settings: dict[str, str]) -> str:
         </fieldset>
       </div>
 
-      {server_strip}
+      {server_picker_html('free', settings=settings) if fc['free_on'] and not fc['maintenance'] else ''}
       {ts_widget}
       <div class="creator-bottom">
         <div class="quota-readout" id="quota-readout" aria-live="polite">
@@ -7636,7 +8324,8 @@ def render_premium_page(form_token: str, settings: dict[str, str], scheme: str =
     scheme = "payg" if scheme == "payg" else "duration"
     premium_json = json.dumps(pc["data"], ensure_ascii=False).replace("</", "<\\/")
     ts_site, _ts_secret, ts_on = turnstile_config()
-    server_strip = server_strip_html()
+    server_pick_duration = server_picker_html("premium", settings=settings)
+    server_pick_payg = server_picker_html("payg", settings=settings)
     ts_widget = (
         '<div class="turnstile-box premium-turnstile">'
         f'<div class="cf-turnstile" data-sitekey="{e(ts_site)}" data-theme="light" data-language="id" data-size="flexible"></div>'
@@ -7727,16 +8416,16 @@ def render_premium_page(form_token: str, settings: dict[str, str], scheme: str =
             <div><span>Per hari</span><b id="payg-rate-day">—</b></div>
           </div>
         </div>
-        {server_strip}
+        <form id="payg-form" method="post" action="/payg/create" data-can-create="{1 if payg_can_create else 0}">
+          <input type="hidden" name="_form" value="{e(form_token)}">
+          <input type="hidden" name="service" id="payg-service" value="{e(default_service)}">
+          <input type="hidden" name="protocol" id="payg-protocol" value="{e(default_protocol)}">
+        {server_pick_payg}
         <div class="premium-summary payg-summary">
           <div><span>Saldo Anda</span><b>{rupiah_milli(pc["payg_balance_milli"], strip=True)}</b></div>
           <div><span>Minimal saldo</span><b>{rupiah_milli(pc["payg_min_balance_milli"])}</b></div>
           <div><span>Layanan</span><b id="payg-selected-label">—</b></div>
         </div>
-        <form id="payg-form" method="post" action="/payg/create" data-can-create="{1 if payg_can_create else 0}">
-          <input type="hidden" name="_form" value="{e(form_token)}">
-          <input type="hidden" name="service" id="payg-service" value="{e(default_service)}">
-          <input type="hidden" name="protocol" id="payg-protocol" value="{e(default_protocol)}">
           {ts_widget}
           <button class="btn btn-primary btn-block btn-premium" type="submit" id="payg-button" {'disabled' if not payg_can_create else ''}>
             Buat akun Pay As You Go <span aria-hidden="true">↗</span>
@@ -7755,15 +8444,15 @@ def render_premium_page(form_token: str, settings: dict[str, str], scheme: str =
             <p class="premium-hint">Pilih layanan terlebih dahulu.</p>
           </div>
         </div>
-        {server_strip}
+        <form id="premium-form" method="post" action="/premium/buy">
+          <input type="hidden" name="_form" value="{e(form_token)}">
+          <input type="hidden" name="product_code" id="premium-product" value="">
+        {server_pick_duration}
         <div class="premium-summary" id="premium-summary" hidden>
           <div><span>Paket</span><b id="premium-summary-name">—</b></div>
           <div><span>Harga</span><b id="premium-summary-price">—</b></div>
           <div><span>Masa aktif</span><b id="premium-summary-days">—</b></div>
         </div>
-        <form id="premium-form" method="post" action="/premium/buy">
-          <input type="hidden" name="_form" value="{e(form_token)}">
-          <input type="hidden" name="product_code" id="premium-product" value="">
           {ts_widget}
           <button class="btn btn-primary btn-block btn-premium" type="submit" id="premium-button" disabled>
             Beli via QRIS <span aria-hidden="true">↗</span>
@@ -8137,6 +8826,7 @@ def render_account_card(account: dict) -> str:
         {error_html}
         <div class="acct-meta">
           <span>{icon('clock')} {e(expiry_text)}</span>
+          <span>{icon('globe')} {e(account.get('server_label') or 'VPS Utama')}</span>
           <span>{icon('shield')} {e('Mullog aktif' if account.get('suspended') else 'Tidak ada pelanggaran')}</span>
         </div>
         {_usage_html(account)}
