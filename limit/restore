@@ -559,6 +559,28 @@ for f in /usr/local/sbin/jeda-mullog /usr/local/sbin/setting-jeda /usr/local/sbi
 done
 [ -d /etc/kyt-node ] && chmod 700 /etc/kyt-node 2>/dev/null
 [ -f /etc/kyt-node/agent.json ] && chmod 600 /etc/kyt-node/agent.json 2>/dev/null
+
+# Firewall agent node: hanya IP VPS utama yang boleh akses port agent.
+if [ -f /etc/kyt-node/agent.json ] && command -v iptables >/dev/null 2>&1; then
+    _agent_info=$(python3 - <<'PY_AGENT' 2>/dev/null
+import json
+try:
+    d = json.load(open("/etc/kyt-node/agent.json"))
+    ips = d.get("allow_ips") or []
+    print("%s %s" % (ips[0] if ips else "", d.get("port") or 8787))
+except Exception:
+    print("")
+PY_AGENT
+)
+    _master_ip=${_agent_info%% *}
+    _agent_port=${_agent_info##* }
+    if [ -n "$_master_ip" ] && [ -n "$_agent_port" ]; then
+        iptables -C INPUT -p tcp -s "$_master_ip" --dport "$_agent_port" -j ACCEPT 2>/dev/null ||             iptables -I INPUT 1 -p tcp -s "$_master_ip" --dport "$_agent_port" -j ACCEPT
+        iptables -C INPUT -p tcp --dport "$_agent_port" -j DROP 2>/dev/null ||             iptables -I INPUT 2 -p tcp --dport "$_agent_port" -j DROP
+        netfilter-persistent save >/dev/null 2>&1 || true
+        echo -e "       -> firewall agent: ${GREEN}${_master_ip} -> port ${_agent_port}${NC}"
+    fi
+fi
 [ -f /usr/local/sbin/vpnfree.conf.tpl ] && chmod 644 /usr/local/sbin/vpnfree.conf.tpl 2>/dev/null
 [ -f /etc/kyt-theme.conf ] && chmod 644 /etc/kyt-theme.conf 2>/dev/null
 [ -f /etc/sysctl.d/99-slowdns.conf ] && chmod 644 /etc/sysctl.d/99-slowdns.conf 2>/dev/null
