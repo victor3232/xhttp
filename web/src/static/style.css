@@ -4453,3 +4453,15 @@ html, body {
   .server-price-banner { flex-direction: column; align-items: stretch; gap: 14px; }
   .server-price-btn { width: 100%; text-align: center; }
 }
+.server-pick-card.is-offline {
+  opacity: .62;
+  cursor: not-allowed;
+  border-style: dashed;
+  background: var(--surface-2);
+}
+.server-pick-card.is-offline:hover { transform: none; border-color: var(--line); }
+.server-pick-state.is-error {
+  color: var(--red);
+  font-weight: 800;
+  letter-spacing: .03em;
+}
