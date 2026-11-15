@@ -314,6 +314,25 @@ def _location(force: bool = False) -> dict:
     return data
 
 
+
+def _dns_info() -> dict:
+    """Info SlowDNS node ini. Kosong berarti SlowDNS tidak aktif."""
+    mode = (_read_text("/etc/kyt-dns-mode").strip() or "off").lower()
+    host = ""
+    for path in ("/etc/xray/dns", "/root/slowdns/dns_domain"):
+        host = _read_text(path).strip()
+        if host:
+            break
+    pubkey = ""
+    for path in ("/root/slowdns/server.pub", "/etc/slowdns/server.pub"):
+        pubkey = _read_text(path).strip()
+        if pubkey:
+            break
+    ssh_on = mode == "ssh" and bool(host)
+    xray_on = mode.startswith("xray") and bool(host)
+    return {"mode": mode, "host": host, "pubkey": pubkey,
+            "ssh": ssh_on, "xray": xray_on}
+
 def _validate(payload: dict) -> tuple:
     service = str(payload.get("service") or "")
     protocol = str(payload.get("protocol") or "")
@@ -396,6 +415,7 @@ def _create(payload: dict) -> dict:
         "password": password if service == "ssh" else "", "service": service, "protocol": protocol,
         "expires_at": _parse_expiry(service, protocol, user),
         "profile": _read_text(paths["profile"]).strip(), "rc": rc,
+        "dns": _dns_info(),
     }
 
 
@@ -836,7 +856,7 @@ class Handler(BaseHTTPRequestHandler):
                                  "hostname": os.uname().nodename, "time": int(time.time()),
                                  "services": _services(), "accounts": _count_accounts(),
                                  "max_slots": MAX_SLOTS, "revoked": REVOKED,
-                                 "location": _location()})
+                                 "location": _location(), "dns": _dns_info()})
             elif path == "/v1/capacity":
                 acc = _count_accounts()
                 self._send(200, {"ok": True, "node": NODE, "accounts": acc,
@@ -850,7 +870,7 @@ class Handler(BaseHTTPRequestHandler):
                                              **{k: os.path.exists(v) for k, v in XRAY_SCRIPTS.items()}},
                                  "mullog": os.path.exists(MULLOG_BIN),
                                  "services": _services(),
-                                 "location": _location()})
+                                 "location": _location(), "dns": _dns_info()})
             elif path == "/v1/location":
                 query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 self._send(200, {"ok": True, "node": NODE,
