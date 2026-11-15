@@ -4730,12 +4730,6 @@ def create_account(service: str, protocol: str, days: int, ip: str, user_agent: 
     quota = quota_state(settings)
     if settings.get("maintenance") == "1":
         raise ValueError("Website sedang dalam perawatan. Silakan coba lagi nanti.")
-    if settings.get("free_enabled", "1") != "1":
-        raise ValueError("Kategori akun gratis sedang ditutup admin.")
-    if not settings.get(f"{service}_enabled") == "1":
-        raise ValueError(f"Layanan {SERVICES[service]['label']} sedang dinonaktifkan admin.")
-    if service == "xray" and settings.get(f"{protocol}_enabled", "1") != "1":
-        raise ValueError(f"Protokol {PROTOCOLS[protocol]['label']} sedang ditutup admin.")
     server_id = int(server_id or 0)
     server = user_server(server_id, "free")
     ss = server_settings_for(server_id, settings)
@@ -9173,12 +9167,13 @@ def icon(name: str) -> str:
 def _free_context(settings: dict[str, str]) -> dict:
     quota = quota_state(settings)
     maintenance = settings.get("maintenance") == "1"
-    free_on = settings.get("free_enabled", "1") == "1"
-    ssh_global = settings.get("ssh_enabled", "1") == "1"
-    proto_on = {p: settings.get(f"{p}_enabled", "1") == "1" for p in PROTOCOLS}
-    xray_global = settings.get("xray_enabled", "1") == "1" and any(proto_on.values())
-    ssh_on = free_on and ssh_global
-    xray_on = free_on and xray_global
+    choices = server_choice_list("free", settings)
+    free_on = bool(choices)
+    selected_id = int(choices[0]["id"]) if choices else 0
+    ss = server_settings_for(selected_id, settings)
+    proto_on = {p: ss.get(f"{p}_enabled", "1") == "1" for p in PROTOCOLS}
+    ssh_on = free_on and ss.get("ssh_enabled", "1") == "1"
+    xray_on = free_on and ss.get("xray_enabled", "1") == "1" and any(proto_on.values())
     available = ssh_on or xray_on
     default_service = "ssh" if ssh_on else ("xray" if xray_on else "")
     first_proto = next((p for p in ("vmess", "vless", "trojan") if proto_on[p]), "")
@@ -9201,7 +9196,7 @@ def _free_context(settings: dict[str, str]) -> dict:
     )
     closed_html = ""
     if not free_on:
-        closed_html = '<div class="notice notice-error"><strong>Kategori gratis ditutup.</strong> Admin sedang menutup pembuatan akun gratis.</div>'
+        closed_html = '<div class="notice notice-error"><strong>Kategori gratis ditutup.</strong> Semua server sedang menutup pembuatan akun gratis.</div>'
     elif not available:
         closed_html = '<div class="notice notice-error"><strong>Semua layanan gratis ditutup.</strong> Admin sedang menutup pembuatan akun.</div>'
 
@@ -11606,7 +11601,7 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
         <div class="settings-grid two">
           <label>Batas free per IP / layanan / hari<input type="number" name="per_ip_daily" min="0" max="1000" value="{e(settings['per_ip_daily'])}"><small>0 = tanpa batas per IP</small></label>
         </div>
-        <label class="switch"><input type="checkbox" name="free_enabled" value="1" {'checked' if settings['free_enabled'] == '1' else ''}><span>Buka kategori akun gratis</span></label>
+        <label class="switch"><input type="checkbox" name="free_enabled" value="1" {'checked' if settings['free_enabled'] == '1' else ''}><span>Buka kategori gratis di VPS utama (server cabang diatur di Multi-Server)</span></label>
         <label class="switch"><input type="checkbox" name="premium_enabled" value="1" {'checked' if settings['premium_enabled'] == '1' else ''}><span>Buka kategori premium</span></label>
         <div class="settings-grid two">
           <label>Invoice premium berlaku (menit)<input type="number" name="premium_expiry_min" min="5" max="120" value="{e(settings['premium_expiry_min'])}"></label>
