@@ -44,6 +44,11 @@ if ! python3 -c 'from PIL import Image' >/dev/null 2>&1; then
     DEBIAN_FRONTEND=noninteractive apt-get update -qq
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-pil >/dev/null
 fi
+if ! python3 -c 'import cryptography' >/dev/null 2>&1; then
+    echo "Memasang modul enkripsi credential node..."
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3-cryptography >/dev/null
+fi
 if [ ! -x /usr/sbin/haproxy ]; then
     echo "HAProxy tidak ditemukan. Pastikan script VPN utama sudah terpasang." >&2
     exit 1
