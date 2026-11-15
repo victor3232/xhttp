@@ -55,11 +55,14 @@ fi
 #  hanya karena 1 paket tidak ada.
 # ============================================================
 apt_pasang() {
-    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$@" >/dev/null 2>&1 && return 0
+    # --force-confdef/confold + stdin /dev/null: cegah prompt konflik config
+    # (penyebab paket seperti dropbear gagal terpasang di Ubuntu 26/Debian baru).
+    local _opts=(-y --no-install-recommends -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold)
+    DEBIAN_FRONTEND=noninteractive apt-get install "${_opts[@]}" "$@" </dev/null >/dev/null 2>&1 && return 0
     echo -e "  \033[0;33mSebagian paket tidak tersedia, memasang satu per satu...\033[0m"
     local _gagal=""
     for _p in "$@"; do
-        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "$_p" >/dev/null 2>&1 \
+        DEBIAN_FRONTEND=noninteractive apt-get install "${_opts[@]}" "$_p" </dev/null >/dev/null 2>&1 \
             || _gagal="$_gagal $_p"
     done
     [ -n "$_gagal" ] && echo -e "  \033[0;33mDilewati (tidak ada di repo OS ini):$_gagal\033[0m"
@@ -834,12 +837,36 @@ clear
 function ins_dropbear(){
 clear
 print_install "Menginstall Dropbear"
-# // Installing Dropbear
+# Pasang paket DULU (tanpa menimpa config), baru tulis config panel.
+# Urutan ini mencegah prompt konflik /etc/default/dropbear yang membuat
+# paket tertinggal setengah terpasang (iU) di Ubuntu 26 / Debian baru.
 apt_pasang dropbear
+if [ ! -x /usr/sbin/dropbear ]; then
+    DEBIAN_FRONTEND=noninteractive apt-get update -y </dev/null >/dev/null 2>&1
+    DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold \
+        dropbear dropbear-bin </dev/null >/dev/null 2>&1
+fi
+if [ ! -x /usr/sbin/dropbear ]; then
+    echo -e "  \033[0;31m[!] Paket Dropbear GAGAL dipasang. Jalankan: apt-get install dropbear\033[0m"
+    return 1
+fi
 wget -q -O /etc/default/dropbear "${REPO}limit/dropbear.conf"
-chmod +x /etc/default/dropbear
-/etc/init.d/dropbear restart
-/etc/init.d/dropbear status
+chmod 644 /etc/default/dropbear
+# Host key wajib ada agar Dropbear bisa start.
+[ -d /etc/dropbear ] || { mkdir -p /etc/dropbear; chmod 700 /etc/dropbear; }
+[ -s /etc/dropbear/dropbear_rsa_host_key ] || \
+    dropbearkey -t rsa -f /etc/dropbear/dropbear_rsa_host_key >/dev/null 2>&1
+systemctl daemon-reload 2>/dev/null
+systemctl enable dropbear >/dev/null 2>&1
+systemctl restart dropbear >/dev/null 2>&1 || /etc/init.d/dropbear restart >/dev/null 2>&1
+sleep 1
+if systemctl is-active --quiet dropbear; then
+    echo -e "  \033[0;32m[ok] Dropbear aktif (port 143 & 109)\033[0m"
+else
+    echo -e "  \033[0;33m[!] Dropbear belum aktif, detail:\033[0m"
+    journalctl -u dropbear -n 8 --no-pager 2>/dev/null | sed 's/^/      /'
+fi
 print_success "Dropbear"
 }
 
