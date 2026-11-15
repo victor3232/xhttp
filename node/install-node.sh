@@ -3,8 +3,9 @@
 #  install-node.sh — pasang KYT Node Agent di VPS cabang
 #  Tidak memasang website panel dan tidak mengubah akun VPN.
 #  Pemakaian:
-#    bash install-node.sh --master-ip 1.2.3.4 --domain node.domain.com \
-#         --code id-1 --port 8787 --max-slots 50
+#    bash install-node.sh --domain node.domain.com --code id-1 --port 8787
+#  IP master bersifat opsional. Tanpa --master-ip, agent tetap aman
+#  karena memakai API Key + HMAC dan tidak bergantung pada IP web utama.
 # ============================================================
 set -euo pipefail
 
@@ -33,10 +34,9 @@ done
 case "${ID:-}" in debian|ubuntu) ;; *) echo "Hanya Debian/Ubuntu." >&2; exit 1 ;; esac
 [ "$(uname -m)" = "x86_64" ] || { echo "Hanya x86_64." >&2; exit 1; }
 
-if [ -z "$MASTER_IP" ]; then read -r -p "IP publik VPS utama: " MASTER_IP; fi
 if [ -z "$DOMAIN" ]; then read -r -p "Domain node (harus mengarah ke VPS ini): " DOMAIN; fi
 if [ -z "$CODE" ]; then read -r -p "Kode node (contoh id-1): " CODE; fi
-[ -n "$MASTER_IP" ] && [ -n "$DOMAIN" ] && [ -n "$CODE" ] || { echo "Data belum lengkap." >&2; exit 64; }
+[ -n "$DOMAIN" ] && [ -n "$CODE" ] || { echo "Data belum lengkap." >&2; exit 64; }
 [[ "$CODE" =~ ^[a-z0-9-]{2,16}$ ]] || { echo "Kode node tidak valid." >&2; exit 64; }
 [[ "$PORT" =~ ^[0-9]+$ ]] && [ "$PORT" -ge 1024 ] && [ "$PORT" -le 65535 ] || { echo "Port tidak valid." >&2; exit 64; }
 
@@ -70,8 +70,13 @@ API_KEY="${CODE}-$(openssl rand -hex 8)"
 SECRET="$(openssl rand -hex 32)"
 mkdir -p /etc/kyt-node
 umask 077
+if [ -n "$MASTER_IP" ]; then
+    ALLOW_JSON="[\"${MASTER_IP}\"]"
+else
+    ALLOW_JSON="[]"
+fi
 cat > /etc/kyt-node/agent.json <<EOF
-{"node":"${CODE}","bind":"0.0.0.0","port":${PORT},"api_key":"${API_KEY}","secret":"${SECRET}","token":"${SECRET}","domain":"${DOMAIN}","allow_ips":["${MASTER_IP}"],"cert":"/etc/xray/xray.crt","key":"/etc/xray/xray.key","max_slots":${MAX_SLOTS},"revoked":false}
+{"node":"${CODE}","bind":"0.0.0.0","port":${PORT},"api_key":"${API_KEY}","secret":"${SECRET}","token":"${SECRET}","domain":"${DOMAIN}","allow_ips":${ALLOW_JSON},"cert":"/etc/xray/xray.crt","key":"/etc/xray/xray.key","max_slots":${MAX_SLOTS},"revoked":false}
 EOF
 chmod 600 /etc/kyt-node/agent.json
 
@@ -96,11 +101,20 @@ EOF
 systemctl daemon-reload
 systemctl enable kyt-node-agent >/dev/null 2>&1
 
-echo "[5/6] Mengatur firewall (hanya IP master)..."
-iptables -C INPUT -p tcp -s "$MASTER_IP" --dport "$PORT" -j ACCEPT 2>/dev/null || \
-    iptables -I INPUT 1 -p tcp -s "$MASTER_IP" --dport "$PORT" -j ACCEPT
-iptables -C INPUT -p tcp --dport "$PORT" -j DROP 2>/dev/null || \
-    iptables -I INPUT 2 -p tcp --dport "$PORT" -j DROP
+if [ -n "$MASTER_IP" ]; then
+    echo "[5/6] Mengatur firewall (hanya IP master $MASTER_IP)..."
+    iptables -C INPUT -p tcp -s "$MASTER_IP" --dport "$PORT" -j ACCEPT 2>/dev/null || \
+        iptables -I INPUT 1 -p tcp -s "$MASTER_IP" --dport "$PORT" -j ACCEPT
+    iptables -C INPUT -p tcp --dport "$PORT" -j DROP 2>/dev/null || \
+        iptables -I INPUT 2 -p tcp --dport "$PORT" -j DROP
+else
+    echo "[5/6] Membuka port agent (autentikasi API Key + HMAC)..."
+    while iptables -C INPUT -p tcp --dport "$PORT" -j DROP 2>/dev/null; do
+        iptables -D INPUT -p tcp --dport "$PORT" -j DROP 2>/dev/null || break
+    done
+    iptables -C INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null || \
+        iptables -I INPUT 1 -p tcp --dport "$PORT" -j ACCEPT
+fi
 netfilter-persistent save >/dev/null 2>&1 || true
 
 echo "[6/6] Menjalankan agent..."
@@ -177,7 +191,7 @@ cat <<EOF
  Node code : ${CODE}
  API Key   : ${API_KEY}
  Secret    : ${SECRET}
- Master IP : ${MASTER_IP}
+ Master IP : ${MASTER_IP:-otomatis / terbuka (HMAC)}
 
  Simpan Secret ini, hanya ditampilkan sekali.
  Di VPS utama: Admin -> Multi-Server -> Add Server.
