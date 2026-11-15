@@ -9136,7 +9136,7 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
 <meta name="theme-color" content="{UI_THEME_COLORS.get(b['theme'], '#fffaf2')}">
 {robots}
 {favicon}
-<link rel="stylesheet" href="/static/style.css?v=20261115servers4">
+<link rel="stylesheet" href="/static/style.css?v=20261115servers5">
 {turnstile_script}
 </head>
 <body>
@@ -9144,7 +9144,7 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
 {body}
 {footer}
 {popup_html}
-<script src="/static/app.js?v=20261115servers4" defer></script>
+<script src="/static/app.js?v=20261115servers5" defer></script>
 </body>
 </html>"""
 
@@ -11659,8 +11659,17 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
     </aside>
   </div>
 
+  <section class="panel admin-panel server-price-banner">
+    <div class="server-price-copy">
+      <span class="mini-label">HARGA PER SERVER</span>
+      <h2>Atur harga VPS cabang</h2>
+      <p>Paket premium dan harga untuk server cabang seperti <b>sg-1</b> diatur terpisah dari server utama.</p>
+    </div>
+    <a class="btn btn-primary server-price-btn" href="/admin/nodes">Atur harga per server <span aria-hidden="true">↗</span></a>
+  </section>
+
   <section class="panel admin-panel">
-    <div class="panel-head"><div><span class="mini-label">PREMIUM</span><h2>Paket jualan</h2></div><span class="panel-hint">Harga tidak termasuk kode unik Rp1–999. <a href="/admin/nodes">Atur harga per server →</a></span></div>
+    <div class="panel-head"><div><span class="mini-label">PREMIUM</span><h2>Paket jualan server utama</h2></div><span class="panel-hint">Harga belum termasuk kode unik Rp1–999.</span></div>
     <form method="post" action="/admin/premium" class="premium-table-form">
       <input type="hidden" name="_csrf" value="{e(session['csrf'])}">
       <div class="table-wrap">
