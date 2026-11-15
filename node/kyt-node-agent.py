@@ -561,7 +561,9 @@ def _renew(service: str, protocol: str, user: str, payload: dict) -> dict:
                     line = re.sub(r"(\d{4}-\d{2}-\d{2})", new_date, line, count=1)
                 out.append(line)
             open(db, "w", encoding="utf-8").write("".join(out))
-    return _status(service, protocol, user)
+    result = _status(service, protocol, user)
+    result["profile"] = _read_text(_paths(service, protocol, user)["profile"]).strip()
+    return result
 
 
 def _mullog_args(action: str, service: str, protocol: str, user: str) -> list:
