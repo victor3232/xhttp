@@ -386,6 +386,13 @@
     button.addEventListener("click", function () { choosePayg(button); });
   });
   if (paygForm) {
+    // Ganti server PAYG -> muat ulang tarif khusus server tersebut.
+    $$('input[name="server_id"]', paygForm).forEach(function (input) {
+      input.addEventListener("change", function () {
+        var sid = input.value || "0";
+        window.location.href = "/premium?scheme=payg&server=" + encodeURIComponent(sid);
+      });
+    });
     var paygDefault = null;
     $$(".payg-service-card").forEach(function (button) {
       if (!paygDefault && button.getAttribute("data-payg-existing") !== "1") paygDefault = button;
