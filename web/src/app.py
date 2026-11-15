@@ -810,6 +810,7 @@ def init_nodes() -> None:
                 latency_ms INTEGER NOT NULL DEFAULT 0,
                 services_json TEXT NOT NULL DEFAULT '{}',
                 accounts_json TEXT NOT NULL DEFAULT '{}',
+                dns_json TEXT NOT NULL DEFAULT '{}',
                 version TEXT NOT NULL DEFAULT '',
                 updated_at INTEGER NOT NULL DEFAULT 0,
                 last_error TEXT NOT NULL DEFAULT ''
@@ -852,6 +853,7 @@ def init_nodes() -> None:
             ("payg_accounts", "server_id", "INTEGER NOT NULL DEFAULT 0"),
             ("usage_daily", "server_id", "INTEGER NOT NULL DEFAULT 0"),
             ("node_account_status", "order_id", "INTEGER NOT NULL DEFAULT 0"),
+            ("node_health", "dns_json", "TEXT NOT NULL DEFAULT '{}'"),
             ("server_settings", "payg_base_ssh", "INTEGER NOT NULL DEFAULT 0"),
             ("server_settings", "payg_base_xray", "INTEGER NOT NULL DEFAULT 0"),
             ("payg_accounts", "offline_since", "INTEGER NOT NULL DEFAULT 0"),
@@ -1459,14 +1461,16 @@ def node_monitor_once(only_server_id: int = 0) -> dict:
             try:
                 conn.execute(
                     "INSERT INTO node_health(server_id,ok,latency_ms,services_json,accounts_json,"
-                    "version,updated_at,last_error) VALUES(?,?,?,?,?,?,?,?) "
+                    "dns_json,version,updated_at,last_error) VALUES(?,?,?,?,?,?,?,?,?) "
                     "ON CONFLICT(server_id) DO UPDATE SET ok=excluded.ok,"
                     "latency_ms=excluded.latency_ms,services_json=excluded.services_json,"
-                    "accounts_json=excluded.accounts_json,version=excluded.version,"
-                    "updated_at=excluded.updated_at,last_error=excluded.last_error",
+                    "accounts_json=excluded.accounts_json,dns_json=excluded.dns_json,"
+                    "version=excluded.version,updated_at=excluded.updated_at,"
+                    "last_error=excluded.last_error",
                     (sid, 1 if ok else 0, latency,
                      json.dumps(data.get("services") or {}, ensure_ascii=False),
                      json.dumps(data.get("accounts") or {}, ensure_ascii=False),
+                     json.dumps(data.get("dns") or {}, ensure_ascii=False),
                      str(data.get("version") or "")[:30], int(time.time()), error[:240]),
                 )
                 conn.execute(
@@ -1567,14 +1571,19 @@ def node_request(server, method: str, path: str, payload=None, timeout: int = 20
                 sid = int(server["id"])
             except Exception:
                 sid = 0
-            if sid > 0 and record:
+            if sid > 0:
                 try:
                     conn = db_connect()
                     try:
-                        conn.execute(
-                            "UPDATE servers SET last_seen=?, last_version=?, last_error='' WHERE id=?",
-                            (int(time.time()), str(data.get("version") or "")[:30], sid),
-                        )
+                        if record:
+                            conn.execute(
+                                "UPDATE servers SET last_seen=?, last_version=?, last_error='' WHERE id=?",
+                                (int(time.time()), str(data.get("version") or "")[:30], sid),
+                            )
+                        dns = data.get("dns")
+                        if isinstance(dns, dict):
+                            conn.execute("UPDATE node_health SET dns_json=? WHERE server_id=?",
+                                         (json.dumps(dns, ensure_ascii=False), sid))
                         conn.commit()
                     finally:
                         conn.close()
@@ -4092,7 +4101,83 @@ def slowdns_info(kind: str) -> list[tuple[str, str]]:
         info.append(("Mode SlowDNS", label))
     return info
 
-def format_ssh_output(raw: str, expiry_label: str | None = None) -> str:
+def node_dns_info(server_id: int) -> dict:
+    sid = int(server_id or 0)
+    if sid <= 0:
+        return {}
+    conn = db_connect()
+    try:
+        row = conn.execute("SELECT dns_json FROM node_health WHERE server_id=?", (sid,)).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return {}
+    try:
+        data = json.loads(row["dns_json"] or "{}")
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+def remote_slowdns_info(server_id: int, kind: str) -> list[tuple[str, str]]:
+    dns = node_dns_info(server_id)
+    mode = str(dns.get("mode") or "").lower()
+    host = str(dns.get("host") or "").strip()
+    pubkey = str(dns.get("pubkey") or "").strip()
+    label = ""
+    if kind == "ssh":
+        if mode != "ssh" or not host:
+            return []
+    else:
+        label = XRAY_DNS_LABELS.get(mode, "")
+        if not label or not host:
+            return []
+    info: list[tuple[str, str]] = []
+    if host:
+        info.append(("Host Slowdns", host))
+    if pubkey:
+        info.append(("Pub Key", pubkey))
+    if label:
+        info.append(("Mode SlowDNS", label))
+    return info
+
+REMOTE_DNS_FIELD_RE = re.compile(
+    r"(?im)^[ \t]*(?:Host Slowdns|Pub(?:lic)? Key|Mode SlowDNS|Port SlowDNS)[ \t]*:[^\n]*\n?"
+)
+
+def format_remote_ssh_output(raw: str, server_id: int, expiry_label: str | None = None) -> str:
+    """Output SSH node apa adanya, hanya SlowDNS yang disesuaikan kemampuan node."""
+    raw = clean_output(raw or "")
+    if not raw:
+        return raw
+    dns_info = remote_slowdns_info(server_id, "ssh")
+    raw = REMOTE_DNS_FIELD_RE.sub("", raw)
+    raw = re.sub(r"\n{3,}", "\n\n", raw).strip("\n")
+    if expiry_label:
+        raw = re.sub(
+            r"(?im)^[ \t]*(?:Aktif Selama|Berakhir Pada|Expired until|Masa Aktif)[ \t]*:[^\n]*$",
+            f" {'Masa Aktif':<17}: {expiry_label}", raw,
+        )
+    if not dns_info:
+        return raw
+    lines = raw.splitlines()
+    out: list[str] = []
+    host_done = False
+    port_done = False
+    for line in lines:
+        out.append(line)
+        if not host_done and re.match(r"^[ \t]*Host[ \t]*:", line, re.I):
+            for label, value in dns_info:
+                out.append(f" {label:<17}: {value}")
+            host_done = True
+        if not port_done and re.match(r"^[ \t]*HCR[ \t]*:", line, re.I):
+            out.append(f" {'Port SlowDNS':<17}: 53, 80, 443")
+            port_done = True
+    return "\n".join(out)
+
+def format_ssh_output(raw: str, expiry_label: str | None = None, server_id: int = 0) -> str:
+    sid = int(server_id or 0)
+    if sid > 0:
+        return format_remote_ssh_output(raw, sid, expiry_label)
     """Rapikan output akun SSH ke format kartu klasik HITS SSH.
 
     Host Slowdns, Pub Key, dan Port SlowDNS diambil otomatis dari mode DNS
@@ -4189,13 +4274,29 @@ def _xray_output_host(raw: str) -> str:
     )
     return match.group(1).strip() if match else ""
 
-def format_xray_output(raw: str, protocol: str = "") -> str:
-    """Tambahkan info SlowDNS ke output Xray sesuai mode DNS yang aktif.
+def format_xray_output(raw: str, protocol: str = "", server_id: int = 0) -> str:
+    """Tambahkan info SlowDNS ke output Xray sesuai mode DNS server.
 
     Mode xray-*  -> tampil Host, Host Slowdns, Pub Key, dan Mode SlowDNS.
     Mode ssh/off -> baris SlowDNS lama dibuang supaya tidak menyesatkan.
     """
+    sid = int(server_id or 0)
     raw = clean_output(raw or "")
+    if sid > 0:
+        raw = REMOTE_DNS_FIELD_RE.sub("", raw)
+        raw = re.sub(r"\n{3,}", "\n\n", raw).strip("\n")
+        info = remote_slowdns_info(sid, "xray")
+        if not info:
+            return raw
+        dns = node_dns_info(sid)
+        host = str(dns.get("host") or "").strip() or _xray_output_host(raw)
+        block: list[str] = [SSH_BOX_SEP, " Xray DNS Account", SSH_BOX_SEP]
+        if host:
+            block.append(f" {'Host':<17}: {host}")
+        for label, value in info:
+            block.append(f" {label:<17}: {value}")
+        block.append(SSH_BOX_SEP)
+        return "\n".join(block) + "\n" + raw
     raw = SLOWDNS_FIELD_RE.sub("", raw)
     raw = re.sub(r"\n{3,}", "\n\n", raw).strip("\n")
     if not raw:
@@ -4213,12 +4314,13 @@ def format_xray_output(raw: str, protocol: str = "") -> str:
     block.append(SSH_BOX_SEP)
     return "\n".join(block) + "\n" + raw
 
-def format_account_output(service: str, protocol: str, raw: str, kind: str = "") -> str:
+def format_account_output(service: str, protocol: str, raw: str, kind: str = "",
+                          server_id: int = 0) -> str:
     if service == "ssh":
         expiry_label = "Pay As You Go · tanpa masa aktif tetap" if kind == "payg" else None
-        return format_ssh_output(raw, expiry_label=expiry_label)
+        return format_ssh_output(raw, expiry_label=expiry_label, server_id=server_id)
     if service == "xray":
-        return format_xray_output(raw, protocol)
+        return format_xray_output(raw, protocol, server_id=server_id)
     return clean_output(raw or "")
 
 def read_account_output(service: str, user: str, protocol: str = "") -> str:
@@ -6412,7 +6514,8 @@ class Handler(BaseHTTPRequestHandler):
                 return
         if download:
             download_output = format_account_output(
-                row["service"], row["protocol"], row["output"] or "", row["kind"]
+                row["service"], row["protocol"], row["output"] or "", row["kind"],
+                server_id=int(row["server_id"] or 0),
             )
             body = download_output.encode("utf-8")
             self._send(
@@ -6953,6 +7056,7 @@ class Handler(BaseHTTPRequestHandler):
                 "ssh" if row["protocol"] == "ssh" else "xray",
                 row["protocol"],
                 row["account_output"] or "",
+                server_id=int(row["server_id"] or 0),
             )
             body = (header + download_output).encode("utf-8")
             self._send(
@@ -7000,6 +7104,7 @@ class Handler(BaseHTTPRequestHandler):
                     "ssh" if row["protocol"] == "ssh" else "xray",
                     row["protocol"],
                     row["account_output"] or "",
+                    server_id=int(row["server_id"] or 0),
                 )
                 if status == "COMPLETED" and row["account_output"]
                 else ""
@@ -9411,6 +9516,7 @@ def render_account_card(account: dict) -> str:
             account["protocol"],
             output,
             "payg" if account.get("source") == "payg" else "",
+            server_id=int(account.get("server_id") or 0),
         )
     output_id = "acct-" + re.sub(r"[^A-Za-z0-9_-]", "-", f"{account['source']}-{username}")
     expires = int(account.get("expires_at") or 0)
@@ -10017,7 +10123,8 @@ def render_result(row: sqlite3.Row) -> str:
     protocol = PROTOCOLS.get(row["protocol"], {}).get("label", "")
     label = service["label"] + (f" · {protocol}" if protocol else "")
     raw_output = row["output"] or ""
-    raw_output = format_account_output(row["service"], row["protocol"], raw_output, row["kind"])
+    raw_output = format_account_output(row["service"], row["protocol"], raw_output, row["kind"],
+                                       server_id=int(row["server_id"] or 0))
     output = e(raw_output)
     expires = fmt_ts(row["expires_at"], "%d %b %Y · %H:%M WIB")
     try:
@@ -11212,6 +11319,7 @@ def render_invoice(row: sqlite3.Row, new: bool = False) -> str:
         "ssh" if row["protocol"] == "ssh" else "xray",
         row["protocol"],
         invoice_output,
+        server_id=int(row["server_id"] or 0),
     )
     completed_block = f"""
     <div class="invoice-done">
