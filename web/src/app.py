@@ -1017,7 +1017,7 @@ def server_choice_list(kind: str = "free", settings: dict | None = None) -> list
             "isp": str(row["isp"] or "")[:80],
             "country_code": str(row["country_code"] or "").upper(),
             "flag": flag_emoji(str(row["country_code"] or "")),
-            "online": last > 0 and now - last < 300,
+            "online": not node_offline_state(int(row["id"]), now),
             "local": False,
             "last_seen": last,
         })
@@ -1031,13 +1031,16 @@ def server_picker_html(kind: str = "free", selected: int = 0,
             '<div class="notice notice-warn"><strong>Belum ada server aktif.</strong> '
             'Coba lagi nanti atau hubungi admin.</div>'
         )
-    ids = [item["id"] for item in choices]
+    usable = [item["id"] for item in choices if item.get("online")]
     selected = int(selected or 0)
-    if selected not in ids:
-        selected = ids[0]
+    if selected not in usable:
+        selected = usable[0] if usable else -1
     cards = []
+    offline_count = 0
     for item in choices:
         online = bool(item.get("online"))
+        if not online:
+            offline_count += 1
         subtitle = " · ".join(
             part for part in (item.get("city") or item.get("region"), item.get("isp")) if part
         )
@@ -1045,22 +1048,36 @@ def server_picker_html(kind: str = "free", selected: int = 0,
         state = (
             '<span class="server-pick-state is-online">Online</span>'
             if online
-            else '<span class="server-pick-state">Belum terhubung</span>'
+            else '<span class="server-pick-state is-error">ERROR · OFFLINE</span>'
         )
         cards.append(
-            f'<label class="server-pick-card{" selected" if item["id"] == selected else ""}">'
+            f'<label class="server-pick-card{" selected" if online and item["id"] == selected else ""}'
+            f'{" is-offline" if not online else ""}">'
             f'<input type="radio" name="server_id" value="{item["id"]}"'
-            f'{" checked" if item["id"] == selected else ""}>'
+            f'{" checked" if online and item["id"] == selected else ""}'
+            f'{" disabled" if not online else ""}>'
             f'<span class="server-pick-flag" aria-hidden="true">{item["flag"]}</span>'
             f'<span class="server-pick-copy"><b>{e(item["name"])} {badge}</b>'
             f'<small>{e(subtitle or item["code"])}</small>'
             f'<small class="server-pick-code">{e(item["code"])}</small></span>'
             f'{state}<span class="server-pick-mark" aria-hidden="true">✓</span></label>'
         )
+    notice = ""
+    if not usable:
+        notice = (
+            '<div class="notice notice-error"><strong>Server sedang offline.</strong> '
+            'Pembuatan akun dan pembelian dinonaktifkan sampai server kembali online.</div>'
+        )
+    elif offline_count:
+        notice = (
+            '<div class="notice notice-warn"><strong>Ada server offline.</strong> '
+            'Server dengan tulisan ERROR tidak bisa dipilih.</div>'
+        )
     return (
-        '<fieldset class="field-group server-pick">'
+        notice
+        + '<fieldset class="field-group server-pick">'
         '<legend><span>03</span> Pilih server</legend>'
-        '<p class="mini-label">Pilih lokasi akun dibuat. Nama sama bisa berasal dari ISP berbeda.</p>'
+        '<p class="mini-label">Pilih lokasi akun dibuat. Server offline tidak bisa dipilih.</p>'
         '<div class="server-pick-grid">'
         + "".join(cards)
         + "</div></fieldset>"
@@ -1093,6 +1110,11 @@ def user_server(server_id: int, kind: str) -> sqlite3.Row | None:
     server = server_by_id(sid)
     if not server or str(server["status"]) != "active":
         raise ValueError("Server yang dipilih sedang tidak aktif.")
+    if node_offline_state(sid):
+        raise ValueError(
+            "Server %s sedang offline. Pilih server lain atau coba lagi nanti."
+            % str(server["name"] or server["code"])
+        )
     ss = server_settings_for(sid)
     if ss.get(kind + "_enabled", "1") != "1":
         raise ValueError("Kategori %s di server %s sedang ditutup." % (kind, server["name"]))
@@ -9130,7 +9152,7 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
 <meta name="theme-color" content="{UI_THEME_COLORS.get(b['theme'], '#fffaf2')}">
 {robots}
 {favicon}
-<link rel="stylesheet" href="/static/style.css?v=20261115servers5">
+<link rel="stylesheet" href="/static/style.css?v=20261115servers6">
 {turnstile_script}
 </head>
 <body>
@@ -9138,7 +9160,7 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
 {body}
 {footer}
 {popup_html}
-<script src="/static/app.js?v=20261115servers5" defer></script>
+<script src="/static/app.js?v=20261115servers6" defer></script>
 </body>
 </html>"""
 
@@ -9168,12 +9190,13 @@ def _free_context(settings: dict[str, str]) -> dict:
     quota = quota_state(settings)
     maintenance = settings.get("maintenance") == "1"
     choices = server_choice_list("free", settings)
+    usable = [item for item in choices if item.get("online")]
     free_on = bool(choices)
-    selected_id = int(choices[0]["id"]) if choices else 0
+    selected_id = int(usable[0]["id"]) if usable else (int(choices[0]["id"]) if choices else 0)
     ss = server_settings_for(selected_id, settings)
     proto_on = {p: ss.get(f"{p}_enabled", "1") == "1" for p in PROTOCOLS}
-    ssh_on = free_on and ss.get("ssh_enabled", "1") == "1"
-    xray_on = free_on and ss.get("xray_enabled", "1") == "1" and any(proto_on.values())
+    ssh_on = bool(usable) and ss.get("ssh_enabled", "1") == "1"
+    xray_on = bool(usable) and ss.get("xray_enabled", "1") == "1" and any(proto_on.values())
     available = ssh_on or xray_on
     default_service = "ssh" if ssh_on else ("xray" if xray_on else "")
     first_proto = next((p for p in ("vmess", "vless", "trojan") if proto_on[p]), "")
@@ -9197,6 +9220,9 @@ def _free_context(settings: dict[str, str]) -> dict:
     closed_html = ""
     if not free_on:
         closed_html = '<div class="notice notice-error"><strong>Kategori gratis ditutup.</strong> Semua server sedang menutup pembuatan akun gratis.</div>'
+    elif not usable:
+        closed_html = ('<div class="notice notice-error"><strong>Server gratis sedang offline.</strong> '
+                       'Pembuatan akun dinonaktifkan sampai server kembali online.</div>')
     elif not available:
         closed_html = '<div class="notice notice-error"><strong>Semua layanan gratis ditutup.</strong> Admin sedang menutup pembuatan akun.</div>'
 
@@ -9213,7 +9239,7 @@ def _free_context(settings: dict[str, str]) -> dict:
         "closed_html": closed_html,
         "proto_on": proto_on,
         "web_config": {
-            "free": free_on,
+            "free": free_on and bool(usable),
             "ssh": ssh_on,
             "xray": xray_on,
             "protocols": proto_on,
