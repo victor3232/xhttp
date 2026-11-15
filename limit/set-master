@@ -40,7 +40,7 @@ valid_ip() {
 clear
 echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo -e "                ${BOLD}SET VPS UTAMA${NC}"
-echo -e "     Arahkan node ini ke IP VPS utama (master) baru"
+echo -e "   Opsional: kunci node ke IP web utama, atau buka tanpa patokan IP"
 echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo
 
@@ -85,14 +85,17 @@ PY
 
 echo "  Node       : $NODE"
 echo "  Port agent : $PORT"
-echo "  Master kini: ${OLD_IPS[*]:-belum diatur}"
+echo "  Master kini: ${OLD_IPS[*]:-terbuka (tanpa patokan IP)}"
 echo
 
-read -r -p "  IP VPS utama baru: " NEW_IP
-[ -n "$NEW_IP" ] || die "IP master baru wajib diisi."
-valid_ip "$NEW_IP" || die "Format IP tidak valid."
-
-read -r -p "  Hapus IP master lama dari izin? [y/N]: " HAPUS
+read -r -p "  IP VPS utama baru (kosongkan = buka tanpa patokan IP): " NEW_IP
+NEW_IP="${NEW_IP// /}"
+if [ -n "$NEW_IP" ]; then
+    valid_ip "$NEW_IP" || die "Format IP tidak valid."
+    read -r -p "  Hapus IP master lama dari izin? [y/N]: " HAPUS
+else
+    HAPUS="y"
+fi
 echo
 
 # ------------------------------------------------------------
@@ -103,10 +106,13 @@ import json, sys, os
 conf, new_ip, hapus = sys.argv[1], sys.argv[2], sys.argv[3].lower()
 d = json.load(open(conf))
 ips = [str(x) for x in (d.get("allow_ips") or []) if x]
-if new_ip not in ips:
-    ips.append(new_ip)
-if hapus in ("y", "ya"):
-    ips = [new_ip]
+if new_ip:
+    if new_ip not in ips:
+        ips.append(new_ip)
+    if hapus in ("y", "ya"):
+        ips = [new_ip]
+else:
+    ips = []
 d["allow_ips"] = ips
 tmp = conf + ".tmp"
 with open(tmp, "w", encoding="utf-8") as fh:
@@ -120,21 +126,36 @@ PY
 # Firewall: izinkan master baru, opsional hapus master lama
 # ------------------------------------------------------------
 if command -v iptables >/dev/null 2>&1; then
-    iptables -C INPUT -p tcp -s "$NEW_IP" --dport "$PORT" -j ACCEPT 2>/dev/null || \
-        iptables -I INPUT 1 -p tcp -s "$NEW_IP" --dport "$PORT" -j ACCEPT
-    if [[ "$HAPUS" =~ ^[yY] ]]; then
+    if [ -n "$NEW_IP" ]; then
+        iptables -C INPUT -p tcp -s "$NEW_IP" --dport "$PORT" -j ACCEPT 2>/dev/null || \
+            iptables -I INPUT 1 -p tcp -s "$NEW_IP" --dport "$PORT" -j ACCEPT
+        if [[ "$HAPUS" =~ ^[yY] ]]; then
+            for ip in "${OLD_IPS[@]:-}"; do
+                [ -n "$ip" ] || continue
+                [ "$ip" = "$NEW_IP" ] && continue
+                while iptables -C INPUT -p tcp -s "$ip" --dport "$PORT" -j ACCEPT 2>/dev/null; do
+                    iptables -D INPUT -p tcp -s "$ip" --dport "$PORT" -j ACCEPT 2>/dev/null || break
+                done
+            done
+        fi
+        iptables -C INPUT -p tcp --dport "$PORT" -j DROP 2>/dev/null || \
+            iptables -I INPUT 2 -p tcp --dport "$PORT" -j DROP
+        echo -e "  ${GREEN}✓${NC} Firewall port $PORT diarahkan ke $NEW_IP"
+    else
         for ip in "${OLD_IPS[@]:-}"; do
             [ -n "$ip" ] || continue
-            [ "$ip" = "$NEW_IP" ] && continue
             while iptables -C INPUT -p tcp -s "$ip" --dport "$PORT" -j ACCEPT 2>/dev/null; do
                 iptables -D INPUT -p tcp -s "$ip" --dport "$PORT" -j ACCEPT 2>/dev/null || break
             done
         done
+        while iptables -C INPUT -p tcp --dport "$PORT" -j DROP 2>/dev/null; do
+            iptables -D INPUT -p tcp --dport "$PORT" -j DROP 2>/dev/null || break
+        done
+        iptables -C INPUT -p tcp --dport "$PORT" -j ACCEPT 2>/dev/null || \
+            iptables -I INPUT 1 -p tcp --dport "$PORT" -j ACCEPT
+        echo -e "  ${GREEN}✓${NC} Port $PORT terbuka; autentikasi tetap API Key + HMAC"
     fi
-    iptables -C INPUT -p tcp --dport "$PORT" -j DROP 2>/dev/null || \
-        iptables -I INPUT 2 -p tcp --dport "$PORT" -j DROP
     netfilter-persistent save >/dev/null 2>&1 || true
-    echo -e "  ${GREEN}✓${NC} Firewall port $PORT diarahkan ke $NEW_IP"
 else
     echo -e "  ${YELLOW}!${NC} iptables tidak ditemukan, atur firewall manual."
 fi
@@ -159,7 +180,7 @@ fi
 
 echo
 echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e " ${GREEN}VPS utama untuk node ini:${NC} ${BOLD}${NEW_IP}${NC}"
+echo -e " ${GREEN}VPS utama untuk node ini:${NC} ${BOLD}${NEW_IP:-terbuka (tanpa patokan IP)}${NC}"
 echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo
 echo "Di VPS utama baru, pastikan:"
