@@ -713,6 +713,321 @@ def init_db() -> None:
         conn.commit()
     finally:
         conn.close()
+    init_nodes()
+
+
+def init_nodes() -> None:
+    """Tabel aditif untuk multi-server. Aman dijalankan berulang."""
+    conn = db_connect()
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS servers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                code TEXT UNIQUE NOT NULL,
+                name TEXT NOT NULL,
+                region TEXT NOT NULL DEFAULT '',
+                base_url TEXT NOT NULL,
+                token TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active',
+                max_slots INTEGER NOT NULL DEFAULT 0,
+                price_multiplier REAL NOT NULL DEFAULT 1.0,
+                is_default INTEGER NOT NULL DEFAULT 0,
+                last_seen INTEGER NOT NULL DEFAULT 0,
+                last_version TEXT NOT NULL DEFAULT '',
+                last_error TEXT NOT NULL DEFAULT '',
+                created_at INTEGER NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS node_test_accounts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                server_id INTEGER NOT NULL,
+                service TEXT NOT NULL,
+                protocol TEXT NOT NULL DEFAULT '',
+                username TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                output TEXT NOT NULL DEFAULT ''
+            );
+            """
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+class NodeError(Exception):
+    pass
+
+
+NODE_KEY_FILE = Path("/etc/kyt-web-node.key")
+
+
+def _node_fernet():
+    from cryptography.fernet import Fernet
+    try:
+        key = NODE_KEY_FILE.read_bytes().strip()
+    except FileNotFoundError:
+        key = Fernet.generate_key()
+        NODE_KEY_FILE.write_bytes(key + b"\n")
+        os.chmod(NODE_KEY_FILE, 0o600)
+    return Fernet(key)
+
+
+def encrypt_node_secret(secret: str) -> str:
+    return _node_fernet().encrypt(str(secret).encode("utf-8")).decode("ascii")
+
+
+def decrypt_node_secret(token: str) -> str:
+    if not token:
+        return ""
+    return _node_fernet().decrypt(str(token).encode("ascii")).decode("utf-8")
+
+
+def server_by_id(server_id: int):
+    conn = db_connect()
+    try:
+        return conn.execute("SELECT * FROM servers WHERE id=?", (int(server_id),)).fetchone()
+    finally:
+        conn.close()
+
+
+def node_request(server, method: str, path: str, payload=None, timeout: int = 20,
+                 idempotency_key: str = "") -> dict:
+    """Panggil agent node dengan HMAC. Hanya HTTPS yang diizinkan.
+
+    Mendukung dua mode:
+    - v2 : API Key + Secret (secret dienkripsi di database)
+    - v1 : token lama (kompatibilitas selama migrasi)
+    """
+    base = str(server["base_url"] or "").rstrip("/")
+    if not base.startswith("https://"):
+        raise NodeError("base_url node harus https://")
+    body = json.dumps(payload, separators=(",", ":")).encode("utf-8") if payload is not None else b""
+    ts = str(int(time.time()))
+    nonce = secrets.token_hex(16)
+    digest = hashlib.sha256(body).hexdigest()
+    canonical = "\n".join([method, path, ts, nonce, digest])
+    api_key = str(server["api_key"] or "")
+    encrypted = str(server["secret_enc"] or "")
+    if api_key and encrypted:
+        try:
+            secret = decrypt_node_secret(encrypted)
+        except Exception as exc:
+            raise NodeError("secret node tidak bisa dibuka: %s" % (exc,))
+        auth_headers = {"X-Kyt-Api-Key": api_key}
+    else:
+        secret = str(server["token"] or "")
+        auth_headers = {"X-Kyt-Node": str(server["code"])}
+    signature = hmac.new(secret.encode("utf-8"), canonical.encode("utf-8"),
+                         hashlib.sha256).hexdigest()
+    headers = {
+        **auth_headers,
+        "X-Kyt-Node": str(server["code"]),
+        "X-Kyt-Timestamp": ts,
+        "X-Kyt-Nonce": nonce,
+        "X-Kyt-Signature": signature,
+        "Content-Type": "application/json",
+        "User-Agent": "kyt-web-node/2.0",
+    }
+    if idempotency_key:
+        headers["Idempotency-Key"] = idempotency_key
+    req = urllib.request.Request(base + path, data=body if method != "GET" else None,
+                                 method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout,
+                                    context=ssl.create_default_context()) as resp:
+            raw = resp.read().decode("utf-8", "replace")
+            return json.loads(raw or "{}")
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", "replace")
+        try:
+            data = json.loads(raw or "{}")
+        except Exception:
+            data = {}
+        raise NodeError(str(data.get("error") or ("HTTP %s" % exc.code)))
+    except urllib.error.URLError as exc:
+        raise NodeError("tidak bisa menghubungi node: %s" % (exc.reason,))
+    except Exception as exc:
+        raise NodeError("gagal memanggil node: %s" % (exc,))
+
+
+def render_admin_nodes(session: sqlite3.Row, msg: str = "", test_id: int = 0) -> str:
+    conn = db_connect()
+    try:
+        servers = conn.execute("SELECT * FROM servers ORDER BY id").fetchall()
+        tests = conn.execute(
+            "SELECT t.*, s.name AS server_name FROM node_test_accounts t "
+            "LEFT JOIN servers s ON s.id=t.server_id ORDER BY t.id DESC LIMIT 25"
+        ).fetchall()
+        selected = None
+        if test_id:
+            selected = conn.execute("SELECT * FROM node_test_accounts WHERE id=?",
+                                    (int(test_id),)).fetchone()
+    finally:
+        conn.close()
+
+    messages = {
+        "added": ("ok", "Server ditambahkan. Klik Tes untuk memeriksa koneksi."),
+        "exists": ("error", "Kode server sudah dipakai."),
+        "invalid": ("error", "Data server tidak valid. URL wajib https dan token minimal 32 karakter."),
+        "deleted": ("ok", "Server dihapus dari daftar."),
+        "tested": ("ok", "Koneksi ke node berhasil."),
+        "testfail": ("error", "Koneksi ke node gagal. Cek URL, token, firewall, dan status agent."),
+        "created": ("ok", "Akun uji berhasil dibuat di node."),
+        "createfail": ("error", "Pembuatan akun uji gagal. Lihat detail di bawah."),
+        "removed": ("ok", "Akun uji dihapus dari node."),
+        "removefail": ("error", "Gagal menghapus akun uji dari node."),
+        "rotated": ("ok", "API Key dan Secret baru sudah aktif di node."),
+        "rotatefail": ("error", "Rotasi kredensial gagal. Kredensial lama tetap dipakai."),
+        "revoked": ("ok", "Credential node dicabut. Node dinonaktifkan sampai diaktifkan ulang dari VPS node."),
+        "revokefail": ("error", "Pencabutan credential gagal."),
+    }
+    notice = ""
+    if msg in messages:
+        cls, text = messages[msg]
+        notice = ('<div class="notice %s"><b>%s</b></div>'
+                  % ("notice-ok" if cls == "ok" else "notice-error", e(text)))
+
+    now = int(time.time())
+    server_rows = ""
+    for s in servers:
+        online = bool(s["last_seen"]) and now - int(s["last_seen"]) < 180
+        if s["status"] == "disabled":
+            badge = '<span class="badge badge-bad">Disabled</span>'
+        elif online:
+            badge = '<span class="badge badge-ok">Online</span>'
+        else:
+            badge = '<span class="badge badge-bad">Belum terhubung</span>'
+
+        last = time.strftime("%d %b %H:%M", time.localtime(int(s["last_seen"]))) if s["last_seen"] else "-"
+        err = ("<small>%s</small>" % e(s["last_error"])) if s["last_error"] and not online else ""
+        server_rows += (
+            "<tr><td><b>%s</b><small>%s · %s</small></td>"
+            "<td><code>%s</code><small>key %s</small></td>"
+            "<td>%s<small>%s · %s</small>%s</td>"
+            "<td>%s</td><td>%.2f×</td><td>"
+            '<form method="post" action="/admin/nodes/test" class="inline-form">'
+            '<input type="hidden" name="_csrf" value="%s">'
+            '<input type="hidden" name="id" value="%s">'
+            '<button class="btn btn-tiny btn-ghost" type="submit">Tes</button></form>'
+            '<form method="post" action="/admin/nodes/rotate" class="inline-form" '
+            'data-confirm="Buat API Key dan Secret baru untuk node ini?">'
+            '<input type="hidden" name="_csrf" value="%s">'
+            '<input type="hidden" name="id" value="%s">'
+            '<button class="btn btn-tiny btn-ghost" type="submit">Rotate</button></form>'
+            '<form method="post" action="/admin/nodes/revoke" class="inline-form" '
+            'data-confirm="Cabut credential node ini? Node tidak bisa dipakai sampai diaktifkan ulang dari VPS node.">'
+            '<input type="hidden" name="_csrf" value="%s">'
+            '<input type="hidden" name="id" value="%s">'
+            '<button class="btn btn-tiny btn-danger" type="submit">Revoke</button></form>'
+            '<form method="post" action="/admin/nodes/delete" class="inline-form" '
+            'data-confirm="Hapus server ini dari daftar? Akun di node tidak dihapus.">'
+            '<input type="hidden" name="_csrf" value="%s">'
+            '<input type="hidden" name="id" value="%s">'
+            '<button class="btn btn-tiny btn-danger" type="submit">Hapus</button></form>'
+            "</td></tr>"
+            % (e(s["name"]), e(s["code"]), e(s["region"]), e(s["base_url"]),
+               (e(str(s["api_key"])[:10]) + "…") if s["api_key"] else "legacy",
+               badge, e(s["last_version"] or "-"), e(last), err, int(s["max_slots"]),
+               float(s["price_multiplier"] or 1), e(session["csrf"]), int(s["id"]),
+               e(session["csrf"]), int(s["id"]), e(session["csrf"]), int(s["id"]),
+               e(session["csrf"]), int(s["id"]))
+        )
+    if not server_rows:
+        server_rows = '<tr><td colspan="6" class="empty">Belum ada server cabang.</td></tr>'
+
+    options = "".join(
+        '<option value="%s">%s (%s)</option>' % (int(s["id"]), e(s["name"]), e(s["code"]))
+        for s in servers
+    )
+    test_rows = ""
+    for t in tests:
+        test_rows += (
+            "<tr><td><b>%s</b><small>%s</small></td><td>%s/%s</td>"
+            "<td>%s</td><td>"
+            '<form method="post" action="/admin/nodes/remove" class="inline-form" '
+            'data-confirm="Hapus akun uji %s dari node?">'
+            '<input type="hidden" name="_csrf" value="%s">'
+            '<input type="hidden" name="id" value="%s">'
+            '<button class="btn btn-tiny btn-danger" type="submit">Hapus akun</button></form>'
+            "</td></tr>"
+            % (e(t["username"]), e(t["server_name"] or "-"), e(t["service"]),
+               e(t["protocol"] or "-"),
+               time.strftime("%d %b %H:%M", time.localtime(int(t["created_at"]))),
+               e(t["username"]), e(session["csrf"]), int(t["id"]))
+        )
+    if not test_rows:
+        test_rows = '<tr><td colspan="4" class="empty">Belum ada akun uji.</td></tr>'
+
+    output_html = ""
+    if selected:
+        output_html = (
+            '<section class="panel admin-panel"><div class="panel-head"><div>'
+            '<span class="mini-label">HASIL AKUN UJI</span><h2>%s</h2></div>'
+            '<span class="badge badge-muted">%s/%s</span></div>'
+            '<pre style="white-space:pre-wrap;overflow:auto;max-height:420px;'
+            'background:#0b1220;color:#d7e3f4;padding:14px;border-radius:12px">%s</pre>'
+            "</section>"
+            % (e(selected["username"]), e(selected["service"]), e(selected["protocol"] or "-"),
+               e(selected["output"] or "(kosong)"))
+        )
+
+    body = f"""
+<main class="admin-main wrap">
+  <div class="admin-head">
+    <div><span class="mini-label">MULTI-SERVER</span><h1>Manajemen Node</h1>
+      <p>Kelola VPS cabang dari satu panel. Agent hanya menerima perintah terbatas.</p></div>
+    <a class="btn btn-ghost btn-small" href="/admin">‹ Dashboard</a>
+  </div>
+  {notice}
+  <section class="panel admin-panel">
+    <div class="panel-head"><div><span class="mini-label">NODE TERDAFTAR</span><h2>Server cabang</h2></div>
+      <span class="panel-hint">Token tidak pernah ditampilkan.</span></div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Server</th><th>URL Agent</th><th>Status</th><th>Slot</th><th>Harga</th><th></th></tr></thead>
+      <tbody>{server_rows}</tbody>
+    </table></div>
+  </section>
+  <section class="panel admin-panel">
+    <div class="panel-head"><div><span class="mini-label">TAMBAH NODE</span><h2>Daftarkan VPS cabang</h2></div></div>
+    <form method="post" action="/admin/nodes/add" class="settings-grid">
+      <input type="hidden" name="_csrf" value="{e(session['csrf'])}">
+      <label>Nama<input type="text" name="name" maxlength="60" placeholder="Indonesia" required></label>
+      <label>Kode<input type="text" name="code" maxlength="16" placeholder="id-1" required></label>
+      <label>Region<input type="text" name="region" maxlength="40" placeholder="Indonesia" value="Indonesia"></label>
+      <label>URL agent<input type="text" name="base_url" maxlength="200" placeholder="https://node.domain:8787" required></label>
+      <label>API Key<input type="text" name="api_key" maxlength="80" placeholder="id-1-xxxxxxxx" required></label>
+      <label>Secret Token<input type="password" name="secret" maxlength="200" placeholder="minimal 32 karakter" required></label>
+      <label>Token lama (opsional)<input type="password" name="token" maxlength="200" placeholder="untuk agent v1"></label>
+      <label>Maks slot<input type="number" name="max_slots" min="0" max="10000" value="50"></label>
+      <label>Multiplier harga<input type="text" name="price_multiplier" value="1.0" maxlength="6"></label>
+      <div class="form-actions"><button class="btn btn-primary btn-small" type="submit">Tambah server</button></div>
+    </form>
+  </section>
+  <section class="panel admin-panel">
+    <div class="panel-head"><div><span class="mini-label">TES NYATA</span><h2>Buat akun uji di node</h2></div>
+      <span class="panel-hint">Akun ini nyata di VPS cabang. Hapus setelah selesai tes.</span></div>
+    <form method="post" action="/admin/nodes/create" class="settings-grid">
+      <input type="hidden" name="_csrf" value="{e(session['csrf'])}">
+      <label>Server<select name="id" required>{options}</select></label>
+      <label>Layanan<select name="service"><option value="ssh">SSH</option><option value="xray">Xray</option></select></label>
+      <label>Protokol Xray<select name="protocol"><option value="">-</option><option value="vmess">VMess</option><option value="vless">VLESS</option><option value="trojan">Trojan</option></select></label>
+      <label>Hari<input type="number" name="days" min="1" max="30" value="1"></label>
+      <label>Kuota GB<input type="number" name="quota_gb" min="0" max="10000" value="1"></label>
+      <label>Limit IP<input type="number" name="ip_limit" min="0" max="100" value="1"></label>
+      <div class="form-actions"><button class="btn btn-dark btn-small" type="submit">Buat akun uji</button></div>
+    </form>
+    {output_html}
+  </section>
+  <section class="panel admin-panel">
+    <div class="panel-head"><div><span class="mini-label">RIWAYAT TES</span><h2>Akun uji di node</h2></div></div>
+    <div class="table-wrap"><table>
+      <thead><tr><th>Username</th><th>Layanan</th><th>Dibuat</th><th></th></tr></thead>
+      <tbody>{test_rows}</tbody>
+    </table></div>
+  </section>
+</main>
+"""
+    return page_shell("Multi-Server", body, admin=True, noindex=True)
 
 
 def get_settings() -> dict[str, str]:
@@ -4850,6 +5165,9 @@ class Handler(BaseHTTPRequestHandler):
                     head_only=head_only,
                 )
                 return
+            if path in ("/admin/nodes", "/admin/nodes/"):
+                self.admin_nodes_page(query, head_only)
+                return
             if path == "/admin/login":
                 if self.admin_session():
                     self.redirect("/admin")
@@ -5063,6 +5381,27 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/admin/server":
                 self.admin_server()
+                return
+            if path == "/admin/nodes/add":
+                self.admin_nodes_add()
+                return
+            if path == "/admin/nodes/delete":
+                self.admin_nodes_delete()
+                return
+            if path == "/admin/nodes/test":
+                self.admin_nodes_test()
+                return
+            if path == "/admin/nodes/create":
+                self.admin_nodes_create()
+                return
+            if path == "/admin/nodes/rotate":
+                self.admin_nodes_rotate()
+                return
+            if path == "/admin/nodes/revoke":
+                self.admin_nodes_revoke()
+                return
+            if path == "/admin/nodes/remove":
+                self.admin_nodes_remove()
                 return
             if path == "/admin/mail":
                 self.admin_mail()
@@ -6113,6 +6452,310 @@ class Handler(BaseHTTPRequestHandler):
         audit("server", f"manual {code} {name}", self.client_ip())
         self.redirect("/admin?msg=server")
 
+    def admin_nodes_page(self, query, head_only: bool = False) -> None:
+        session = self.admin_session()
+        if not session:
+            self.redirect("/admin/login")
+            return
+        msg = (query.get("msg", [""])[0] or "")[:40]
+        try:
+            test_id = int(query.get("test", ["0"])[0] or 0)
+        except ValueError:
+            test_id = 0
+        self.html(
+            200,
+            render_admin_nodes(session, msg, test_id),
+            extra_headers={"Cache-Control": "no-store", "X-Robots-Tag": "noindex, nofollow"},
+            head_only=head_only,
+        )
+
+    def admin_nodes_add(self) -> None:
+        body = self.parse_body()
+        session = self.require_admin(body.get("_csrf", ""))
+        if not session:
+            return
+        name = body.get("name", "").strip()[:60]
+        code = body.get("code", "").strip().lower()[:16]
+        region = body.get("region", "").strip()[:40]
+        base_url = body.get("base_url", "").strip()[:200].rstrip("/")
+        api_key = body.get("api_key", "").strip()[:80]
+        secret = body.get("secret", "").strip()
+        token = body.get("token", "").strip()
+        if not token and secret:
+            token = secret
+        try:
+            max_slots = max(0, min(10000, int(body.get("max_slots", "0") or 0)))
+        except ValueError:
+            max_slots = 0
+        try:
+            multiplier = max(0.1, min(10.0, float(body.get("price_multiplier", "1") or 1)))
+        except ValueError:
+            multiplier = 1.0
+        if (not name or not re.fullmatch(r"[a-z0-9-]{2,16}", code)
+                or not base_url.startswith("https://")
+                or (not api_key and len(token) < 32)
+                or (api_key and (not re.fullmatch(r"[A-Za-z0-9._-]{8,80}", api_key)
+                                 or len(secret) < 32))):
+            self.redirect("/admin/nodes?msg=invalid")
+            return
+        secret_enc = encrypt_node_secret(secret) if (api_key and secret) else ""
+        conn = db_connect()
+        try:
+            conn.execute(
+                "INSERT INTO servers(code,name,region,base_url,token,api_key,secret_enc,"
+                "max_slots,price_multiplier,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (code, name, region, base_url, token, api_key, secret_enc,
+                 max_slots, multiplier, int(time.time())),
+            )
+            conn.commit()
+        except sqlite3.IntegrityError:
+            self.redirect("/admin/nodes?msg=exists")
+            return
+        finally:
+            conn.close()
+        audit("nodes", "add %s %s" % (code, base_url), self.client_ip())
+        self.redirect("/admin/nodes?msg=added")
+
+    def admin_nodes_delete(self) -> None:
+        body = self.parse_body()
+        session = self.require_admin(body.get("_csrf", ""))
+        if not session:
+            return
+        try:
+            sid = int(body.get("id", "0"))
+        except ValueError:
+            sid = 0
+        conn = db_connect()
+        try:
+            conn.execute("DELETE FROM servers WHERE id=?", (sid,))
+            conn.execute("DELETE FROM node_test_accounts WHERE server_id=?", (sid,))
+            conn.commit()
+        finally:
+            conn.close()
+        audit("nodes", "delete %s" % sid, self.client_ip())
+        self.redirect("/admin/nodes?msg=deleted")
+
+    def admin_nodes_test(self) -> None:
+        body = self.parse_body()
+        session = self.require_admin(body.get("_csrf", ""))
+        if not session:
+            return
+        try:
+            sid = int(body.get("id", "0"))
+        except ValueError:
+            sid = 0
+        server = server_by_id(sid)
+        if not server:
+            self.redirect("/admin/nodes?msg=testfail")
+            return
+        conn = db_connect()
+        try:
+            try:
+                data = node_request(server, "GET", "/v1/health", timeout=15)
+                conn.execute(
+                    "UPDATE servers SET last_seen=?, last_version=?, status='active', last_error='' WHERE id=?",
+                    (int(time.time()), str(data.get("version") or "")[:40], sid),
+                )
+                conn.commit()
+                ok = True
+            except NodeError as exc:
+                conn.execute(
+                    "UPDATE servers SET status='offline', last_error=? WHERE id=?",
+                    (str(exc)[:200], sid),
+                )
+                conn.commit()
+                ok = False
+        finally:
+            conn.close()
+        self.redirect("/admin/nodes?msg=" + ("tested" if ok else "testfail"))
+
+    def admin_nodes_create(self) -> None:
+        body = self.parse_body()
+        session = self.require_admin(body.get("_csrf", ""))
+        if not session:
+            return
+        try:
+            sid = int(body.get("id", "0"))
+        except ValueError:
+            sid = 0
+        server = server_by_id(sid)
+        if not server:
+            self.redirect("/admin/nodes?msg=createfail")
+            return
+        service = body.get("service", "ssh")
+        protocol = body.get("protocol", "")
+        if service not in ("ssh", "xray"):
+            self.redirect("/admin/nodes?msg=createfail")
+            return
+        if service == "ssh":
+            protocol = ""
+        elif protocol not in ("vmess", "vless", "trojan"):
+            self.redirect("/admin/nodes?msg=createfail")
+            return
+        try:
+            days = max(1, min(30, int(body.get("days", "1") or 1)))
+            quota_gb = max(0, min(10000, int(body.get("quota_gb", "0") or 0)))
+            ip_limit = max(0, min(100, int(body.get("ip_limit", "0") or 0)))
+        except ValueError:
+            self.redirect("/admin/nodes?msg=createfail")
+            return
+        prefix = "ws" if service == "ssh" else {"vmess": "wm", "vless": "wl", "trojan": "wt"}[protocol]
+        alphabet = "abcdefghjkmnpqrstuvwxyz23456789"
+        username = prefix + "".join(secrets.choice(alphabet) for _ in range(6))
+        payload = {
+            "service": service,
+            "protocol": protocol,
+            "username": username,
+            "days": days,
+            "quota_gb": quota_gb,
+            "ip_limit": ip_limit,
+        }
+        try:
+            data = node_request(server, "POST", "/v1/accounts", payload, timeout=180)
+            ok = bool(data.get("ok"))
+            output = str(data.get("profile") or data.get("error") or ("" if ok else "gagal"))
+        except NodeError as exc:
+            ok = False
+            output = str(exc)
+        conn = db_connect()
+        try:
+            cur = conn.execute(
+                "INSERT INTO node_test_accounts(server_id,service,protocol,username,created_at,output) "
+                "VALUES(?,?,?,?,?,?)",
+                (sid, service, protocol, username, int(time.time()), output[:20000]),
+            )
+            conn.commit()
+            tid = int(cur.lastrowid)
+        finally:
+            conn.close()
+        audit("nodes", "create %s/%s %s ok=%s" % (service, protocol or "-", username, ok),
+              self.client_ip())
+        self.redirect("/admin/nodes?msg=%s&test=%s" % ("created" if ok else "createfail", tid))
+
+    def admin_nodes_rotate(self) -> None:
+        body = self.parse_body()
+        session = self.require_admin(body.get("_csrf", ""))
+        if not session:
+            return
+        try:
+            sid = int(body.get("id", "0"))
+        except ValueError:
+            sid = 0
+        server = server_by_id(sid)
+        if not server:
+            self.redirect("/admin/nodes?msg=rotatefail")
+            return
+        new_key = "%s-%s" % (str(server["code"]), secrets.token_hex(8))
+        new_secret = secrets.token_urlsafe(32)
+        try:
+            node_request(
+                server, "POST", "/v1/credentials/rotate",
+                {"api_key": new_key, "secret": new_secret},
+                timeout=25,
+            )
+        except NodeError as exc:
+            conn = db_connect()
+            try:
+                conn.execute("UPDATE servers SET last_error=? WHERE id=?",
+                             (str(exc)[:200], sid))
+                conn.commit()
+            finally:
+                conn.close()
+            self.redirect("/admin/nodes?msg=rotatefail")
+            return
+        conn = db_connect()
+        try:
+            conn.execute(
+                "UPDATE servers SET api_key=?, secret_enc=?, token=?, last_error='' WHERE id=?",
+                (new_key, encrypt_node_secret(new_secret), new_secret, sid),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        audit("nodes", "rotate %s" % str(server["code"]), self.client_ip())
+        self.redirect("/admin/nodes?msg=rotated")
+
+    def admin_nodes_revoke(self) -> None:
+        body = self.parse_body()
+        session = self.require_admin(body.get("_csrf", ""))
+        if not session:
+            return
+        try:
+            sid = int(body.get("id", "0"))
+        except ValueError:
+            sid = 0
+        server = server_by_id(sid)
+        if not server:
+            self.redirect("/admin/nodes?msg=revokefail")
+            return
+        try:
+            node_request(server, "POST", "/v1/credentials/revoke", {}, timeout=25)
+        except NodeError as exc:
+            conn = db_connect()
+            try:
+                conn.execute("UPDATE servers SET last_error=? WHERE id=?",
+                             (str(exc)[:200], sid))
+                conn.commit()
+            finally:
+                conn.close()
+            self.redirect("/admin/nodes?msg=revokefail")
+            return
+        conn = db_connect()
+        try:
+            conn.execute(
+                "UPDATE servers SET status='disabled', last_error=? WHERE id=?",
+                ("Credential dicabut. Aktifkan ulang dari VPS node.", sid),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        audit("nodes", "revoke %s" % str(server["code"]), self.client_ip())
+        self.redirect("/admin/nodes?msg=revoked")
+
+    def admin_nodes_remove(self) -> None:
+        body = self.parse_body()
+        session = self.require_admin(body.get("_csrf", ""))
+        if not session:
+            return
+        try:
+            tid = int(body.get("id", "0"))
+        except ValueError:
+            self.redirect("/admin/nodes?msg=removefail")
+            return
+        conn = db_connect()
+        try:
+            row = conn.execute("SELECT * FROM node_test_accounts WHERE id=?", (tid,)).fetchone()
+        finally:
+            conn.close()
+        if not row:
+            self.redirect("/admin/nodes?msg=removefail")
+            return
+        server = server_by_id(int(row["server_id"]))
+        if not server:
+            self.redirect("/admin/nodes?msg=removefail")
+            return
+        path = "/v1/accounts/%s/%s/%s" % (row["service"], row["protocol"] or "", row["username"])
+        try:
+            node_request(server, "DELETE", path, timeout=90)
+        except NodeError as exc:
+            conn = db_connect()
+            try:
+                conn.execute("UPDATE servers SET last_error=? WHERE id=?",
+                             (str(exc)[:200], int(server["id"])))
+                conn.commit()
+            finally:
+                conn.close()
+            self.redirect("/admin/nodes?msg=removefail")
+            return
+        conn = db_connect()
+        try:
+            conn.execute("DELETE FROM node_test_accounts WHERE id=?", (tid,))
+            conn.commit()
+        finally:
+            conn.close()
+        audit("nodes", "remove %s" % row["username"], self.client_ip())
+        self.redirect("/admin/nodes?msg=removed")
+
     def admin_mail(self) -> None:
         body = self.parse_body()
         session = self.require_admin(body.get("_csrf", ""))
@@ -6373,6 +7016,7 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
     </a>
     <nav class="nav-links nav-links-inline" aria-label="Menu admin">
       <a href="/admin" class="active">Dashboard</a>
+      <a href="/admin/nodes">Multi-Server</a>
       <a href="/" target="_blank" rel="noopener">Lihat situs</a>
     </nav>
     <a class="nav-cta" href="/" target="_blank" rel="noopener">Lihat situs <span aria-hidden="true">↗</span></a>
