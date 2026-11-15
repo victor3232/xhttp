@@ -37,7 +37,7 @@ die() {
 clear
 echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo -e "                 ${BOLD}ADD SERVER${NC}"
-echo -e "        Pasang agent di VPS cabang (node)"
+echo -e "      Pasang agent node di VPS ini (boleh berdampingan dengan web)"
 echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo
 
@@ -80,14 +80,27 @@ PY
 fi
 
 # ------------------------------------------------------------
-# Jangan jalankan di VPS utama (master).
+# VPS yang juga menjalankan panel web tetap boleh menjadi node.
+# Peran "utama" ditentukan oleh web mana yang diberi credential.
 # ------------------------------------------------------------
+HAS_WEB=0
 if [ -f /opt/kyt-web/app.py ] || systemctl list-unit-files --no-legend kyt-web.service 2>/dev/null | grep -q .; then
-    echo -e "${YELLOW}VPS ini terdeteksi sebagai VPS utama (ada panel web).${NC}"
-    echo "Add Server hanya dijalankan di VPS cabang."
-    echo "Di VPS utama, cukup tambah node lewat Admin → Multi-Server → Add Server."
-    pause
-    exit 0
+    HAS_WEB=1
+fi
+if [ "$HAS_WEB" = "1" ]; then
+    echo -e "${YELLOW}VPS ini juga menjalankan panel web.${NC}"
+    echo "Tidak masalah: agent node bisa dipasang berdampingan dengan web."
+    echo "Web di VPS ini tetap berjalan sendiri."
+    echo
+    echo "Yang menentukan VPS utama adalah web mana yang nanti kamu beri"
+    echo "URL agent + API Key + Secret dari VPS ini."
+    echo
+    read -r -p "Lanjut pasang agent node di VPS ini? [y/N]: " LANJUT_WEB
+    case "${LANJUT_WEB:-N}" in
+        [yY]*) ;;
+        *) echo "Dibatalkan."; pause; exit 0 ;;
+    esac
+    echo
 fi
 
 # ------------------------------------------------------------
