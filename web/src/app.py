@@ -8630,7 +8630,8 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
             <label>Kuota bandwidth (GB)<input type="number" name="ssh_quota_gb" min="0" max="10000" value="{e(settings['ssh_quota_gb'])}"><small>0 = tanpa batas</small></label>
             <label>Kuota 3 hari / hari<input type="number" name="ssh_daily_3" min="0" max="1000" value="{e(settings['ssh_daily_3'])}"></label>
             <label>Kuota 7 hari / hari<input type="number" name="ssh_daily_7" min="0" max="1000" value="{e(settings['ssh_daily_7'])}"></label>
-            <label class="switch"><input type="checkbox" name="ssh_enabled" value="1" {'checked' if settings['ssh_enabled'] == '1' else ''}><span>Aktifkan SSH free</span></label>
+            <label class="switch"><input type="checkbox" name="ssh_enabled" value="1" {'checked' if settings['ssh_enabled'] == '1' else ''}><span>Aktifkan layanan SSH (free + premium + PAYG)</span></label>
+            <small>Untuk menutup akun gratis saja, matikan &quot;Buka kategori akun gratis&quot; di bawah.</small>
           </fieldset>
           <fieldset>
             <legend>{icon('bolt')} Xray Free</legend>
@@ -8638,7 +8639,8 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
             <label>Kuota bandwidth (GB)<input type="number" name="xray_quota_gb" min="0" max="10000" value="{e(settings['xray_quota_gb'])}"><small>0 = tanpa batas</small></label>
             <label>Kuota 3 hari / hari<input type="number" name="xray_daily_3" min="0" max="1000" value="{e(settings['xray_daily_3'])}"></label>
             <label>Kuota 7 hari / hari<input type="number" name="xray_daily_7" min="0" max="1000" value="{e(settings['xray_daily_7'])}"></label>
-            <label class="switch"><input type="checkbox" name="xray_enabled" value="1" {'checked' if settings['xray_enabled'] == '1' else ''}><span>Aktifkan Xray free</span></label>
+            <label class="switch"><input type="checkbox" name="xray_enabled" value="1" {'checked' if settings['xray_enabled'] == '1' else ''}><span>Aktifkan layanan Xray (free + premium + PAYG)</span></label>
+            <small>Untuk menutup akun gratis saja, matikan &quot;Buka kategori akun gratis&quot; di bawah.</small>
             <div class="protocol-switches">
               <span class="mini-label">Protokol yang dibuka (free &amp; premium)</span>
               <label class="switch"><input type="checkbox" name="vmess_enabled" value="1" {'checked' if settings['vmess_enabled'] == '1' else ''}><span>VMess</span></label>
