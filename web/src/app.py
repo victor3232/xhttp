@@ -1871,7 +1871,7 @@ def render_admin_nodes(session: sqlite3.Row, msg: str = "", test_id: int = 0) ->
             '<input type="hidden" name="id" value="%s">'
             '<button class="btn btn-tiny btn-danger" type="submit">Revoke</button></form>'
             '<form method="post" action="/admin/nodes/delete" class="inline-form" '
-            'data-confirm="Hapus server ini dari daftar? Akun di node tidak dihapus.">'
+            'data-confirm="Hapus server ini dari web? Setting dan paket per server ikut dihapus. Akun VPN di VPS node tetap aman dan tetap bisa dipakai sampai expired.">'
             '<input type="hidden" name="_csrf" value="%s">'
             '<input type="hidden" name="id" value="%s">'
             '<button class="btn btn-tiny btn-danger" type="submit">Hapus</button></form>'
@@ -1954,16 +1954,22 @@ def render_admin_nodes(session: sqlite3.Row, msg: str = "", test_id: int = 0) ->
     </table></div>
   </section>
   <section class="panel admin-panel">
-    <div class="panel-head"><div><span class="mini-label">TAMBAH NODE</span><h2>Daftarkan VPS cabang</h2></div></div>
+    <div class="panel-head"><div><span class="mini-label">TAMBAH NODE</span><h2>Daftarkan VPS cabang</h2></div>
+      <span class="panel-hint">Tanpa patokan IP master.</span></div>
+    <div class="panel-hint" style="margin-bottom:14px">
+      <b>Di VPS baru:</b> pasang autoscript + domain/SSL, lalu buka <code>menu → 9 Utility → 28 ADD SERVER</code>.<br>
+      Salin <b>URL agent</b>, <b>API Key</b>, dan <b>Secret</b> dari sana, lalu tempel di form ini.<br>
+      Nama, kode (<code>sg-1</code>, <code>id-1</code>, …), ISP, dan region diisi otomatis dari node.
+    </div>
     <form method="post" action="/admin/nodes/add" class="settings-grid">
       <input type="hidden" name="_csrf" value="{e(session['csrf'])}">
-      <p class="panel-hint" style="grid-column:1/-1">Nama, kode, ISP, dan region diambil otomatis dari node. Kode memakai format <b>sg-1</b>, <b>id-1</b>, dst.</p>
       <label>URL agent<input type="text" name="base_url" maxlength="200" placeholder="https://node.domain:8787" required></label>
       <label>API Key<input type="text" name="api_key" maxlength="80" placeholder="id-1-xxxxxxxx" required></label>
-      <label>Secret Token<input type="password" name="secret" maxlength="200" placeholder="minimal 32 karakter" required></label>
-      <label>Token lama (opsional)<input type="password" name="token" maxlength="200" placeholder="untuk agent v1"></label>
+      <label>Secret<input type="password" name="secret" maxlength="200" placeholder="tempel dari menu 28" required></label>
       <label>Maks slot<input type="number" name="max_slots" min="0" max="10000" value="50"></label>
       <label>Multiplier harga<input type="text" name="price_multiplier" value="1.0" maxlength="6"></label>
+      <label class="switch"><input type="checkbox" name="premium_enabled" value="1" checked><span>Buka premium di node ini</span></label>
+      <label class="switch"><input type="checkbox" name="free_enabled" value="1"><span>Buka gratis (mis. VPS donasi)</span></label>
       <div class="form-actions"><button class="btn btn-primary btn-small" type="submit">Tambah server</button></div>
     </form>
   </section>
@@ -6549,6 +6555,7 @@ def user_accounts(user_id: int) -> list[dict]:
             "_cached_sessions": sessions,
         })
 
+    accounts = [a for a in accounts if a.get("source") != "payg"]
     balance_milli = wallet_balance_milli(user_id)
     payg_settings = get_settings()
     min_balance_milli = _setting_int(payg_settings, "payg_min_balance", 1000) * 1000
@@ -6853,13 +6860,13 @@ class Handler(BaseHTTPRequestHandler):
                     self.redirect("/login?next=/premium")
                     return
                 token, cookie = self.public_form_token()
-                scheme = (query.get("scheme", ["duration"])[0] or "duration").strip().lower()
+                scheme = "duration"
                 try:
                     server_id = int(query.get("server", ["0"])[0] or 0)
                 except ValueError:
                     server_id = 0
                 try:
-                    user_server(server_id, "premium" if scheme != "payg" else "payg")
+                    user_server(server_id, "premium")
                 except ValueError:
                     server_id = 0
                 self.html(200, render_premium_page(token, get_settings(), scheme, server_id),
@@ -7084,15 +7091,6 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/deposit":
                 self.deposit_post()
                 return
-            if path == "/payg/create":
-                self.payg_create_post()
-                return
-            if path == "/dashboard/payg/start":
-                self.payg_start_post()
-                return
-            if path == "/dashboard/payg/stop":
-                self.payg_stop_post()
-                return
             if path == "/cek-invoice":
                 self.check_invoice_post()
                 return
@@ -7176,9 +7174,6 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/admin/mail":
                 self.admin_mail()
-                return
-            if path == "/admin/payg":
-                self.admin_payg()
                 return
             if path == "/admin/wallet":
                 self.admin_wallet()
@@ -8596,7 +8591,7 @@ class Handler(BaseHTTPRequestHandler):
                 same += 1
             name = region if same == 0 else "%s v%d" % (region, same + 1)
             try:
-                conn.execute(
+                cur = conn.execute(
                     "INSERT INTO servers(code,name,region,isp,country_code,city,base_url,token,"
                     "api_key,secret_enc,max_slots,price_multiplier,created_at,last_seen,last_version) "
                     "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -8604,6 +8599,20 @@ class Handler(BaseHTTPRequestHandler):
                      "" if api_key else token, api_key, secret_enc,
                      max_slots, multiplier, int(time.time()), int(time.time()),
                      str(info.get("version") or "")[:30]),
+                )
+                new_sid = int(cur.lastrowid)
+                conn.execute(
+                    "INSERT INTO server_settings(server_id,free_enabled,premium_enabled,"
+                    "payg_enabled,ssh_enabled,xray_enabled,vmess_enabled,vless_enabled,"
+                    "trojan_enabled,maintenance,updated_at,max_slots) "
+                    "VALUES(?,?,?,'0','1','1','1','1','1','0',?,?) "
+                    "ON CONFLICT(server_id) DO UPDATE SET free_enabled=excluded.free_enabled,"
+                    "premium_enabled=excluded.premium_enabled,payg_enabled='0',"
+                    "updated_at=excluded.updated_at,max_slots=excluded.max_slots",
+                    (new_sid,
+                     "1" if body.get("free_enabled") == "1" else "0",
+                     "1" if body.get("premium_enabled") == "1" else "0",
+                     int(time.time()), max_slots),
                 )
                 conn.commit()
             except sqlite3.IntegrityError:
@@ -8627,6 +8636,9 @@ class Handler(BaseHTTPRequestHandler):
         try:
             conn.execute("DELETE FROM servers WHERE id=?", (sid,))
             conn.execute("DELETE FROM node_test_accounts WHERE server_id=?", (sid,))
+            conn.execute("DELETE FROM server_settings WHERE server_id=?", (sid,))
+            conn.execute("DELETE FROM server_products WHERE server_id=?", (sid,))
+            conn.execute("DELETE FROM node_health WHERE server_id=?", (sid,))
             conn.commit()
         finally:
             conn.close()
@@ -9125,7 +9137,6 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
             ("home", "/", "Beranda"),
             ("premium", "/premium", "Premium Akun"),
             ("free", "/gratis", "Free Akun"),
-            ("deposit", "/deposit", "Deposit"),
             ("invoice", "/cek-invoice", "Cek Invoice"),
             ("contact", "/kontak", "Kontak"),
         ]
@@ -9143,19 +9154,16 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
             except Exception:
                 cu_balance = 0
             auth_menu = f"""
-      <a class="nav-link nav-balance-chip" href="/deposit">{icon('wallet')}<span>Saldo <b>{rupiah_milli(cu_balance, strip=True)}</b></span></a>
       <a class="nav-link nav-user-chip" href="/dashboard/profil"><span class="nav-avatar">{e((cu['email'][:1] or 'M').upper())}</span><span class="nav-email">{e(cu['email'])}</span></a>
       <form method="post" action="/logout" class="nav-logout"><input type="hidden" name="_csrf" value="{e(cu['csrf'])}"><button class="nav-link nav-logout-btn" type="submit">Keluar</button></form>"""
             drawer_cta = (
                 '<a class="nav-drawer-cta" href="/dashboard">Buka dashboard <span aria-hidden="true">↗</span></a>'
-                '<a class="nav-drawer-cta" href="/deposit">Deposit / top up saldo <span aria-hidden="true">↗</span></a>'
             )
         else:
             auth_menu = ""
             drawer_cta = (
                 '<a class="nav-drawer-cta" href="/login">Login <span aria-hidden="true">↗</span></a>'
                 '<a class="nav-drawer-cta" href="/register">Daftar gratis <span aria-hidden="true">↗</span></a>'
-                '<a class="nav-drawer-cta" href="/deposit">Deposit / top up saldo <span aria-hidden="true">↗</span></a>'
             )
         header = f"""
 <header class="nav nav-public">
@@ -9188,7 +9196,6 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
       <a href="/">Beranda</a>
       <a href="/gratis">Akun gratis</a>
       <a href="/premium">Premium</a>
-      <a href="/deposit">Deposit Saldo</a>
       <a href="/dashboard">Dashboard</a>
       <a href="/cek-invoice">Cek Invoice</a>
       <a href="/kontak">Kontak</a>
@@ -9376,12 +9383,8 @@ def _premium_context(settings: dict[str, str], server_id: int = 0) -> dict:
     cheapest_all = min((int(row["price"]) for row in rows), default=0)
     cu = current_user()
     payg_rows = []
-    payg_on = (
-        settings.get("payg_enabled", "1") == "1"
-        and ss.get("payg_enabled", "1") == "1"
-        and ss.get("maintenance", "0") != "1"
-        and not maintenance
-    )
+    # PAYG dihapus. Semua layanan memakai paket durasi 3 / 7 / 30 hari.
+    payg_on = False
     if payg_on:
         for proto in ("ssh", "vmess", "vless", "trojan"):
             service = "ssh" if proto == "ssh" else "xray"
@@ -9451,15 +9454,6 @@ def render_home(form_token: str, settings: dict[str, str]) -> str:
     premium_price = rupiah(pc["cheapest"]) if pc["cheapest"] else "—"
     free_note = "" if fc["free_on"] else '<div class="notice notice-error"><strong>Kategori gratis sedang ditutup.</strong></div>'
     premium_note = "" if pc["premium_on"] else '<div class="notice notice-warn"><strong>Premium sedang ditutup.</strong></div>'
-    cu = current_user()
-    balance_milli = wallet_balance_milli(int(cu["user_id"])) if cu else 0
-    payg_on = settings.get("payg_enabled", "1") == "1" and settings.get("maintenance") != "1"
-    rates_ssh = payg_rates("ssh", settings)
-    rates_xray = payg_rates("xray", settings)
-    payg_hour_min = min(rates_ssh["hour_milli"], rates_xray["hour_milli"])
-    wallet_balance_text = rupiah_milli(balance_milli, strip=True) if cu else "Rp 0"
-    deposit_cta = "/deposit" if cu else "/login?next=/deposit"
-    payg_off_note = "" if payg_on else '<div class="notice notice-warn compact-notice"><b>Pay As You Go sedang ditutup.</b> Deposit tetap bisa dilakukan.</div>'
     body = f"""
 <main>
   <section class="hero wrap">
@@ -9510,32 +9504,6 @@ def render_home(form_token: str, settings: dict[str, str]) -> str:
     </div>
   </section>
 
-  <section class="section wrap wallet-band" id="saldo">
-    <div class="wallet-promo panel">
-      <div class="wallet-promo-copy">
-        <div class="eyebrow"><span class="dot"></span> SALDO &amp; PAY AS YOU GO</div>
-        <h2>Isi saldo.<br><em>Nyalakan saat butuh.</em></h2>
-        <p>Beli paket durasi seperti biasa, atau pakai Pay As You Go: saldo hanya terpotong saat akun Anda ON. Tarif otomatis mengikuti harga patokan admin.</p>
-        {payg_off_note}
-        <div class="wallet-promo-actions">
-          <a class="btn btn-primary" href="{deposit_cta}">{icon('wallet')} Deposit saldo</a>
-          <a class="btn btn-ghost" href="/premium?scheme=payg">Lihat tarif PAYG</a>
-        </div>
-        <small class="wallet-promo-note">Minimal top up {rupiah(_setting_int(settings, "payg_min_topup", 5000))} · saldo aktif di semua akun PAYG.</small>
-      </div>
-      <div class="wallet-promo-card">
-        <span class="mini-label">{'SALDO ANDA' if cu else 'MULAI DARI'}</span>
-        <b class="wallet-promo-amount">{wallet_balance_text if cu else rupiah_milli(payg_hour_min)}</b>
-        <small>{'Siap dipakai untuk akun Pay As You Go.' if cu else 'per jam, tarif PAYG termurah'}</small>
-        <div class="wallet-promo-rates">
-          <div><span>SSH</span><b>{rupiah_milli(rates_ssh['hour_milli'])} / jam</b></div>
-          <div><span>Xray</span><b>{rupiah_milli(rates_xray['hour_milli'])} / jam</b></div>
-        </div>
-        <a class="btn btn-dark btn-block" href="{deposit_cta}">Top up sekarang <span aria-hidden="true">↗</span></a>
-      </div>
-    </div>
-  </section>
-
   <section class="section wrap category-section" id="layanan">
     <div class="section-head">
       <div>
@@ -9565,7 +9533,7 @@ def render_home(form_token: str, settings: dict[str, str]) -> str:
         <p>Masa aktif lebih panjang, limit IP dan kuota per paket, tanpa kuota pembelian harian.</p>
         <ul>
           <li>Paket durasi 3 / 7 / 30 hari</li>
-          <li>Atau Pay As You Go dari saldo</li>
+          <li>Bisa diperpanjang kapan saja</li>
           <li>SSH, VMess, VLESS, Trojan</li>
           <li>Bayar QRIS GoPay</li>
         </ul>
@@ -9814,7 +9782,7 @@ def render_premium_page(form_token: str, settings: dict[str, str], scheme: str =
     server_id = int(server_id or 0)
     pc = _premium_context(settings, server_id)
     b = branding()
-    scheme = "payg" if scheme == "payg" else "duration"
+    scheme = "duration"
     premium_json = json.dumps(pc["data"], ensure_ascii=False).replace("</", "<\\/")
     ts_site, _ts_secret, ts_on = turnstile_config()
     server_pick_duration = server_picker_html("premium", selected=server_id, settings=settings)
@@ -9827,24 +9795,11 @@ def render_premium_page(form_token: str, settings: dict[str, str], scheme: str =
         if ts_on
         else ""
     )
-    tabs = f"""
-    <div class="scheme-tabs" role="tablist" aria-label="Skema pembelian">
-      <a class="scheme-tab{' active' if scheme == 'duration' else ''}" href="/premium" role="tab" aria-selected="{'true' if scheme == 'duration' else 'false'}">
-        <span class="scheme-tab-icon">{icon('clock')}</span>
-        <span class="scheme-tab-copy"><b>Paket Durasi</b><small>Bayar di awal · 3 / 7 / 30 hari</small></span>
-        <span class="scheme-tab-side">{'Aktif' if scheme == 'duration' else 'Pilih'}</span>
-      </a>
-      <a class="scheme-tab{' active' if scheme == 'payg' else ''}" href="/premium?scheme=payg" role="tab" aria-selected="{'true' if scheme == 'payg' else 'false'}">
-        <span class="scheme-tab-icon">{icon('bolt')}</span>
-        <span class="scheme-tab-copy"><b>Pay As You Go</b><small>Bayar per menit · hanya saat ON</small></span>
-        <span class="scheme-tab-side">{'Aktif' if scheme == 'payg' else 'Pilih'}</span>
-      </a>
-    </div>"""
+    tabs = ""
     chips = (
         f'<span class="page-chip">Mulai {rupiah(pc["cheapest"])}</span>'
         f'<span class="page-chip">Invoice {e(settings.get("premium_expiry_min", "15"))} menit</span>'
         '<span class="page-chip">QRIS GoPay</span>'
-        f'<span class="page-chip">Saldo {rupiah_milli(pc["payg_balance_milli"], strip=True)}</span>'
     )
     if scheme == "payg":
         hero = _page_hero(
@@ -9964,7 +9919,6 @@ def render_premium_page(form_token: str, settings: dict[str, str], scheme: str =
             <li>{'Minimal saldo ' + rupiah_milli(pc['payg_min_balance_milli']) + ' untuk Start.' if scheme == 'payg' else 'Invoice ' + e(settings.get('premium_expiry_min', '15')) + ' menit dan bisa dicek ulang.'}</li>
             <li>{'Tombol Start / Stop ada di dashboard.' if scheme == 'payg' else 'Download detail akun .txt setelah lunas.'}</li>
           </ul>
-          <a class="btn btn-dark btn-block" href="/deposit">{icon('wallet')} Deposit saldo</a>
         </div>
         <div class="panel check-card">
           <span class="mini-label">{'SALDO & RIWAYAT' if scheme == 'payg' else 'SUDAH BELI?'}</span>
@@ -10491,7 +10445,6 @@ def _dash_nav(active: str) -> str:
     items = [
         ("overview", "/dashboard", "Ringkasan", "globe"),
         ("akun", "/dashboard/akun", "Akun & Monitoring", "terminal"),
-        ("saldo", "/dashboard/saldo", "Saldo & Deposit", "wallet"),
         ("mullog", "/dashboard/mullog", "Cek Mullog", "shield"),
         ("invoice", "/dashboard/invoice", "Riwayat Invoice", "download"),
         ("profil", "/dashboard/profil", "Profil & Password", "clock"),
@@ -10508,7 +10461,6 @@ def _dash_bottom(active: str) -> str:
         ("overview", "/dashboard", "Ringkasan", "globe"),
         ("buat", "/gratis", "Buat", "bolt"),
         ("akun", "/dashboard/akun", "Akun", "terminal"),
-        ("saldo", "/dashboard/saldo", "Saldo", "wallet"),
         ("mullog", "/dashboard/mullog", "Mullog", "shield"),
         ("invoice", "/dashboard/invoice", "Invoice", "download"),
         ("profil", "/dashboard/profil", "Profil", "clock"),
@@ -10541,6 +10493,8 @@ def _dash_alerts(msg: str) -> str:
 
 
 def render_dashboard_page(session: sqlite3.Row, data: dict, section: str, msg: str = "") -> str:
+    if section == "saldo":
+        section = "overview"
     email = session["email"]
     initial = (email[:1] or "M").upper()
     accounts = data["accounts"]
@@ -10568,28 +10522,13 @@ def render_dashboard_page(session: sqlite3.Row, data: dict, section: str, msg: s
                 for a in data["suspended"]
             )
             suspend_html = f'<div class="notice notice-error"><b>Mullog aktif.</b> Akun berikut sedang dibekukan sementara:<ul class="dash-alert-list">{rows}</ul><a href="/dashboard/mullog">Lihat detail mullog →</a></div>'
-        payg_cards = "".join(render_account_card(a) for a in data["payg"])
-        payg_section = f"""
-        <section class="dash-section">
-          <div class="dash-section-head"><div><span class="mini-label">PAY AS YOU GO</span><h2>Argo &amp; saldo</h2></div><a class="btn btn-ghost btn-small" href="/deposit">Deposit saldo</a></div>
-          <div class="acct-list">{payg_cards}</div>
-        </section>""" if data["payg"] else f"""
-        <section class="dash-section">
-          <div class="dash-section-head"><div><span class="mini-label">PAY AS YOU GO</span><h2>Argo &amp; saldo</h2></div><a class="btn btn-ghost btn-small" href="/premium?scheme=payg">Lihat tarif</a></div>
-          <div class="dash-empty"><b>Belum ada akun Pay As You Go.</b><p>Isi saldo, lalu buat akun yang hanya terpotong saat ON.</p><div class="dash-empty-actions"><a class="btn btn-primary btn-small" href="/deposit">Deposit saldo</a><a class="btn btn-ghost btn-small" href="/premium?scheme=payg">Buat akun PAYG</a></div></div>
-        </section>"""
         content = f"""
         {alerts}
-        <div class="dash-summary four">
+        <div class="dash-summary">
           <article class="dash-stat">
             <span>Total akun aktif</span>
             <b>{len(data['active'])}</b>
             <small>{len(data['expired'])} expired · {len(accounts)} total</small>
-          </article>
-          <article class="dash-stat wallet-stat">
-            <span>Saldo</span>
-            <b>{rupiah_milli(data['balance_milli'], strip=True)}</b>
-            <small><a href="/deposit">Deposit saldo</a> · min {rupiah_milli(data['payg_settings']['min_balance_milli'])}</small>
           </article>
           <article class="dash-stat">
             <span>Pemakaian hari ini</span>
@@ -10603,17 +10542,15 @@ def render_dashboard_page(session: sqlite3.Row, data: dict, section: str, msg: s
           </article>
         </div>
         {suspend_html}
-        {payg_section}
         <section class="dash-section">
           <div class="dash-section-head"><div><span class="mini-label">AKUN TERBARU</span><h2>Akun &amp; monitoring</h2></div><a class="btn btn-ghost btn-small" href="/dashboard/akun">Lihat semua</a></div>
           <div class="acct-list">{recent_html}</div>
         </section>
         <section class="dash-section">
           <div class="dash-section-head"><div><span class="mini-label">AKSES CEPAT</span><h2>Butuh akun baru?</h2></div></div>
-          <div class="dash-quick four">
-            <a class="dash-quick-card" href="/gratis"><span>{icon('terminal')}</span><b>Buat akun gratis</b><small>SSH atau Xray, 3–7 hari.</small></a>
-            <a class="dash-quick-card" href="/premium"><span>{icon('bolt')}</span><b>Beli paket durasi</b><small>QRIS GoPay, masa aktif lebih panjang.</small></a>
-            <a class="dash-quick-card" href="/premium?scheme=payg"><span>{icon('wallet')}</span><b>Pay As You Go</b><small>Saldo terpotong hanya saat ON.</small></a>
+          <div class="dash-quick">
+            <a class="dash-quick-card" href="/gratis"><span>{icon('terminal')}</span><b>Buat akun gratis</b><small>SSH atau Xray, 3/7 hari.</small></a>
+            <a class="dash-quick-card" href="/premium"><span>{icon('bolt')}</span><b>Beli / perpanjang</b><small>3, 7, atau 30 hari.</small></a>
             <a class="dash-quick-card" href="/dashboard/invoice"><span>{icon('download')}</span><b>Riwayat invoice</b><small>{len(orders)} transaksi tersimpan.</small></a>
           </div>
         </section>"""
@@ -10849,8 +10786,7 @@ def render_dashboard_page(session: sqlite3.Row, data: dict, section: str, msg: s
       </div>
       <nav class="dash-nav" aria-label="Menu dashboard">{nav}</nav>
       <div class="dash-side-cta">
-        <a class="btn btn-primary btn-small btn-block" href="/deposit">{icon('wallet')} Deposit saldo</a>
-        <a class="btn btn-ghost btn-small btn-block" href="/gratis">Buat akun</a>
+        <a class="btn btn-primary btn-small btn-block" href="/gratis">Buat akun</a>
         <a class="btn btn-ghost btn-small btn-block" href="/premium">Beli premium</a>
       </div>
       <form method="post" action="/logout" class="dash-logout">
@@ -10866,8 +10802,8 @@ def render_dashboard_page(session: sqlite3.Row, data: dict, section: str, msg: s
           <p>{e(subtitle)}</p>
         </div>
         <div class="dash-head-actions">
-          <a class="btn btn-ghost btn-small" href="/dashboard/saldo">Saldo {rupiah_milli(data['balance_milli'], strip=True)}</a>
-          <a class="btn btn-primary btn-small" href="/deposit">Deposit</a>
+          <a class="btn btn-ghost btn-small" href="/dashboard/akun">Akun saya</a>
+          <a class="btn btn-primary btn-small" href="/premium">Beli / perpanjang</a>
         </div>
       </header>
       {content}
@@ -11016,7 +10952,6 @@ def render_server_settings_page(session: sqlite3.Row, server_id: int, msg: str =
     toggles = "".join([
         sw("free_enabled", "Buka kategori gratis di server ini", ss.get("free_enabled", "1")),
         sw("premium_enabled", "Buka kategori premium", ss.get("premium_enabled", "1")),
-        sw("payg_enabled", "Buka Pay As You Go", ss.get("payg_enabled", "1")),
         sw("ssh_enabled", "Layanan SSH", ss.get("ssh_enabled", "1")),
         sw("xray_enabled", "Layanan Xray", ss.get("xray_enabled", "1")),
         sw("vmess_enabled", "Protokol VMess", ss.get("vmess_enabled", "1")),
@@ -11128,8 +11063,6 @@ def render_server_settings_page(session: sqlite3.Row, server_id: int, msg: str =
         {num("free_ip_limit", "Limit IP akun gratis (0 = ikut global)", ss.get("free_ip_limit", 0), 0, 100)}
         {num("free_quota_gb", "Kuota gratis GB (0 = ikut global)", ss.get("free_quota_gb", 0), 0, 10000)}
         {num("max_accounts_per_user", "Maks akun gratis / user (0 = tanpa batas)", ss.get("max_accounts_per_user", 0), 0, 100)}
-        {num("payg_base_ssh", "Harga PAYG SSH / 30 hari (0 = global)", ss.get("payg_base_ssh", 0), 0, 10000000)}
-        {num("payg_base_xray", "Harga PAYG Xray / 30 hari (0 = global)", ss.get("payg_base_xray", 0), 0, 10000000)}
         {remote_fields}
       </div>
       <div class="form-actions"><button class="btn btn-primary btn-small" type="submit">Simpan pengaturan</button></div>
@@ -11443,11 +11376,6 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
     <div class="stat-card accent"><span>Pendapatan premium</span><strong>{rupiah(pstats['revenue'])}</strong><small>transaksi sukses</small></div>
     <div class="stat-card"><span>GoPay gateway</span><strong>{'ON' if gopay_ok else 'OFF'}</strong><small>{e(gstat['base'])}</small></div>
   </div>
-  <div class="admin-stats">
-    <div class="stat-card"><span>Total saldo user</span><strong>{rupiah_milli(wallet_total, strip=True)}</strong><small>saldo aktif di semua wallet</small></div>
-    <div class="stat-card"><span>Deposit lunas</span><strong>{rupiah(deposit_paid)}</strong><small>{len(deposits)} invoice terbaru</small></div>
-    <div class="stat-card"><span>PAYG berjalan</span><strong>{payg_running}</strong><small>{len(payg_list)} akun PAYG</small></div>
-  </div>
 
   <section class="panel admin-panel branding-panel">
     <div class="panel-head"><div><span class="mini-label">BRANDING</span><h2>Logo, nama &amp; slogan</h2></div><span class="panel-hint">Berlaku di semua halaman dan notifikasi.</span></div>
@@ -11627,47 +11555,6 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
     </form>
   </section>
 
-  <section class="panel admin-panel payg-admin-panel">
-    <div class="panel-head"><div><span class="mini-label">PAY AS YOU GO</span><h2>Harga patokan & saldo</h2></div><span class="badge {'badge-ok' if settings.get('payg_enabled', '1') == '1' else 'badge-bad'}">{'Aktif' if settings.get('payg_enabled', '1') == '1' else 'Nonaktif'}</span></div>
-    <form method="post" action="/admin/payg" class="server-form">
-      <input type="hidden" name="_csrf" value="{e(session['csrf'])}">
-      <div class="settings-grid">
-        <fieldset>
-          <legend>Harga patokan 30 hari</legend>
-          <label>SSH (Rp / 30 hari)<input type="number" name="payg_base_ssh_30d" min="1000" max="10000000" value="{e(settings.get('payg_base_ssh_30d', '10000'))}"></label>
-          <label>Xray (Rp / 30 hari)<input type="number" name="payg_base_xray_30d" min="1000" max="10000000" value="{e(settings.get('payg_base_xray_30d', '10000'))}"></label>
-          <p class="panel-hint">Tarif otomatis: per hari = harga / 30 · per jam = harga / 720 · per menit = harga / 43.200. Perubahan langsung dipakai semua akun PAYG.</p>
-        </fieldset>
-        <fieldset>
-          <legend>Batas saldo & top up</legend>
-          <label>Minimal saldo untuk Start (Rp)<input type="number" name="payg_min_balance" min="100" max="1000000" value="{e(settings.get('payg_min_balance', '1000'))}"></label>
-          <label>Minimal top up (Rp)<input type="number" name="payg_min_topup" min="1000" max="10000000" value="{e(settings.get('payg_min_topup', '5000'))}"></label>
-          <label>Maksimal top up (Rp)<input type="number" name="payg_max_topup" min="1000" max="100000000" value="{e(settings.get('payg_max_topup', '1000000'))}"></label>
-          <label>Auto-off jika tidak ada login (menit)<input type="number" name="payg_idle_minutes" min="1" max="1440" value="{e(settings.get('payg_idle_minutes', '15'))}"><small>Akun OFF otomatis jika tidak ada sesi aktif selama ini.</small></label>
-          <label>Grace saat node offline (menit)<input type="number" name="payg_offline_grace_min" min="1" max="1440" value="{e(settings.get('payg_offline_grace_min', '15'))}"><small>Billing dijeda saat node tidak terhubung. Lewat grace, akun PAYG di node itu disuspend.</small></label>
-          <label class="switch"><input type="checkbox" name="payg_enabled" value="1" {'checked' if settings.get('payg_enabled', '1') == '1' else ''}><span>Buka Pay As You Go</span></label>
-        </fieldset>
-      </div>
-      <div class="settings-grid two">
-        <fieldset>
-          <legend>Limit akun PAYG · SSH</legend>
-          <label>Limit IP per akun<input type="number" name="payg_ssh_ip_limit" min="0" max="100" value="{e(settings.get('payg_ssh_ip_limit', '2'))}"><small>0 = tanpa batas</small></label>
-          <label>Kuota bandwidth (GB)<input type="number" name="payg_ssh_quota_gb" min="0" max="10000" value="{e(settings.get('payg_ssh_quota_gb', '0'))}"><small>0 = tanpa batas</small></label>
-        </fieldset>
-        <fieldset>
-          <legend>Limit akun PAYG · Xray</legend>
-          <label>Limit IP per akun<input type="number" name="payg_xray_ip_limit" min="0" max="100" value="{e(settings.get('payg_xray_ip_limit', '2'))}"><small>0 = tanpa batas</small></label>
-          <label>Kuota bandwidth (GB)<input type="number" name="payg_xray_quota_gb" min="0" max="10000" value="{e(settings.get('payg_xray_quota_gb', '0'))}"><small>0 = tanpa batas</small></label>
-        </fieldset>
-      </div>
-      <p class="panel-hint">Limit IP &amp; kuota ini dipakai saat akun PAYG dibuat. Akun PAYG yang sudah ada tetap memakai limit saat pembuatannya.</p>
-      <div class="payg-rate-grid admin-rate-grid">
-        <div class="payg-rate-card"><span class="mini-label">SSH</span><b>{rupiah(rates_ssh['base'])} / 30 hari</b><div><span>Per hari</span><b>{rupiah_milli(rates_ssh['day_milli'])}</b></div><div><span>Per jam</span><b>{rupiah_milli(rates_ssh['hour_milli'])}</b></div><div><span>Per menit</span><b>{rupiah_milli(rates_ssh['minute_milli'])}</b></div><div><span>Limit IP</span><b>{e(settings.get('payg_ssh_ip_limit', '2'))}</b></div><div><span>Kuota</span><b>{e(settings.get('payg_ssh_quota_gb', '0'))} GB</b></div></div>
-        <div class="payg-rate-card"><span class="mini-label">XRAY</span><b>{rupiah(rates_xray['base'])} / 30 hari</b><div><span>Per hari</span><b>{rupiah_milli(rates_xray['day_milli'])}</b></div><div><span>Per jam</span><b>{rupiah_milli(rates_xray['hour_milli'])}</b></div><div><span>Per menit</span><b>{rupiah_milli(rates_xray['minute_milli'])}</b></div><div><span>Limit IP</span><b>{e(settings.get('payg_xray_ip_limit', '2'))}</b></div><div><span>Kuota</span><b>{e(settings.get('payg_xray_quota_gb', '0'))} GB</b></div></div>
-      </div>
-      <div class="form-actions"><button class="btn btn-primary btn-small" type="submit">Simpan pengaturan PAYG</button></div>
-    </form>
-  </section>
 
   <div class="admin-grid">
     <section class="panel admin-panel">
@@ -11681,7 +11568,7 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
             <label>Kuota bandwidth (GB)<input type="number" name="ssh_quota_gb" min="0" max="10000" value="{e(settings['ssh_quota_gb'])}"><small>0 = tanpa batas</small></label>
             <label>Kuota 3 hari / hari<input type="number" name="ssh_daily_3" min="0" max="1000" value="{e(settings['ssh_daily_3'])}"></label>
             <label>Kuota 7 hari / hari<input type="number" name="ssh_daily_7" min="0" max="1000" value="{e(settings['ssh_daily_7'])}"></label>
-            <label class="switch"><input type="checkbox" name="ssh_enabled" value="1" {'checked' if settings['ssh_enabled'] == '1' else ''}><span>Aktifkan layanan SSH (free + premium + PAYG)</span></label>
+            <label class="switch"><input type="checkbox" name="ssh_enabled" value="1" {'checked' if settings['ssh_enabled'] == '1' else ''}><span>Aktifkan layanan SSH (free + premium)</span></label>
             <small>Untuk menutup akun gratis saja, matikan &quot;Buka kategori akun gratis&quot; di bawah.</small>
           </fieldset>
           <fieldset>
@@ -11690,7 +11577,7 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
             <label>Kuota bandwidth (GB)<input type="number" name="xray_quota_gb" min="0" max="10000" value="{e(settings['xray_quota_gb'])}"><small>0 = tanpa batas</small></label>
             <label>Kuota 3 hari / hari<input type="number" name="xray_daily_3" min="0" max="1000" value="{e(settings['xray_daily_3'])}"></label>
             <label>Kuota 7 hari / hari<input type="number" name="xray_daily_7" min="0" max="1000" value="{e(settings['xray_daily_7'])}"></label>
-            <label class="switch"><input type="checkbox" name="xray_enabled" value="1" {'checked' if settings['xray_enabled'] == '1' else ''}><span>Aktifkan layanan Xray (free + premium + PAYG)</span></label>
+            <label class="switch"><input type="checkbox" name="xray_enabled" value="1" {'checked' if settings['xray_enabled'] == '1' else ''}><span>Aktifkan layanan Xray (free + premium)</span></label>
             <small>Untuk menutup akun gratis saja, matikan &quot;Buka kategori akun gratis&quot; di bawah.</small>
             <div class="protocol-switches">
               <span class="mini-label">Protokol yang dibuka (free &amp; premium)</span>
@@ -11803,37 +11690,6 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
       <table>
         <thead><tr><th>Invoice</th><th>Paket</th><th>Total</th><th>Dibuat</th><th>Status</th><th>Akun</th><th></th></tr></thead>
         <tbody>{order_rows}</tbody>
-      </table>
-    </div>
-  </section>
-
-  <section class="panel admin-panel">
-    <div class="panel-head"><div><span class="mini-label">DEPOSIT SALDO</span><h2>Invoice top up</h2></div><span class="panel-hint">Mark paid untuk kredit manual jika gateway terlambat.</span></div>
-    <div class="table-wrap">
-      <table>
-        <thead><tr><th>Invoice</th><th>Nominal</th><th>Status</th><th></th></tr></thead>
-        <tbody>{deposit_rows}</tbody>
-      </table>
-    </div>
-    <details class="add-product">
-      <summary>+ Sesuaikan saldo user</summary>
-      <form method="post" action="/admin/wallet" class="settings-grid add-product-form">
-        <input type="hidden" name="_csrf" value="{e(session['csrf'])}">
-        <label>Email user<input type="email" name="email" placeholder="user@email.com" required></label>
-        <label>Nominal (Rp)<input type="number" name="amount" min="1" max="100000000" value="10000" required></label>
-        <label>Aksi<select name="action"><option value="add">Tambah saldo</option><option value="subtract">Kurangi saldo</option></select></label>
-        <label>Catatan<input type="text" name="note" maxlength="200" placeholder="Contoh: bonus / refund"></label>
-        <div class="form-actions"><button class="btn btn-dark btn-small" type="submit">Simpan saldo</button></div>
-      </form>
-    </details>
-  </section>
-
-  <section class="panel admin-panel">
-    <div class="panel-head"><div><span class="mini-label">PAY AS YOU GO</span><h2>Akun & argo</h2></div><span class="panel-hint">Saldo dan pemakaian per akun.</span></div>
-    <div class="table-wrap">
-      <table>
-        <thead><tr><th>Akun</th><th>State</th><th>Terpakai</th><th>Saldo user</th></tr></thead>
-        <tbody>{payg_admin_rows}</tbody>
       </table>
     </div>
   </section>
@@ -12262,7 +12118,6 @@ def main() -> int:
         return 0
 
     threading.Thread(target=payment_daemon, name="gopay-poller", daemon=True).start()
-    threading.Thread(target=payg_daemon, name="payg-billing", daemon=True).start()
     try:
         usage_snapshot_once()
     except Exception:
