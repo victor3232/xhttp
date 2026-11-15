@@ -46,11 +46,12 @@ echo -e " $(sopt2 21 "GANTI TEMA WARNA UI")$(sopt2 22 "CHECK BANDWIDTH")"
 echo -e " $(sopt2 23 "LIMIT SPEED")$(sopt2 24 "SLOWDNS ON/OFF")"
 echo -e " $(sopt2 25 "TIMER MULLOG")$(sopt2 26 "SETTING WEBSITE")"
 echo -e " $(sopt2 27 "TRIAL MANAGER")$(sopt2 28 "ADD SERVER")"
+echo -e " $(sopt2 29 "SET VPS UTAMA")"
 sline
 echo -e " $(sopt2 0 "Back To Menu")"
 sline
 printf '\n'
-printf ' %sSelect From Options %s[1-28 / 0]%s : %s' "$SN" "$SB" "$SN" "$SR"
+printf ' %sSelect From Options %s[1-29 / 0]%s : %s' "$SN" "$SB" "$SN" "$SR"
 read -r menu
 case $menu in
 1) clear ;
@@ -136,6 +137,9 @@ case $menu in
    ;;
 28) clear ;
    add-server
+   ;;
+29) clear ;
+   set-master
    ;;
 0) clear ;
    menu
