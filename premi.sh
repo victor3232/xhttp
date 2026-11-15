@@ -1138,7 +1138,7 @@ print_success "All Packet"
 function menu(){
     clear
     print_install "Memasang Menu Packet"
-    wget -O menu.zip "${REPO}limit/menu-20261115.zip?v=$(date +%s)"
+    wget -O menu.zip "${REPO}limit/menu-20261115b.zip?v=$(date +%s)"
     rm -rf menu
     unzip -oq menu.zip
     chmod +x menu/*
