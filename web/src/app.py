@@ -854,11 +854,20 @@ def init_nodes() -> None:
             ("usage_daily", "server_id", "INTEGER NOT NULL DEFAULT 0"),
             ("node_account_status", "order_id", "INTEGER NOT NULL DEFAULT 0"),
             ("node_health", "dns_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ("orders", "action", "TEXT NOT NULL DEFAULT 'new'"),
+            ("orders", "target_order_id", "INTEGER NOT NULL DEFAULT 0"),
+            ("orders", "service_expires_at", "INTEGER NOT NULL DEFAULT 0"),
+            ("orders", "expiry_suspended", "INTEGER NOT NULL DEFAULT 0"),
+            ("orders", "renew_count", "INTEGER NOT NULL DEFAULT 0"),
             ("server_settings", "payg_base_ssh", "INTEGER NOT NULL DEFAULT 0"),
             ("server_settings", "payg_base_xray", "INTEGER NOT NULL DEFAULT 0"),
             ("payg_accounts", "offline_since", "INTEGER NOT NULL DEFAULT 0"),
         ):
             _ensure_column(conn, table, column, ddl)
+        conn.execute(
+            "UPDATE orders SET service_expires_at=COALESCE(paid_at,created_at)+days*86400 "
+            "WHERE status='COMPLETED' AND service_expires_at=0"
+        )
         conn.commit()
     finally:
         conn.close()
@@ -1315,6 +1324,158 @@ def remote_mullog(server_id: int, service: str, protocol: str, username: str,
         return False, str(exc)
     return bool(data.get("ok")), str(data.get("error") or "")
 
+
+def hold_account_on_server(server_id: int, service: str, protocol: str,
+                           username: str) -> tuple[bool, str]:
+    sid = int(server_id or 0)
+    if sid <= 0:
+        rc, out = _jeda_call(*_jeda_args("hold", service, protocol, username))
+        return rc in (0, 3, 4), out or ""
+    return remote_mullog(sid, service, protocol, username, "suspend")
+
+def resume_account_on_server(server_id: int, service: str, protocol: str,
+                             username: str) -> tuple[bool, str]:
+    sid = int(server_id or 0)
+    if sid <= 0:
+        rc, out = _jeda_call(*_jeda_args("release", service, protocol, username))
+        return rc in (0, 3, 4), out or ""
+    return remote_mullog(sid, service, protocol, username, "resume")
+
+def renew_local_ssh_account(username: str, days: int, ip_limit: int,
+                            quota_gb: int) -> dict:
+    if not USER_RE.match(username):
+        raise ValueError("Username tidak valid.")
+    path = Path("/etc/ssh/.ssh.db")
+    try:
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines(True)
+    except FileNotFoundError:
+        raise ValueError("Database akun SSH tidak ditemukan.")
+    found = -1
+    old_line = ""
+    for index, line in enumerate(lines):
+        if re.match(r"^#ssh#\s+" + re.escape(username) + r"(?:\s|$)", line):
+            found = index
+            old_line = line
+            break
+    if found < 0:
+        raise ValueError("Akun SSH tidak ditemukan di server.")
+    now = int(time.time())
+    match = re.search(r"(\d{1,2} [A-Za-z]{3},? \d{4})", old_line)
+    current = 0
+    if match:
+        try:
+            current = int(time.mktime(time.strptime(match.group(1).replace(",", ""), "%d %b %Y")))
+        except Exception:
+            current = 0
+    base = max(now, current)
+    new_ts = base + max(1, int(days)) * 86400
+    display = time.strftime("%d %b, %Y", time.localtime(new_ts))
+    iso = time.strftime("%Y-%m-%d", time.localtime(new_ts))
+    new_line = re.sub(r"\d{1,2} [A-Za-z]{3},? \d{4}", display, old_line, count=1)
+    lines[found] = new_line
+    path.write_text("".join(lines), encoding="utf-8", errors="ignore")
+    subprocess.run(["usermod", "-e", iso, username], stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL, timeout=20)
+    subprocess.run(["chage", "-E", iso, username], stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL, timeout=20)
+    if int(quota_gb or 0) > 0:
+        try:
+            Path(f"/etc/ssh/{username}").write_text(str(int(quota_gb) * 1024 ** 3))
+        except OSError:
+            pass
+    if int(ip_limit or 0) >= 0:
+        try:
+            ip_path = Path(f"/etc/kyt/limit/ssh/ip/{username}")
+            ip_path.parent.mkdir(parents=True, exist_ok=True)
+            ip_path.write_text(str(max(0, int(ip_limit))))
+        except OSError:
+            pass
+    raw = read_account_output("ssh", username)
+    output = format_ssh_output(raw, expiry_label=display) if raw else ""
+    return {"ok": True, "expires_at": new_ts, "output": output, "profile": output}
+
+def renew_local_xray_account(protocol: str, username: str, days: int,
+                             ip_limit: int, quota_gb: int) -> dict:
+    if protocol not in PROTOCOLS:
+        raise ValueError("Protokol tidak valid.")
+    cfg = PROTOCOLS[protocol]
+    db_path = Path(cfg["db"])
+    try:
+        lines = db_path.read_text(encoding="utf-8", errors="ignore").splitlines(True)
+    except FileNotFoundError:
+        raise ValueError("Database akun Xray tidak ditemukan.")
+    found = -1
+    for index, line in enumerate(lines):
+        if re.match(r"^###\s+" + re.escape(username) + r"(?:\s|$)", line):
+            found = index
+            break
+    if found < 0:
+        raise ValueError("Akun Xray tidak ditemukan di server.")
+    Q = int(quota_gb or 0)
+    if Q <= 0:
+        Q = round(_int_file(Path(cfg["dir"]) / username) / (1024 ** 3))
+    IP = int(ip_limit if ip_limit is not None else -1)
+    if IP < 0:
+        IP = _int_file(Path(cfg["ipdir"]) / username)
+    scripts = {
+        "vmess": "/usr/local/sbin/renewws",
+        "vless": "/usr/local/sbin/renewvless",
+        "trojan": "/usr/local/sbin/renewtr",
+    }
+    rc, log = run_panel_script([scripts[protocol]], [username, str(days), str(int(Q)), str(int(IP))],
+                               timeout=120)
+    new_date = ""
+    try:
+        for line in XRAY_CONFIG.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if re.match(r"^\s*" + re.escape(cfg["marker"]) + r"\s+" + re.escape(username) + r"(?:\s|$)", line):
+                mdate = re.search(r"(\d{4}-\d{2}-\d{2})", line)
+                if mdate:
+                    new_date = mdate.group(1)
+                    break
+    except FileNotFoundError:
+        new_date = ""
+    if new_date:
+        out_lines = []
+        for line in db_path.read_text(encoding="utf-8", errors="ignore").splitlines(True):
+            if re.match(r"^###\s+" + re.escape(username) + r"(?:\s|$)", line):
+                line = re.sub(r"(\d{4}-\d{2}-\d{2})", new_date, line, count=1)
+            out_lines.append(line)
+        db_path.write_text("".join(out_lines), encoding="utf-8", errors="ignore")
+    raw = read_account_output("xray", username, protocol)
+    output = format_xray_output(raw, protocol) if raw else ""
+    expires = 0
+    if new_date:
+        try:
+            expires = int(time.mktime(time.strptime(new_date, "%Y-%m-%d")))
+        except Exception:
+            expires = 0
+    logger.info("renew lokal %s/%s rc=%s", protocol, username, rc)
+    return {"ok": True, "expires_at": expires, "output": output, "profile": output}
+
+def renew_account_on_server(server_id: int, service: str, protocol: str, username: str,
+                            days: int, ip_limit: int, quota_gb: int,
+                            idempotency_key: str = "") -> dict:
+    sid = int(server_id or 0)
+    if sid <= 0:
+        if service == "ssh":
+            return renew_local_ssh_account(username, days, ip_limit, quota_gb)
+        return renew_local_xray_account(protocol, username, days, ip_limit, quota_gb)
+    server = server_by_id(sid)
+    if not server or str(server["status"]) != "active":
+        raise ValueError("Server akun tidak aktif.")
+    data = node_request(
+        server, "POST", node_account_path(service, protocol, username) + "/renew",
+        {"days": int(days), "quota_gb": int(quota_gb), "ip_limit": int(ip_limit)},
+        timeout=180, idempotency_key=idempotency_key,
+    )
+    if not data.get("ok"):
+        raise ValueError(str(data.get("error") or "Renew gagal di node."))
+    return {
+        "ok": True,
+        "expires_at": int(data.get("expires_at") or 0),
+        "output": str(data.get("profile") or ""),
+        "profile": str(data.get("profile") or ""),
+    }
 
 def cached_order_node_status(order_id: int) -> dict | None:
     return cached_node_account(-int(order_id))
@@ -3452,6 +3613,92 @@ def payg_stop_all() -> None:
         except Exception:
             logger.warning("payg stop all %s: %s", row["id"], traceback.format_exc())
 
+EXPIRY_GRACE_SECONDS = 300
+
+def expire_free_accounts_once(limit: int = 50) -> int:
+    now = int(time.time())
+    conn = db_connect()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM accounts WHERE kind='free' AND status='active' AND expires_at<? "
+            "ORDER BY expires_at LIMIT ?",
+            (now - EXPIRY_GRACE_SECONDS, max(1, int(limit))),
+        ).fetchall()
+    finally:
+        conn.close()
+    done = 0
+    for row in rows:
+        sid = int(row["server_id"] or 0)
+        try:
+            remove_account_on_server(sid, row["service"], row["protocol"], row["username"])
+        except Exception as exc:
+            logger.warning("expire free %s/%s gagal: %s", row["service"], row["username"], exc)
+            continue
+        conn = db_connect()
+        try:
+            conn.execute("UPDATE accounts SET status='expired', output='' WHERE id=?",
+                         (int(row["id"]),))
+            conn.execute("DELETE FROM node_account_status WHERE account_id=?", (int(row["id"]),))
+            conn.commit()
+        finally:
+            conn.close()
+        done += 1
+        audit("expire_free", f"{row['service']}/{row['protocol'] or '-'} {row['username']}", "")
+    if done:
+        logger.info("expiry: %d akun gratis dihapus dari node", done)
+    return done
+
+def expire_premium_orders_once(limit: int = 50) -> int:
+    now = int(time.time())
+    conn = db_connect()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM orders WHERE action='new' AND status='COMPLETED'"
+            " AND expiry_suspended=0 AND ("
+            " COALESCE(NULLIF(service_expires_at,0),"
+            " COALESCE(paid_at,created_at)+days*86400)<?)"
+            " ORDER BY COALESCE(NULLIF(service_expires_at,0),"
+            " COALESCE(paid_at,created_at)+days*86400) LIMIT ?",
+            (now - EXPIRY_GRACE_SECONDS, max(1, int(limit))),
+        ).fetchall()
+    finally:
+        conn.close()
+    done = 0
+    for row in rows:
+        username = str(row["account_username"] or "")
+        if not username:
+            continue
+        protocol = str(row["protocol"])
+        service = "ssh" if protocol == "ssh" else "xray"
+        sid = int(row["server_id"] or 0)
+        ok, err = hold_account_on_server(sid, service, protocol, username)
+        if not ok and any(word in (err or "").lower() for word in ("tidak ditemukan", "not found")):
+            ok = True
+        if not ok:
+            logger.warning("expire premium %s tidak bisa suspend: %s", username, err)
+            continue
+        conn = db_connect()
+        try:
+            conn.execute("UPDATE orders SET expiry_suspended=1 WHERE id=?", (int(row["id"]),))
+            conn.commit()
+        finally:
+            conn.close()
+        done += 1
+        audit("expire_premium", f"{row['invoice']} {username}", "")
+    if done:
+        logger.info("expiry: %d akun premium disuspend", done)
+    return done
+
+def expiry_daemon() -> None:
+    time.sleep(45)
+    while True:
+        try:
+            expire_free_accounts_once()
+            expire_premium_orders_once()
+        except Exception:
+            logger.error("expiry daemon: %s", traceback.format_exc())
+        time.sleep(300)
+
 def payg_daemon() -> None:
     time.sleep(10)
     while True:
@@ -5181,6 +5428,13 @@ def order_by_invoice(invoice: str) -> sqlite3.Row | None:
         conn.close()
 
 
+def order_by_id(order_id: int) -> sqlite3.Row | None:
+    conn = db_connect()
+    try:
+        return conn.execute("SELECT * FROM orders WHERE id=?", (int(order_id),)).fetchone()
+    finally:
+        conn.close()
+
 def create_premium_order(product_code: str, ip: str, user_agent: str, user_id: int = 0,
                          server_id: int = 0) -> sqlite3.Row:
     settings = get_settings()
@@ -5267,12 +5521,89 @@ def create_premium_order(product_code: str, ip: str, user_agent: str, user_id: i
     return order_by_invoice(invoice)
 
 
+def create_renewal_order(target_order_id: int, product_code: str, ip: str,
+                         user_agent: str, user_id: int = 0) -> sqlite3.Row:
+    settings = get_settings()
+    if settings.get("maintenance") == "1":
+        raise ValueError("Website sedang dalam perawatan. Silakan coba lagi nanti.")
+    if settings.get("premium_enabled", "1") != "1":
+        raise ValueError("Kategori Premium sedang ditutup admin.")
+    target = order_by_id(int(target_order_id or 0))
+    if (not target or int(target["user_id"] or 0) != int(user_id or 0)
+            or str(target["status"]) != "COMPLETED"
+            or str(target["action"] or "new") != "new"
+            or not target["account_username"]):
+        raise ValueError("Akun premium tidak ditemukan atau bukan milik Anda.")
+    server_id = int(target["server_id"] or 0)
+    product = premium_product_for_server(server_id, product_code, active_only=True)
+    if not product:
+        raise ValueError("Paket perpanjangan tidak tersedia di server akun ini.")
+    if product["protocol"] != target["protocol"]:
+        raise ValueError("Paket harus sama dengan protokol akun.")
+    server = user_server(server_id, "premium")
+    if server:
+        ss = server_settings_for(server_id, settings)
+        if product["protocol"] == "ssh" and ss.get("ssh_enabled", "1") != "1":
+            raise ValueError("SSH di server ini sedang ditutup.")
+        if product["protocol"] in PROTOCOLS and (
+            ss.get("xray_enabled", "1") != "1"
+            or ss.get(product["protocol"] + "_enabled", "1") != "1"
+        ):
+            raise ValueError("Protokol akun ini di server sedang ditutup.")
+    ready, reason = gopay_ready()
+    if not ready:
+        raise ValueError(reason)
+    conn = db_connect()
+    try:
+        active = conn.execute(
+            "SELECT COUNT(*) n FROM orders WHERE buyer_ip=? AND status IN "
+            "('PENDING','PAID','PROVISIONING') AND created_at>=?",
+            (ip, int(time.time()) - 3600),
+        ).fetchone()["n"]
+    finally:
+        conn.close()
+    if int(active) >= 3:
+        raise ValueError("Terlalu banyak invoice aktif dari IP Anda. Selesaikan invoice lama dulu.")
+
+    unique_code, total = _allocate_total(int(product["price"]))
+    try:
+        qr = gopay_build_qris(total)
+        if not qr:
+            raise ValueError("Gagal membuat QRIS GoPay. Hubungi admin.")
+        invoice = _invoice_code()
+        now = int(time.time())
+        expires = now + int(settings.get("premium_expiry_min", "15")) * 60
+        conn = db_connect()
+        try:
+            conn.execute(
+                "INSERT INTO orders(invoice,product_code,protocol,days,price,unique_code,total,"
+                "ip_limit,quota_gb,status,qr_string,buyer_ip,user_agent,created_at,expires_at,"
+                "user_id,server_id,action,target_order_id) "
+                "VALUES(?,?,?,?,?,?,?,?,?,'PENDING',?,?,?,?,?,?,?,?,?)",
+                (
+                    invoice, product["code"], product["protocol"], product["days"],
+                    product["price"], unique_code, total, product["ip_limit"],
+                    product["quota_gb"], qr, ip, (user_agent or "")[:300], now, expires,
+                    int(user_id or 0), server_id, "renew", int(target["id"]),
+                ),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+    finally:
+        _release_total(total)
+    audit("premium_renew_invoice",
+          f"{invoice} target={target['account_username']} total={total} ip={ip}", ip)
+    return order_by_invoice(invoice)
+
 def premium_order_notify(row: sqlite3.Row, ok: bool, error: str = "") -> None:
     label = f"{row['protocol'].upper()} · {row['days']} hari"
+    is_renew = str(row["action"] or "new") == "renew"
     if ok:
         b = branding()
+        heading = "PERPANJANGAN PREMIUM" if is_renew else "PREMIUM TERJUAL"
         text = (
-            f"<b>✅ {e(b['name'])} PREMIUM TERJUAL</b>\n"
+            f"<b>✅ {e(b['name'])} {heading}</b>\n"
             f"Invoice : <code>{e(row['invoice'])}</code>\n"
             f"Paket   : <code>{e(label)}</code>\n"
             f"Total   : <code>Rp {int(row['total']):,}</code>\n"
@@ -5280,8 +5611,9 @@ def premium_order_notify(row: sqlite3.Row, ok: bool, error: str = "") -> None:
             "Status  : <code>AKTIF</code>"
         ).replace(",", ".")
     else:
+        heading = "PERPANJANGAN GAGAL" if is_renew else "AKUN GAGAL"
         text = (
-            "<b>⚠️ PEMBAYARAN MASUK, AKUN GAGAL</b>\n"
+            f"<b>⚠️ PEMBAYARAN MASUK, {heading}</b>\n"
             f"Invoice : <code>{e(row['invoice'])}</code>\n"
             f"Paket   : <code>{e(label)}</code>\n"
             f"Total   : <code>Rp {int(row['total']):,}</code>\n"
@@ -5291,12 +5623,99 @@ def premium_order_notify(row: sqlite3.Row, ok: bool, error: str = "") -> None:
     telegram_send(text)
 
 
+def provision_renewal_order(row: sqlite3.Row) -> bool:
+    invoice = str(row["invoice"])
+    if str(row["status"]) == "COMPLETED" and row["account_output"]:
+        return True
+    if not row["reference"] and not row["paid_at"]:
+        logger.warning("renew %s ditolak: belum ada pembayaran", invoice)
+        return False
+    target = order_by_id(int(row["target_order_id"] or 0))
+    if (not target or int(target["user_id"] or 0) != int(row["user_id"] or 0)
+            or str(target["status"]) != "COMPLETED" or not target["account_username"]):
+        conn = db_connect()
+        try:
+            conn.execute("UPDATE orders SET status='FAILED', provision_error=?, notified=1 WHERE invoice=?",
+                         ("akun target tidak ditemukan", invoice))
+            conn.commit()
+        finally:
+            conn.close()
+        fresh = order_by_invoice(invoice)
+        if fresh:
+            premium_order_notify(fresh, False, "akun target tidak ditemukan")
+        return False
+
+    username = str(target["account_username"])
+    protocol = str(target["protocol"])
+    service = "ssh" if protocol == "ssh" else "xray"
+    server_id = int(target["server_id"] or 0)
+    days = int(row["days"] or 0)
+    current_quota = int(target["quota_gb"] or 0)
+    current_ip = int(target["ip_limit"] or 0)
+    new_quota = max(current_quota, int(row["quota_gb"] or 0))
+    new_ip = max(current_ip, int(row["ip_limit"] or 0))
+    current_expiry = int(target["service_expires_at"] or 0)
+    if current_expiry <= 0:
+        current_expiry = int(target["paid_at"] or target["created_at"] or 0) + int(target["days"] or 0) * 86400
+    if int(target["expiry_suspended"] or 0):
+        try:
+            resume_account_on_server(server_id, service, protocol, username)
+        except Exception:
+            logger.warning("resume sebelum renew gagal %s", traceback.format_exc())
+    try:
+        result = renew_account_on_server(
+            server_id, service, protocol, username, days, new_ip, new_quota,
+            idempotency_key="renew-" + invoice,
+        )
+    except ValueError as exc:
+        conn = db_connect()
+        try:
+            conn.execute("UPDATE orders SET status='FAILED', provision_error=?, notified=1 WHERE invoice=?",
+                         (str(exc)[:1000], invoice))
+            conn.commit()
+        finally:
+            conn.close()
+        fresh = order_by_invoice(invoice)
+        if fresh:
+            premium_order_notify(fresh, False, str(exc))
+        audit("premium_renew", f"{invoice} {username} gagal: {exc}", "")
+        return False
+
+    now = int(time.time())
+    node_expiry = int(result.get("expires_at") or 0)
+    new_expiry = node_expiry if node_expiry > now else max(now, current_expiry) + days * 86400
+    output = str(result.get("output") or target["account_output"] or "")
+    conn = db_connect()
+    try:
+        conn.execute(
+            "UPDATE orders SET days=days+?, quota_gb=?, ip_limit=?, account_output=?,"
+            " service_expires_at=?, expiry_suspended=0, renew_count=renew_count+1,"
+            " provision_error='', notified=1 WHERE id=?",
+            (days, new_quota, new_ip, output, new_expiry, int(target["id"])),
+        )
+        conn.execute(
+            "UPDATE orders SET status='COMPLETED', account_username=?, account_output=?,"
+            " provision_error='', notified=1, service_expires_at=? WHERE invoice=?",
+            (username, output, new_expiry, invoice),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    fresh = order_by_invoice(invoice)
+    if fresh:
+        premium_order_notify(fresh, True)
+    audit("premium_renew",
+          f"{invoice} {username} +{days}d exp={new_expiry} quota={new_quota} ip={new_ip}", "")
+    return True
+
 def provision_premium_order(invoice: str) -> bool:
     global CREATE_LOCK
     with CREATE_LOCK:
         row = order_by_invoice(invoice)
         if not row:
             return False
+        if str(row["action"] or "new") == "renew":
+            return provision_renewal_order(row)
         if row["status"] == "COMPLETED" and row["account_output"]:
             return True
         if not row["reference"] and not row["paid_at"]:
@@ -5879,11 +6298,13 @@ def user_accounts(user_id: int) -> list[dict]:
     conn = db_connect()
     try:
         free_rows = conn.execute(
-            "SELECT * FROM accounts WHERE user_id=? AND status IN ('active','failed') AND kind='free' ORDER BY id DESC",
+            "SELECT * FROM accounts WHERE user_id=? AND status IN ('active','failed','expired')"
+            " AND kind='free' ORDER BY id DESC",
             (int(user_id),),
         ).fetchall()
         order_rows = conn.execute(
-            "SELECT * FROM orders WHERE user_id=? AND status='COMPLETED' ORDER BY id DESC",
+            "SELECT * FROM orders WHERE user_id=? AND status='COMPLETED'"
+            " AND action='new' ORDER BY id DESC",
             (int(user_id),),
         ).fetchall()
         payg_rows = conn.execute(
@@ -5956,18 +6377,20 @@ def user_accounts(user_id: int) -> list[dict]:
             continue
         service = "ssh" if row["protocol"] == "ssh" else "xray"
         sid = int(row["server_id"] or 0)
+        base_time = int(row["paid_at"] or row["created_at"] or 0)
+        order_expiry = int(row["service_expires_at"] or 0) or base_time + int(row["days"] or 0) * 86400
         if sid > 0:
             cached = cached_order_node_status(int(row["id"]))
             if not cached or now - int(cached.get("updated_at") or 0) > 60:
                 schedule_remote_order_refresh(int(row["id"]))
-            quota = int(cached.get("quota_bytes") or 0) if cached else int(row["quota_gb"] or 0) * 1024 ** 3
+            order_quota = int(row["quota_gb"] or 0) * 1024 ** 3
+            quota = max(int(cached.get("quota_bytes") or 0) if cached else 0, order_quota)
             usage = int(cached.get("usage_bytes") or 0) if cached else 0
             ip_limit = int(cached.get("ip_limit") or 0) if cached else int(row["ip_limit"] or 0)
             sessions = list(cached.get("sessions") or []) if cached else []
             state = cached.get("mullog") if cached else None
             hold = bool(state and state.get("hold"))
-            base_time = int(row["paid_at"] or row["created_at"] or 0)
-            expires = int(cached.get("expires_at") or 0) if cached else base_time + int(row["days"] or 0) * 86400
+            expires = order_expiry
             today = 0
         else:
             paths = account_paths(service, row["protocol"], username)
@@ -5978,8 +6401,7 @@ def user_accounts(user_id: int) -> list[dict]:
             ip_limit = _int_file(paths["ip"])
             if ip_limit <= 0 and int(row["ip_limit"] or 0) > 0:
                 ip_limit = int(row["ip_limit"])
-            base_time = int(row["paid_at"] or row["created_at"] or 0)
-            expires = base_time + int(row["days"] or 0) * 86400
+            expires = order_expiry
             state = mullog_state_for(states, username, row["protocol"] if service == "xray" else "")
             hold = bool(state.get("hold")) if state else False
             sessions = []
@@ -6006,6 +6428,8 @@ def user_accounts(user_id: int) -> list[dict]:
             "expired": expires < now,
             "server_id": sid,
             "server_label": labels.get(sid, ""),
+            "order_id": int(row["id"]),
+            "expiry_suspended": bool(int(row["expiry_suspended"] or 0)),
             "_cached_sessions": sessions,
         })
 
@@ -6348,6 +6772,25 @@ class Handler(BaseHTTPRequestHandler):
                 token, cookie = self.public_form_token()
                 self.html(200, render_free_page(token, get_settings()), cookies=[cookie] if cookie else None, head_only=head_only)
                 return
+            if path == "/premium/renew":
+                session = self.user_session()
+                if not session:
+                    self.redirect("/login?next=" + urllib.parse.quote(self.path[:300], safe="/"))
+                    return
+                code = (query.get("order", [""])[0] or "").strip().upper()
+                row = order_by_invoice(code)
+                if (not row or int(row["user_id"] or 0) != int(session["user_id"])
+                        or str(row["status"]) != "COMPLETED"
+                        or str(row["action"] or "new") != "new"
+                        or not row["account_username"]):
+                    self.html(404, render_not_found())
+                    return
+                token, cookie = self.public_form_token()
+                self.html(200, render_renew_page(token, row, get_settings()),
+                          cookies=[cookie] if cookie else None,
+                          extra_headers={"Cache-Control": "no-store", "X-Robots-Tag": "noindex, nofollow"},
+                          head_only=head_only)
+                return
             if path == "/premium" or path == "/premium/":
                 if not self.user_session():
                     self.redirect("/login?next=/premium")
@@ -6575,6 +7018,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/buat":
                 self.public_create()
                 return
+            if path == "/premium/renew":
+                self.premium_renew()
+                return
             if path == "/premium/buy":
                 self.premium_buy()
                 return
@@ -6741,6 +7187,45 @@ class Handler(BaseHTTPRequestHandler):
             self.html(500, render_error("Pembuatan akun gagal. Silakan coba lagi atau hubungi admin.", retry=True))
             return
         self.redirect(f"/hasil/{account['token']}")
+
+    def premium_renew(self) -> None:
+        session = self.user_session()
+        if not session:
+            self.redirect("/login?next=/dashboard/akun")
+            return
+        body = self.parse_body()
+        token_cookie = self.cookie(FORM_COOKIE)
+        if not token_cookie or not hmac.compare_digest(body.get("_form", ""), token_cookie):
+            self.html(400, render_error("Sesi formulir kedaluwarsa. Muat ulang halaman lalu coba lagi."))
+            return
+        if not rate_ok("renew:" + self.client_ip(), 6, 600):
+            self.html(429, render_error("Terlalu banyak percobaan. Tunggu beberapa menit lalu coba lagi."))
+            return
+        ts_ok, ts_msg = verify_turnstile(body.get("cf-turnstile-response", ""), self.client_ip())
+        if not ts_ok:
+            self.html(400, render_error(ts_msg, retry=True))
+            return
+        try:
+            order_id = int(body.get("order_id", "0"))
+        except ValueError:
+            order_id = 0
+        product_code = body.get("product_code", "").strip()[:40]
+        if not re.fullmatch(r"[a-z0-9-]{3,40}", product_code):
+            self.html(400, render_error("Paket perpanjangan tidak valid.", retry=True))
+            return
+        try:
+            order = create_renewal_order(
+                order_id, product_code, self.client_ip(),
+                self.headers.get("User-Agent", ""), int(session["user_id"]),
+            )
+        except ValueError as exc:
+            self.html(409, render_error(str(exc), retry=True))
+            return
+        except Exception:
+            logger.error("premium renew: %s", traceback.format_exc())
+            self.html(500, render_error("Gagal membuat invoice perpanjangan.", retry=True))
+            return
+        self.redirect(f"/invoice/{order['invoice']}?new=1")
 
     def premium_buy(self) -> None:
         session = self.user_session()
@@ -8556,7 +9041,7 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
 <meta name="theme-color" content="{UI_THEME_COLORS.get(b['theme'], '#fffaf2')}">
 {robots}
 {favicon}
-<link rel="stylesheet" href="/static/style.css?v=20261115servers3">
+<link rel="stylesheet" href="/static/style.css?v=20261115servers4">
 {turnstile_script}
 </head>
 <body>
@@ -8564,7 +9049,7 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
 {body}
 {footer}
 {popup_html}
-<script src="/static/app.js?v=20261115servers3" defer></script>
+<script src="/static/app.js?v=20261115servers4" defer></script>
 </body>
 </html>"""
 
@@ -9054,6 +9539,105 @@ def render_free_page(form_token: str, settings: dict[str, str]) -> str:
     return page_shell("Buat Akun Gratis", body, active="free", turnstile=ts_on)
 
 
+def render_renew_page(form_token: str, order: sqlite3.Row, settings: dict[str, str],
+                      msg: str = "") -> str:
+    now = int(time.time())
+    server_id = int(order["server_id"] or 0)
+    current_expiry = int(order["service_expires_at"] or 0)
+    if current_expiry <= 0:
+        current_expiry = int(order["paid_at"] or order["created_at"] or 0) + int(order["days"] or 0) * 86400
+    expired = current_expiry < now
+    labels = server_label_map()
+    server_label = labels.get(server_id, "VPS Utama")
+    proto_label = "SSH" if order["protocol"] == "ssh" else PROTOCOLS.get(
+        order["protocol"], {}).get("label", str(order["protocol"]).upper())
+    products = [
+        item for item in premium_products_for_server(server_id, active_only=True)
+        if item["protocol"] == order["protocol"]
+    ]
+    ts_site, _ts_secret, ts_on = turnstile_config()
+    ts_widget = (
+        '<div class="turnstile-box">'
+        f'<div class="cf-turnstile" data-sitekey="{e(ts_site)}" data-theme="light"'
+        ' data-language="id" data-size="flexible"></div>'
+        '<small class="turnstile-status" data-turnstile-status>Memuat verifikasi keamanan…</small>'
+        '</div>'
+        if ts_on else ""
+    )
+    notice = ""
+    if msg:
+        notice = f'<div class="notice notice-error">{e(msg)}</div>'
+    cards = ""
+    for index, item in enumerate(products):
+        quota_text = (f"{int(item['quota_gb'])} GB" if int(item["quota_gb"]) > 0 else "Tanpa batas")
+        cards += (
+            f'<label class="duration-card{" selected" if index == 0 else ""}">'
+            f'<input type="radio" name="product_code" value="{e(item["code"])}"'
+            f'{" checked" if index == 0 else ""}>'
+            f'<span class="duration-badge">{int(item["days"])} HARI</span>'
+            f'<b>{int(item["days"])} hari</b>'
+            f'<small>Kuota {e(quota_text)} · Limit {int(item["ip_limit"]) if int(item["ip_limit"]) > 0 else "∞"} IP</small>'
+            f'<span class="duration-quota">{rupiah(int(item["price"]))}</span>'
+            '</label>'
+        )
+    if not cards:
+        cards = '<div class="notice notice-warn">Belum ada paket untuk protokol ini di server akun.</div>'
+    status_text = "Sudah berakhir" if expired else "Masih aktif"
+    status_class = "badge-bad" if expired else "badge-ok"
+    body = f"""
+<main>
+  <section class="section wrap page-section">
+    <div class="admin-head">
+      <div><span class="mini-label">PERPANJANG / UPGRADE</span><h1>Perpanjang akun premium</h1>
+        <p>Masa aktif ditambahkan dari sisa yang ada. Kuota dan limit IP tidak diturunkan.</p></div>
+      <a class="btn btn-ghost btn-small" href="/dashboard/akun">‹ Akun saya</a>
+    </div>
+    {notice}
+    <div class="premium-layout">
+      <div class="premium-picker panel">
+        <div class="premium-step">
+          <span class="mini-label">AKUN</span>
+          <div class="premium-summary" style="display:block">
+            <div><span>Username</span><b>{e(order['account_username'])}</b></div>
+            <div><span>Layanan</span><b>{e(proto_label)} · {e(server_label)}</b></div>
+            <div><span>Masa aktif</span><b>{e(fmt_ts(current_expiry, '%d %b %Y · %H:%M WIB'))}</b>
+              <span class="badge {status_class}">{status_text}</span></div>
+            <div><span>Kuota sekarang</span><b>{int(order['quota_gb'] or 0)} GB</b></div>
+            <div><span>Limit IP sekarang</span><b>{int(order['ip_limit'] or 0) if int(order['ip_limit'] or 0) > 0 else '∞'}</b></div>
+          </div>
+        </div>
+        <form method="post" action="/premium/renew">
+          <input type="hidden" name="_form" value="{e(form_token)}">
+          <input type="hidden" name="order_id" value="{int(order['id'])}">
+          <div class="premium-step">
+            <span class="mini-label">PILIH PAKET</span>
+            <div class="duration-grid">{cards}</div>
+          </div>
+          {ts_widget}
+          <button class="btn btn-primary btn-block btn-premium" type="submit"
+            {'disabled' if not products else ''}>Buat invoice perpanjangan ↗</button>
+        </form>
+        <p class="form-note">Pembayaran memakai QRIS GoPay seperti pembelian biasa.
+          Setelah lunas, akun di node langsung diperpanjang tanpa membuat akun baru.</p>
+      </div>
+      <aside class="premium-side">
+        <div class="panel premium-info">
+          <div class="premium-badge">RENEW / UPGRADE</div>
+          <h3>Tetap akun yang sama.</h3>
+          <p>Username, password, dan konfigurasi tidak berubah. Hanya masa aktif, kuota, dan limit IP yang diperbarui.</p>
+          <ul>
+            <li>Masa aktif ditambahkan, tidak di-reset.</li>
+            <li>Kuota/IP memakai nilai tertinggi.</li>
+            <li>Bisa dilakukan sebelum atau sesudah expired.</li>
+          </ul>
+        </div>
+      </aside>
+    </div>
+  </section>
+</main>
+"""
+    return page_shell("Perpanjang Premium", body, active="premium", turnstile=ts_on)
+
 def render_premium_page(form_token: str, settings: dict[str, str], scheme: str = "duration",
                         server_id: int = 0) -> str:
     server_id = int(server_id or 0)
@@ -9537,6 +10121,11 @@ def render_account_card(account: dict) -> str:
         download_url = f"/invoice/{account['invoice']}.txt"
         link_url = f"/invoice/{account['invoice']}"
     actions = []
+    if account.get("source") == "premium" and account.get("invoice"):
+        actions.append(
+            f'<a class="btn btn-small btn-primary" href="/premium/renew?order={e(account["invoice"])}">'
+            'Perpanjang / Upgrade</a>'
+        )
     if output:
         copy_label = _copy_label(account["service"], account["protocol"])
         actions.append(f'<button class="btn btn-small btn-ghost" type="button" data-copy-target="{output_id}">{icon("copy")} {e(copy_label)}</button>')
@@ -11463,6 +12052,7 @@ def main() -> int:
         logger.warning("snapshot awal usage gagal: %s", traceback.format_exc())
     threading.Thread(target=usage_snapshot_loop, name="usage-snapshot", daemon=True).start()
     threading.Thread(target=node_monitor_loop, name="node-monitor", daemon=True).start()
+    threading.Thread(target=expiry_daemon, name="expiry", daemon=True).start()
 
     if not Path(SSH_SCRIPT).exists():
         logger.warning("script %s tidak ditemukan", SSH_SCRIPT)
