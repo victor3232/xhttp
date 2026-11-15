@@ -7144,6 +7144,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/admin/server":
                 self.admin_server()
                 return
+            if path == "/admin/nodes/connection":
+                self.admin_nodes_connection()
+                return
             if path == "/admin/nodes/product/add":
                 self.admin_nodes_product_add()
                 return
@@ -8312,6 +8315,58 @@ class Handler(BaseHTTPRequestHandler):
             extra_headers={"Cache-Control": "no-store", "X-Robots-Tag": "noindex, nofollow"},
             head_only=head_only,
         )
+
+    def admin_nodes_connection(self) -> None:
+        body = self.parse_body()
+        session = self.require_admin(body.get("_csrf", ""))
+        if not session:
+            return
+        try:
+            sid = int(body.get("id", "0") or 0)
+        except ValueError:
+            sid = 0
+        server = server_by_id(sid) if sid > 0 else None
+        if not server:
+            self.redirect("/admin/nodes?msg=invalid")
+            return
+        base_url = body.get("base_url", "").strip()[:200].rstrip("/")
+        api_key = body.get("api_key", "").strip()[:80]
+        secret = body.get("secret", "").strip()
+        if (not base_url.startswith("https://")
+                or not re.fullmatch(r"[A-Za-z0-9._-]{8,80}", api_key)
+                or (secret and len(secret) < 32)):
+            self.redirect("/admin/nodes/settings?id=%d&msg=invalid" % sid)
+            return
+        conn = db_connect()
+        try:
+            if secret:
+                conn.execute(
+                    "UPDATE servers SET base_url=?, api_key=?, secret_enc=?, token='',"
+                    " last_error='' WHERE id=?",
+                    (base_url, api_key, encrypt_node_secret(secret), sid),
+                )
+            else:
+                conn.execute(
+                    "UPDATE servers SET base_url=?, api_key=?, token='', last_error='' WHERE id=?",
+                    (base_url, api_key, sid),
+                )
+            conn.commit()
+        finally:
+            conn.close()
+        audit("nodes", "connection update %s %s" % (sid, base_url), self.client_ip())
+        try:
+            fresh = server_by_id(sid)
+            node_request(fresh, "GET", "/v1/health", timeout=20)
+            self.redirect("/admin/nodes/settings?id=%d&msg=saved" % sid)
+        except NodeError as exc:
+            conn = db_connect()
+            try:
+                conn.execute("UPDATE servers SET last_error=? WHERE id=?",
+                             (str(exc)[:240], sid))
+                conn.commit()
+            finally:
+                conn.close()
+            self.redirect("/admin/nodes/settings?id=%d&msg=connectionfail" % sid)
 
     def admin_nodes_product_add(self) -> None:
         body = self.parse_body()
@@ -10923,6 +10978,7 @@ def render_server_settings_page(session: sqlite3.Row, server_id: int, msg: str =
         code = str(server["code"] or "")
         isp = str(server["isp"] or "-")
         base_url = str(server["base_url"] or "")
+        api_key = str(server["api_key"] or "")
         status = str(server["status"] or "")
     else:
         info = server_info()
@@ -10930,12 +10986,14 @@ def render_server_settings_page(session: sqlite3.Row, server_id: int, msg: str =
         code = "utama"
         isp = local_isp_name()
         base_url = "VPS utama (lokal)"
+        api_key = ""
         status = "active"
     ss = server_settings_for(sid, settings)
 
     messages = {
         "saved": ("ok", "Pengaturan server disimpan dan langsung dipakai."),
         "invalid": ("error", "Pengaturan tidak valid. Periksa angka yang diisi."),
+        "connectionfail": ("error", "Koneksi ke agent gagal. Data tetap disimpan; periksa URL/API Key/Secret lalu Tes ulang."),
     }
     notice = ""
     if msg in messages:
@@ -11033,6 +11091,23 @@ def render_server_settings_page(session: sqlite3.Row, server_id: int, msg: str =
     </details>
   </section>"""
 
+    connection_html = ""
+    if sid > 0:
+        connection_html = f"""
+  <section class="panel admin-panel">
+    <div class="panel-head"><div><span class="mini-label">KONEKSI AGENT</span><h2>URL &amp; credential node</h2></div>
+      <span class="panel-hint">Secret tidak ditampilkan.</span></div>
+    <form method="post" action="/admin/nodes/connection" class="settings-grid">
+      <input type="hidden" name="_csrf" value="{e(session['csrf'])}">
+      <input type="hidden" name="id" value="{sid}">
+      <label>URL agent<input type="text" name="base_url" maxlength="200" value="{e(base_url)}" required></label>
+      <label>API Key<input type="text" name="api_key" maxlength="80" value="{e(api_key)}" required></label>
+      <label>Secret baru (opsional)<input type="password" name="secret" maxlength="200" placeholder="kosongkan jika tidak berubah"></label>
+      <div class="form-actions"><button class="btn btn-primary btn-small" type="submit">Simpan koneksi</button></div>
+    </form>
+    <p class="panel-hint">Gunakan ini jika VPS cabang diinstal ulang atau secret berubah. ID server tetap, jadi akun, harga, dan riwayat tidak hilang.</p>
+  </section>"""
+
     body = f"""
 <main class="admin-main wrap">
   <div class="admin-head">
@@ -11041,6 +11116,7 @@ def render_server_settings_page(session: sqlite3.Row, server_id: int, msg: str =
     <a class="btn btn-ghost btn-small" href="/admin/nodes">‹ Multi-Server</a>
   </div>
   {notice}
+  {connection_html}
   <section class="panel admin-panel">
     <div class="panel-head"><div><span class="mini-label">SAKELAR LAYANAN</span><h2>Kategori &amp; protokol</h2></div>
       <span class="panel-hint">Berlaku hanya untuk server ini.</span></div>
