@@ -880,6 +880,7 @@ def render_admin_nodes(session: sqlite3.Row, msg: str = "", test_id: int = 0) ->
         "rotatefail": ("error", "Rotasi kredensial gagal. Kredensial lama tetap dipakai."),
         "revoked": ("ok", "Credential node dicabut. Node dinonaktifkan sampai diaktifkan ulang dari VPS node."),
         "revokefail": ("error", "Pencabutan credential gagal."),
+        "locationfail": ("error", "Node tidak mengirim info ISP/region. Pastikan agent v2 terpasang dan dapat menghubungi ipinfo."),
     }
     notice = ""
     if msg in messages:
@@ -901,7 +902,7 @@ def render_admin_nodes(session: sqlite3.Row, msg: str = "", test_id: int = 0) ->
         last = time.strftime("%d %b %H:%M", time.localtime(int(s["last_seen"]))) if s["last_seen"] else "-"
         err = ("<small>%s</small>" % e(s["last_error"])) if s["last_error"] and not online else ""
         server_rows += (
-            "<tr><td><b>%s</b><small>%s · %s</small></td>"
+            "<tr><td><b>%s</b><small>%s · %s · %s</small></td>"
             "<td><code>%s</code><small>key %s</small></td>"
             "<td>%s<small>%s · %s</small>%s</td>"
             "<td>%s</td><td>%.2f×</td><td>"
@@ -925,7 +926,8 @@ def render_admin_nodes(session: sqlite3.Row, msg: str = "", test_id: int = 0) ->
             '<input type="hidden" name="id" value="%s">'
             '<button class="btn btn-tiny btn-danger" type="submit">Hapus</button></form>'
             "</td></tr>"
-            % (e(s["name"]), e(s["code"]), e(s["region"]), e(s["base_url"]),
+            % (e(s["name"]), e(s["code"]), e(s["region"]), e(s["isp"] or "-"),
+               e(s["base_url"]),
                (e(str(s["api_key"])[:10]) + "…") if s["api_key"] else "legacy",
                badge, e(s["last_version"] or "-"), e(last), err, int(s["max_slots"]),
                float(s["price_multiplier"] or 1), e(session["csrf"]), int(s["id"]),
@@ -991,9 +993,7 @@ def render_admin_nodes(session: sqlite3.Row, msg: str = "", test_id: int = 0) ->
     <div class="panel-head"><div><span class="mini-label">TAMBAH NODE</span><h2>Daftarkan VPS cabang</h2></div></div>
     <form method="post" action="/admin/nodes/add" class="settings-grid">
       <input type="hidden" name="_csrf" value="{e(session['csrf'])}">
-      <label>Nama<input type="text" name="name" maxlength="60" placeholder="Indonesia" required></label>
-      <label>Kode<input type="text" name="code" maxlength="16" placeholder="id-1" required></label>
-      <label>Region<input type="text" name="region" maxlength="40" placeholder="Indonesia" value="Indonesia"></label>
+      <p class="panel-hint" style="grid-column:1/-1">Nama, kode, ISP, dan region diambil otomatis dari node. Kode memakai format <b>sg-1</b>, <b>id-1</b>, dst.</p>
       <label>URL agent<input type="text" name="base_url" maxlength="200" placeholder="https://node.domain:8787" required></label>
       <label>API Key<input type="text" name="api_key" maxlength="80" placeholder="id-1-xxxxxxxx" required></label>
       <label>Secret Token<input type="password" name="secret" maxlength="200" placeholder="minimal 32 karakter" required></label>
@@ -6474,15 +6474,10 @@ class Handler(BaseHTTPRequestHandler):
         session = self.require_admin(body.get("_csrf", ""))
         if not session:
             return
-        name = body.get("name", "").strip()[:60]
-        code = body.get("code", "").strip().lower()[:16]
-        region = body.get("region", "").strip()[:40]
         base_url = body.get("base_url", "").strip()[:200].rstrip("/")
         api_key = body.get("api_key", "").strip()[:80]
         secret = body.get("secret", "").strip()
         token = body.get("token", "").strip()
-        if not token and secret:
-            token = secret
         try:
             max_slots = max(0, min(10000, int(body.get("max_slots", "0") or 0)))
         except ValueError:
@@ -6491,29 +6486,75 @@ class Handler(BaseHTTPRequestHandler):
             multiplier = max(0.1, min(10.0, float(body.get("price_multiplier", "1") or 1)))
         except ValueError:
             multiplier = 1.0
-        if (not name or not re.fullmatch(r"[a-z0-9-]{2,16}", code)
-                or not base_url.startswith("https://")
+        if (not base_url.startswith("https://")
                 or (not api_key and len(token) < 32)
                 or (api_key and (not re.fullmatch(r"[A-Za-z0-9._-]{8,80}", api_key)
                                  or len(secret) < 32))):
             self.redirect("/admin/nodes?msg=invalid")
             return
         secret_enc = encrypt_node_secret(secret) if (api_key and secret) else ""
+        probe = {
+            "base_url": base_url, "api_key": api_key, "secret_enc": secret_enc,
+            "token": token or secret, "code": "probe",
+        }
+        try:
+            info = node_request(probe, "GET", "/v1/health", timeout=20)
+        except NodeError as exc:
+            conn = db_connect()
+            try:
+                conn.execute("INSERT INTO node_health(server_id,ok,last_error,updated_at) "
+                             "VALUES(0,0,?,?) ON CONFLICT(server_id) DO UPDATE SET "
+                             "ok=0,last_error=excluded.last_error,updated_at=excluded.updated_at",
+                             (str(exc)[:200], int(time.time())))
+                conn.commit()
+            finally:
+                conn.close()
+            self.redirect("/admin/nodes?msg=testfail")
+            return
+        loc = info.get("location") or {}
+        cc = str(loc.get("country_code") or "").strip().upper()
+        isp = str(loc.get("isp") or "").strip()[:80]
+        city = str(loc.get("city") or "").strip()[:80]
+        if len(cc) != 2 or not cc.isalpha() or not isp:
+            self.redirect("/admin/nodes?msg=locationfail")
+            return
+        region = COUNTRY_NAMES.get(cc) or cc
+
+        def _norm(value: str) -> str:
+            return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+
         conn = db_connect()
         try:
-            conn.execute(
-                "INSERT INTO servers(code,name,region,base_url,token,api_key,secret_enc,"
-                "max_slots,price_multiplier,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-                (code, name, region, base_url, token, api_key, secret_enc,
-                 max_slots, multiplier, int(time.time())),
+            rows = conn.execute("SELECT code,isp,country_code FROM servers").fetchall()
+            prefix = cc.lower() + "-"
+            nums = []
+            for row in rows:
+                m = re.fullmatch(re.escape(prefix) + r"(\d+)", str(row["code"] or ""))
+                if m:
+                    nums.append(int(m.group(1)))
+            code = "%s%d" % (prefix, (max(nums) if nums else 0) + 1)
+            same = sum(
+                1 for row in rows
+                if str(row["country_code"] or "").upper() == cc
+                and _norm(row["isp"]) == _norm(isp)
             )
-            conn.commit()
-        except sqlite3.IntegrityError:
-            self.redirect("/admin/nodes?msg=exists")
-            return
+            name = region if same == 0 else "%s v%d" % (region, same + 1)
+            try:
+                conn.execute(
+                    "INSERT INTO servers(code,name,region,isp,country_code,city,base_url,token,"
+                    "api_key,secret_enc,max_slots,price_multiplier,created_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (code, name, region, isp, cc, city, base_url,
+                     "" if api_key else token, api_key, secret_enc,
+                     max_slots, multiplier, int(time.time())),
+                )
+                conn.commit()
+            except sqlite3.IntegrityError:
+                self.redirect("/admin/nodes?msg=exists")
+                return
         finally:
             conn.close()
-        audit("nodes", "add %s %s" % (code, base_url), self.client_ip())
+        audit("nodes", "add %s %s %s/%s" % (code, base_url, isp, cc), self.client_ip())
         self.redirect("/admin/nodes?msg=added")
 
     def admin_nodes_delete(self) -> None:
@@ -6666,8 +6707,8 @@ class Handler(BaseHTTPRequestHandler):
         conn = db_connect()
         try:
             conn.execute(
-                "UPDATE servers SET api_key=?, secret_enc=?, token=?, last_error='' WHERE id=?",
-                (new_key, encrypt_node_secret(new_secret), new_secret, sid),
+                "UPDATE servers SET api_key=?, secret_enc=?, token='', last_error='' WHERE id=?",
+                (new_key, encrypt_node_secret(new_secret), sid),
             )
             conn.commit()
         finally:
