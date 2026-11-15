@@ -776,6 +776,7 @@ def init_nodes() -> None:
             CREATE TABLE IF NOT EXISTS server_products (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 server_id INTEGER NOT NULL,
+                code TEXT NOT NULL DEFAULT '',
                 protocol TEXT NOT NULL,
                 days INTEGER NOT NULL,
                 label TEXT NOT NULL DEFAULT '',
@@ -861,12 +862,19 @@ def init_nodes() -> None:
             ("orders", "renew_count", "INTEGER NOT NULL DEFAULT 0"),
             ("server_settings", "payg_base_ssh", "INTEGER NOT NULL DEFAULT 0"),
             ("server_settings", "payg_base_xray", "INTEGER NOT NULL DEFAULT 0"),
+            ("server_products", "code", "TEXT NOT NULL DEFAULT ''"),
             ("payg_accounts", "offline_since", "INTEGER NOT NULL DEFAULT 0"),
         ):
             _ensure_column(conn, table, column, ddl)
         conn.execute(
             "UPDATE orders SET service_expires_at=COALESCE(paid_at,created_at)+days*86400 "
             "WHERE status='COMPLETED' AND service_expires_at=0"
+        )
+        conn.execute(
+            "UPDATE server_products SET code=COALESCE(("
+            " SELECT p.code FROM premium_products p"
+            " WHERE p.protocol=server_products.protocol AND p.days=server_products.days"
+            "), '') WHERE code=''"
         )
         conn.commit()
     finally:
@@ -5279,17 +5287,21 @@ def _server_product_overrides(server_id: int) -> dict:
     return {(str(r["protocol"]), int(r["days"])): r for r in rows}
 
 def premium_products_for_server(server_id: int, active_only: bool = True) -> list[dict]:
-    """Paket premium dengan harga/limit khusus server. Fallback ke paket global."""
+    """Paket premium server: override global + paket khusus server."""
     sid = int(server_id or 0)
     overrides = _server_product_overrides(sid)
     server = server_by_id(sid) if sid > 0 else None
     multiplier = float(server["price_multiplier"] or 1) if server else 1.0
-    result = []
+    result: list[dict] = []
+    global_keys = set()
     for row in premium_products(active_only=False):
-        if active_only and not int(row["active"] or 0):
-            continue
-        ov = overrides.get((str(row["protocol"]), int(row["days"])))
-        if ov is not None and active_only and not int(ov["active"] or 0):
+        protocol = str(row["protocol"])
+        days = int(row["days"])
+        key = (protocol, days)
+        global_keys.add(key)
+        ov = overrides.get(key)
+        if active_only and (not int(row["active"] or 0)
+                            or (ov is not None and not int(ov["active"] or 0))):
             continue
         price = int(ov["price"]) if ov is not None else int(row["price"])
         if ov is None and sid > 0:
@@ -5297,15 +5309,44 @@ def premium_products_for_server(server_id: int, active_only: bool = True) -> lis
         result.append({
             "id": int(row["id"]),
             "code": str(row["code"]),
-            "protocol": str(row["protocol"]),
+            "protocol": protocol,
             "label": str((ov["label"] if ov is not None and ov["label"] else row["label"])),
-            "days": int(row["days"]),
+            "days": days,
             "price": max(0, price),
+            "base_price": int(row["price"]),
             "ip_limit": int(ov["ip_limit"]) if ov is not None else int(row["ip_limit"]),
             "quota_gb": int(ov["quota_gb"]) if ov is not None else int(row["quota_gb"]),
             "active": bool(int(row["active"] or 0)) and (ov is None or bool(int(ov["active"] or 0))),
             "override": ov is not None,
+            "server_only": False,
+            "sort": int(row["sort"] or 0),
         })
+    for key, ov in overrides.items():
+        protocol, days = key
+        if key in global_keys:
+            continue
+        if active_only and not int(ov["active"] or 0):
+            continue
+        code = str(ov["code"] or "").strip() if "code" in ov.keys() else ""
+        if not code:
+            code = "s%d-%s-%d" % (sid, protocol, days)
+        label = str(ov["label"] or "").strip() or ("%s %d Hari" % (protocol.upper(), days))
+        result.append({
+            "id": 0,
+            "code": code,
+            "protocol": protocol,
+            "label": label,
+            "days": days,
+            "price": max(0, int(ov["price"] or 0)),
+            "base_price": 0,
+            "ip_limit": int(ov["ip_limit"] or 0),
+            "quota_gb": int(ov["quota_gb"] or 0),
+            "active": bool(int(ov["active"] or 0)),
+            "override": True,
+            "server_only": True,
+            "sort": int(ov["sort"] or 0),
+        })
+    result.sort(key=lambda item: (int(item.get("sort") or 0), item["protocol"], int(item["days"])))
     return result
 
 def premium_product_for_server(server_id: int, code: str, active_only: bool = True) -> dict | None:
@@ -7087,6 +7128,9 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/admin/server":
                 self.admin_server()
                 return
+            if path == "/admin/nodes/product/add":
+                self.admin_nodes_product_add()
+                return
             if path == "/admin/nodes/settings":
                 self.admin_nodes_settings_save()
                 return
@@ -8253,6 +8297,56 @@ class Handler(BaseHTTPRequestHandler):
             head_only=head_only,
         )
 
+    def admin_nodes_product_add(self) -> None:
+        body = self.parse_body()
+        session = self.require_admin(body.get("_csrf", ""))
+        if not session:
+            return
+        try:
+            sid = int(body.get("id", "0") or 0)
+        except ValueError:
+            sid = 0
+        if sid <= 0 or not server_by_id(sid):
+            self.redirect("/admin/nodes?msg=invalid")
+            return
+        protocol = body.get("protocol", "")
+        if protocol not in PROTOCOLS and protocol != "ssh":
+            self.redirect("/admin/nodes/settings?id=%d&msg=invalid" % sid)
+            return
+        try:
+            days = max(1, min(365, int(body.get("days", "30"))))
+            price = max(1000, min(10000000, int(body.get("price", "10000"))))
+            ip_limit = max(0, min(100, int(body.get("ip_limit", "2"))))
+            quota_gb = max(0, min(10000, int(body.get("quota_gb", "0"))))
+        except ValueError:
+            self.redirect("/admin/nodes/settings?id=%d&msg=invalid" % sid)
+            return
+        label = (body.get("label", "").strip()[:40]
+                 or "%s %d Hari" % (protocol.upper(), days))
+        global_row = None
+        conn = db_connect()
+        try:
+            global_row = conn.execute(
+                "SELECT code FROM premium_products WHERE protocol=? AND days=?",
+                (protocol, days),
+            ).fetchone()
+            code = str(global_row["code"]) if global_row else "s%d-%s-%d" % (sid, protocol, days)
+            now = int(time.time())
+            conn.execute(
+                "INSERT INTO server_products(server_id,code,protocol,days,label,price,ip_limit,"
+                "quota_gb,active,sort,updated_at) VALUES(?,?,?,?,?,?,?,?,1,?,?) "
+                "ON CONFLICT(server_id,protocol,days) DO UPDATE SET code=excluded.code,"
+                "label=excluded.label,price=excluded.price,ip_limit=excluded.ip_limit,"
+                "quota_gb=excluded.quota_gb,active=1,sort=excluded.sort,"
+                "updated_at=excluded.updated_at",
+                (sid, code, protocol, days, label, price, ip_limit, quota_gb, now, now),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        audit("nodes", "product add %s %s/%sd" % (sid, protocol, days), self.client_ip())
+        self.redirect("/admin/nodes/settings?id=%d&msg=saved" % sid)
+
     def admin_nodes_settings_save(self) -> None:
         body = self.parse_body()
         session = self.require_admin(body.get("_csrf", ""))
@@ -8326,26 +8420,27 @@ class Handler(BaseHTTPRequestHandler):
             if sid > 0:
                 conn.execute("UPDATE servers SET max_slots=?, price_multiplier=? WHERE id=?",
                              (values["max_slots"], multiplier, sid))
-                for row in conn.execute("SELECT * FROM premium_products WHERE active=1").fetchall():
-                    pid = int(row["id"])
-                    price_raw = body.get("price_%d" % pid)
+                for item in premium_products_for_server(sid, active_only=False):
+                    code = str(item["code"])
+                    price_raw = body.get("price_" + code)
                     if price_raw is None:
                         continue
                     try:
                         price = max(1000, min(10000000, int(price_raw)))
                     except ValueError:
-                        price = int(row["price"])
-                    ip_limit = number("ip_%d" % pid, int(row["ip_limit"]), 0, 100)
-                    quota_gb = number("quota_%d" % pid, int(row["quota_gb"]), 0, 10000)
-                    active = 1 if body.get("active_%d" % pid) == "1" else 0
+                        price = int(item["price"])
+                    ip_limit = number("ip_" + code, int(item["ip_limit"]), 0, 100)
+                    quota_gb = number("quota_" + code, int(item["quota_gb"]), 0, 10000)
+                    active = 1 if body.get("active_" + code) == "1" else 0
                     conn.execute(
-                        "INSERT INTO server_products(server_id,protocol,days,label,price,ip_limit,"
-                        "quota_gb,active,sort,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?) "
-                        "ON CONFLICT(server_id,protocol,days) DO UPDATE SET label=excluded.label,"
-                        "price=excluded.price,ip_limit=excluded.ip_limit,quota_gb=excluded.quota_gb,"
-                        "active=excluded.active,sort=excluded.sort,updated_at=excluded.updated_at",
-                        (sid, row["protocol"], int(row["days"]), row["label"], price,
-                         ip_limit, quota_gb, active, int(row["sort"] or 0), now),
+                        "INSERT INTO server_products(server_id,code,protocol,days,label,price,"
+                        "ip_limit,quota_gb,active,sort,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) "
+                        "ON CONFLICT(server_id,protocol,days) DO UPDATE SET code=excluded.code,"
+                        "label=excluded.label,price=excluded.price,ip_limit=excluded.ip_limit,"
+                        "quota_gb=excluded.quota_gb,active=excluded.active,sort=excluded.sort,"
+                        "updated_at=excluded.updated_at",
+                        (sid, code, item["protocol"], int(item["days"]), item["label"], price,
+                         ip_limit, quota_gb, active, int(item.get("sort") or 0), now),
                     )
             conn.commit()
         finally:
@@ -10864,25 +10959,27 @@ def render_server_settings_page(session: sqlite3.Row, server_id: int, msg: str =
 
     product_rows = ""
     if sid > 0:
-        effective = {item["id"]: item for item in premium_products_for_server(sid, active_only=False)}
-        for row in premium_products(active_only=True):
-            pid = int(row["id"])
-            item = effective.get(pid)
-            if not item:
-                continue
+        for item in premium_products_for_server(sid, active_only=False):
+            code = str(item["code"])
             proto = "SSH" if item["protocol"] == "ssh" else PROTOCOLS.get(
                 item["protocol"], {}).get("label", item["protocol"].upper())
+            if item.get("server_only"):
+                source = '<small class="muted">paket khusus server</small>'
+            elif item.get("override"):
+                source = '<small class="muted">override · global %s</small>' % rupiah(int(item["base_price"]))
+            else:
+                source = '<small class="muted">global %s · multiplier</small>' % rupiah(int(item["base_price"]))
             product_rows += f"""
             <tr>
-              <td><b>{e(proto)} · {int(item['days'])} hari</b><small>{e(item['code'])}</small></td>
-              <td><small class="muted">global {rupiah(int(row['price']))}</small></td>
-              <td><input class="mini-input" type="number" name="price_{pid}" min="1000" max="10000000" value="{int(item['price'])}"></td>
-              <td><input class="mini-input" type="number" name="ip_{pid}" min="0" max="100" value="{int(item['ip_limit'])}"></td>
-              <td><input class="mini-input" type="number" name="quota_{pid}" min="0" max="10000" value="{int(item['quota_gb'])}"></td>
-              <td class="center"><input type="checkbox" name="active_{pid}" value="1"{' checked' if item['active'] else ''}></td>
+              <td><b>{e(proto)} · {int(item['days'])} hari</b><small>{e(code)}</small></td>
+              <td>{source}</td>
+              <td><input class="mini-input" type="number" name="price_{e(code)}" min="1000" max="10000000" value="{int(item['price'])}"></td>
+              <td><input class="mini-input" type="number" name="ip_{e(code)}" min="0" max="100" value="{int(item['ip_limit'])}"></td>
+              <td><input class="mini-input" type="number" name="quota_{e(code)}" min="0" max="10000" value="{int(item['quota_gb'])}"></td>
+              <td class="center"><input type="checkbox" name="active_{e(code)}" value="1"{' checked' if item['active'] else ''}></td>
             </tr>"""
         if not product_rows:
-            product_rows = '<tr><td colspan="6" class="empty">Belum ada paket premium global. Tambahkan dari Dashboard → Premium.</td></tr>'
+            product_rows = '<tr><td colspan="6" class="empty">Belum ada paket premium. Tambahkan paket khusus server di bawah.</td></tr>'
 
     products_html = ""
     if sid > 0:
@@ -10894,11 +10991,25 @@ def render_server_settings_page(session: sqlite3.Row, server_id: int, msg: str =
       <input type="hidden" name="_csrf" value="{e(session['csrf'])}">
       <input type="hidden" name="id" value="{sid}">
       <div class="table-wrap"><table class="premium-table">
-        <thead><tr><th>Paket</th><th>Harga global</th><th>Harga server</th><th>Limit IP</th><th>Kuota GB</th><th>Aktif</th></tr></thead>
+        <thead><tr><th>Paket</th><th>Acuan harga</th><th>Harga server</th><th>Limit IP</th><th>Kuota GB</th><th>Aktif</th></tr></thead>
         <tbody>{product_rows}</tbody>
       </table></div>
-      <div class="form-actions"><button class="btn btn-primary btn-small" type="submit">Simpan harga server</button></div>
+      <div class="form-actions"><button class="btn btn-primary btn-small" type="submit">Simpan paket server</button></div>
     </form>
+    <details class="add-product">
+      <summary>+ Tambah paket premium khusus server ini</summary>
+      <form method="post" action="/admin/nodes/product/add" class="settings-grid add-product-form">
+        <input type="hidden" name="_csrf" value="{e(session['csrf'])}">
+        <input type="hidden" name="id" value="{sid}">
+        <label>Layanan<select name="protocol"><option value="ssh">SSH</option><option value="vmess">VMess</option><option value="vless">VLESS</option><option value="trojan">Trojan</option></select></label>
+        <label>Label<input type="text" name="label" placeholder="SSH 5 Hari" maxlength="40"></label>
+        <label>Hari<input type="number" name="days" min="1" max="365" value="30"></label>
+        <label>Harga (Rp)<input type="number" name="price" min="1000" max="10000000" value="10000"></label>
+        <label>Limit IP<input type="number" name="ip_limit" min="0" max="100" value="2"></label>
+        <label>Kuota GB<input type="number" name="quota_gb" min="0" max="10000" value="0"></label>
+        <div class="form-actions"><button class="btn btn-dark btn-small" type="submit">Tambah paket server</button></div>
+      </form>
+    </details>
   </section>"""
 
     body = f"""
@@ -11549,7 +11660,7 @@ def render_admin_dashboard(session: sqlite3.Row, settings: dict[str, str], msg: 
   </div>
 
   <section class="panel admin-panel">
-    <div class="panel-head"><div><span class="mini-label">PREMIUM</span><h2>Paket jualan</h2></div><span class="panel-hint">Harga tidak termasuk kode unik Rp1–999.</span></div>
+    <div class="panel-head"><div><span class="mini-label">PREMIUM</span><h2>Paket jualan</h2></div><span class="panel-hint">Harga tidak termasuk kode unik Rp1–999. <a href="/admin/nodes">Atur harga per server →</a></span></div>
     <form method="post" action="/admin/premium" class="premium-table-form">
       <input type="hidden" name="_csrf" value="{e(session['csrf'])}">
       <div class="table-wrap">
