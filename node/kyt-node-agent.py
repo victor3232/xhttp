@@ -23,6 +23,7 @@ import sys
 import threading
 import time
 import urllib.parse
+import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -47,6 +48,8 @@ MULLOG_HISTORY = Path("/etc/kyt/jeda-mullog/history.jsonl")
 HTML_DIR = Path("/var/www/html")
 XRAY_CONFIG = Path("/etc/xray/config.json")
 IDEM_DB = "/var/lib/kyt-node/idempotency.db"
+LOCATION_CACHE = Path("/var/lib/kyt-node/location.json")
+LOCATION_TTL = 3600
 MAX_BODY = 64 * 1024
 CLOCK_SKEW = 60
 NONCE_TTL = 300
@@ -252,6 +255,65 @@ def _services() -> dict:
     return out
 
 
+def _clean_isp(value: str) -> str:
+    """Hilangkan prefix AS number dari ipinfo, contoh 'AS14061 DigitalOcean, LLC'."""
+    value = re.sub(r"^AS\d+\s+", "", (value or "").strip(), flags=re.I)
+    return value.strip()
+
+
+def _location(force: bool = False) -> dict:
+    """Deteksi ISP/region node. Sumber sama dengan VPS utama, plus fallback file autoscript."""
+    if not force:
+        try:
+            cached = json.loads(LOCATION_CACHE.read_text(encoding="utf-8"))
+            if cached and time.time() - int(cached.get("_ts") or 0) < LOCATION_TTL:
+                cached.pop("_ts", None)
+                return cached
+        except Exception:
+            pass
+    data = {}
+    sources = [
+        ("https://ipinfo.io/json", "country", "city", "org"),
+        ("https://ipapi.co/json/", "country_code", "city", "org"),
+        ("https://ifconfig.co/json", "country_iso", "city", "organization"),
+    ]
+    for url, ckey, citykey, orgkey in sources:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "kyt-node/2.1"})
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                raw = json.loads(resp.read().decode("utf-8", "replace"))
+        except Exception:
+            continue
+        code = str(raw.get(ckey) or "").strip().upper()
+        if len(code) != 2 or not code.isalpha():
+            continue
+        data = {
+            "country_code": code,
+            "city": str(raw.get(citykey) or "").strip(),
+            "isp": _clean_isp(str(raw.get(orgkey) or "")),
+            "source": url,
+        }
+        break
+    if not data.get("isp"):
+        data["isp"] = _read_text("/etc/xray/isp").strip()
+    if not data.get("city"):
+        data["city"] = _read_text("/etc/xray/city").strip()
+    if not data.get("country_code"):
+        data["country_code"] = _read_text("/etc/xray/country").strip().upper()
+    if data.get("country_code") or data.get("isp"):
+        try:
+            os.makedirs(LOCATION_CACHE.parent, exist_ok=True)
+            tmp = str(LOCATION_CACHE) + ".tmp"
+            payload = dict(data)
+            payload["_ts"] = int(time.time())
+            open(tmp, "w", encoding="utf-8").write(json.dumps(payload))
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, LOCATION_CACHE)
+        except Exception:
+            pass
+    return data
+
+
 def _validate(payload: dict) -> tuple:
     service = str(payload.get("service") or "")
     protocol = str(payload.get("protocol") or "")
@@ -267,8 +329,8 @@ def _validate(payload: dict) -> tuple:
     days = int(payload.get("days") or 0)
     ip_limit = int(payload.get("ip_limit") or 0)
     quota_gb = int(payload.get("quota_gb") or 0)
-    if not (1 <= days <= 365):
-        raise ValueError("days harus 1-365")
+    if not (1 <= days <= 3650):
+        raise ValueError("days harus 1-3650")
     if not (0 <= ip_limit <= 100):
         raise ValueError("ip_limit harus 0-100")
     if not (0 <= quota_gb <= 10000):
@@ -414,8 +476,8 @@ def _renew(service: str, protocol: str, user: str, payload: dict) -> dict:
     if not _exists(service, protocol, user):
         return {"ok": False, "error": "Akun tidak ditemukan.", "code": "not_found"}
     days = int(payload.get("days") or 0)
-    if not (1 <= days <= 365):
-        raise ValueError("days harus 1-365")
+    if not (1 <= days <= 3650):
+        raise ValueError("days harus 1-3650")
     paths = _paths(service, protocol, user)
     quota_gb = payload.get("quota_gb")
     ip_limit = payload.get("ip_limit")
@@ -773,7 +835,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, {"ok": True, "node": NODE, "version": VERSION,
                                  "hostname": os.uname().nodename, "time": int(time.time()),
                                  "services": _services(), "accounts": _count_accounts(),
-                                 "max_slots": MAX_SLOTS, "revoked": REVOKED})
+                                 "max_slots": MAX_SLOTS, "revoked": REVOKED,
+                                 "location": _location()})
             elif path == "/v1/capacity":
                 acc = _count_accounts()
                 self._send(200, {"ok": True, "node": NODE, "accounts": acc,
@@ -786,7 +849,12 @@ class Handler(BaseHTTPRequestHandler):
                                  "scripts": {"ssh": os.path.exists(SSH_SCRIPT),
                                              **{k: os.path.exists(v) for k, v in XRAY_SCRIPTS.items()}},
                                  "mullog": os.path.exists(MULLOG_BIN),
-                                 "services": _services()})
+                                 "services": _services(),
+                                 "location": _location()})
+            elif path == "/v1/location":
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                self._send(200, {"ok": True, "node": NODE,
+                                 "location": _location(force=bool(query.get("force")))})
             elif path == "/v1/accounts":
                 acc = _count_accounts()
                 self._send(200, {"ok": True, "node": NODE, "accounts": acc,
