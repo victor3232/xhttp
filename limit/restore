@@ -452,6 +452,11 @@ if [ -d "$AKAR/etc" ]; then
     [ -f "$AKAR/root/kyt-web-admin.txt" ] && salin "$AKAR/root/kyt-web-admin.txt" "/root/kyt-web-admin.txt"
     [ -f "$AKAR/etc/kyt-web.conf" ] && salin "$AKAR/etc/kyt-web.conf" "/etc/kyt-web.conf"
     [ -f "$AKAR/etc/kyt-web-mail.key" ] && salin "$AKAR/etc/kyt-web-mail.key" "/etc/kyt-web-mail.key"
+    [ -f "$AKAR/etc/kyt-web-node.key" ] && salin "$AKAR/etc/kyt-web-node.key" "/etc/kyt-web-node.key"
+    [ -d "$AKAR/etc/kyt-node" ] && salin "$AKAR/etc/kyt-node" "/etc/kyt-node"
+    [ -f "$AKAR/etc/systemd/system/kyt-node-agent.service" ] && salin "$AKAR/etc/systemd/system/kyt-node-agent.service" "/etc/systemd/system/kyt-node-agent.service"
+    [ -f "$AKAR/usr/local/sbin/kyt-node-agent" ] && salin "$AKAR/usr/local/sbin/kyt-node-agent" "/usr/local/sbin/kyt-node-agent"
+    [ -f "$AKAR/usr/local/sbin/kyt-node" ] && salin "$AKAR/usr/local/sbin/kyt-node" "/usr/local/sbin/kyt-node"
     [ -f "$AKAR/usr/local/sbin/setting-web" ] && salin "$AKAR/usr/local/sbin/setting-web" "/usr/local/sbin/setting-web"
     [ -f "$AKAR/etc/bot/.bot.db" ] && salin "$AKAR/etc/bot/.bot.db" "/etc/bot/.bot.db"
     [ -f "$AKAR/usr/bin/kyt/gomerch_token.json" ] && salin "$AKAR/usr/bin/kyt/gomerch_token.json" "/usr/bin/kyt/gomerch_token.json"
@@ -531,7 +536,8 @@ for f in /etc/shadow /etc/gshadow; do
     [ -f "$f" ] && chmod 640 "$f" 2>/dev/null
 done
 for f in /etc/ipsec.secrets /etc/ppp/chap-secrets /etc/xray/xray.key /etc/haproxy/hap.pem \
-         /etc/kyt-web-mail.key /etc/kyt-web.conf /opt/kyt-web/data/web.db \
+         /etc/kyt-web-mail.key /etc/kyt-web.conf /etc/kyt-web-node.key \
+         /etc/kyt-node/agent.json /opt/kyt-web/data/web.db \
          /usr/bin/kyt/database.db /usr/bin/kyt/var.txt /usr/bin/ddsdswl.session \
          /root/slowdns/slowdns.env; do
     [ -f "$f" ] && chmod 600 "$f" 2>/dev/null
@@ -547,9 +553,12 @@ for f in /usr/local/sbin/jeda-mullog /usr/local/sbin/setting-jeda /usr/local/sbi
          /usr/local/sbin/slowdns /usr/local/sbin/slowdns-mode /usr/local/sbin/slowdns-info \
          /usr/local/sbin/dns /usr/local/sbin/backup /usr/local/sbin/restore \
          /usr/local/sbin/trial /usr/local/sbin/kyt-trial /usr/local/sbin/kyt-trial-expire \
-         /usr/local/sbin/trial-install.sh; do
+         /usr/local/sbin/trial-install.sh \
+         /usr/local/sbin/kyt-node-agent /usr/local/sbin/kyt-node; do
     [ -f "$f" ] && chmod 755 "$f" 2>/dev/null
 done
+[ -d /etc/kyt-node ] && chmod 700 /etc/kyt-node 2>/dev/null
+[ -f /etc/kyt-node/agent.json ] && chmod 600 /etc/kyt-node/agent.json 2>/dev/null
 [ -f /usr/local/sbin/vpnfree.conf.tpl ] && chmod 644 /usr/local/sbin/vpnfree.conf.tpl 2>/dev/null
 [ -f /etc/kyt-theme.conf ] && chmod 644 /etc/kyt-theme.conf 2>/dev/null
 [ -f /etc/sysctl.d/99-slowdns.conf ] && chmod 644 /etc/sysctl.d/99-slowdns.conf 2>/dev/null
@@ -596,7 +605,8 @@ echo -e " ${CYAN}[5/5]${NC} Me-restart layanan VPN..."
 systemctl daemon-reload >/dev/null 2>&1
 GAGAL_SVC=""
 for svc in xray haproxy nginx xl2tpd strongswan-starter ipsec openvpn dropbear udp-custom ws \
-           jeda-mullog limitssh vmip vlip trip ssip kyt-trial-expire kyt-web kyt kyt-bot slowdns; do
+           jeda-mullog limitssh vmip vlip trip ssip kyt-trial-expire kyt-web kyt kyt-bot slowdns \
+           kyt-node-agent; do
     if ! systemctl list-unit-files --no-legend "${svc}.service" 2>/dev/null | grep -q . \
        && [ ! -f "/etc/init.d/$svc" ]; then
         continue
@@ -610,7 +620,8 @@ for svc in xray haproxy nginx xl2tpd strongswan-starter ipsec openvpn dropbear u
         fi
     fi
 done
-for svc in jeda-mullog limitssh vmip vlip trip ssip kyt-trial-expire kyt-web kyt kyt-bot slowdns; do
+for svc in jeda-mullog limitssh vmip vlip trip ssip kyt-trial-expire kyt-web kyt kyt-bot slowdns \
+           kyt-node-agent; do
     systemctl list-unit-files --no-legend "${svc}.service" 2>/dev/null | grep -q . \
         && systemctl enable "$svc" >/dev/null 2>&1
 done
