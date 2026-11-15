@@ -1,0 +1,169 @@
+#!/bin/bash
+# ============================================================
+#  SET VPS UTAMA — arahkan node ke IP master baru
+#  Menu Utility → 29
+# ============================================================
+set -uo pipefail
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+CONF="/etc/kyt-node/agent.json"
+
+pause() {
+    read -r -n 1 -s -p " Tekan Enter untuk kembali..." _ || true
+    echo
+}
+
+die() {
+    echo
+    echo -e "${RED}[ERROR]${NC} $*"
+    pause
+    exit 1
+}
+
+valid_ip() {
+    local ip="$1"
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    local IFS=.
+    local -a o=($ip)
+    for n in "${o[@]}"; do
+        [ "$n" -ge 0 ] 2>/dev/null && [ "$n" -le 255 ] 2>/dev/null || return 1
+    done
+    return 0
+}
+
+clear
+echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "                ${BOLD}SET VPS UTAMA${NC}"
+echo -e "     Arahkan node ini ke IP VPS utama (master) baru"
+echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo
+
+if [ ! -s "$CONF" ]; then
+    echo -e "${YELLOW}VPS ini belum terdaftar sebagai node.${NC}"
+    echo "Menu ini hanya untuk VPS cabang yang sudah dipasangi agent."
+    echo
+    echo "Kalau ini VPS utama baru, yang perlu dilakukan adalah:"
+    echo "  1. Pasang web panel / restore backup web"
+    echo "  2. Arahkan domain web ke VPS ini"
+    echo "  3. Di setiap node, jalankan menu ini untuk mengarahkan ke IP baru"
+    pause
+    exit 0
+fi
+
+read -r -a OLD_IPS <<< "$(python3 - "$CONF" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    print(" ".join(d.get("allow_ips") or []))
+except Exception:
+    print("")
+PY
+)"
+PORT=$(python3 - "$CONF" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    print(int(d.get("port") or 8787))
+except Exception:
+    print(8787)
+PY
+)
+NODE=$(python3 - "$CONF" <<'PY'
+import json, sys
+try:
+    print(json.load(open(sys.argv[1])).get("node") or "-")
+except Exception:
+    print("-")
+PY
+)
+
+echo "  Node       : $NODE"
+echo "  Port agent : $PORT"
+echo "  Master kini: ${OLD_IPS[*]:-belum diatur}"
+echo
+
+read -r -p "  IP VPS utama baru: " NEW_IP
+[ -n "$NEW_IP" ] || die "IP master baru wajib diisi."
+valid_ip "$NEW_IP" || die "Format IP tidak valid."
+
+read -r -p "  Hapus IP master lama dari izin? [y/N]: " HAPUS
+echo
+
+# ------------------------------------------------------------
+# Update allow_ips
+# ------------------------------------------------------------
+python3 - "$CONF" "$NEW_IP" "$HAPUS" <<'PY'
+import json, sys, os
+conf, new_ip, hapus = sys.argv[1], sys.argv[2], sys.argv[3].lower()
+d = json.load(open(conf))
+ips = [str(x) for x in (d.get("allow_ips") or []) if x]
+if new_ip not in ips:
+    ips.append(new_ip)
+if hapus in ("y", "ya"):
+    ips = [new_ip]
+d["allow_ips"] = ips
+tmp = conf + ".tmp"
+with open(tmp, "w", encoding="utf-8") as fh:
+    json.dump(d, fh)
+os.chmod(tmp, 0o600)
+os.replace(tmp, conf)
+print("allow_ips:", ",".join(ips))
+PY
+
+# ------------------------------------------------------------
+# Firewall: izinkan master baru, opsional hapus master lama
+# ------------------------------------------------------------
+if command -v iptables >/dev/null 2>&1; then
+    iptables -C INPUT -p tcp -s "$NEW_IP" --dport "$PORT" -j ACCEPT 2>/dev/null || \
+        iptables -I INPUT 1 -p tcp -s "$NEW_IP" --dport "$PORT" -j ACCEPT
+    if [[ "$HAPUS" =~ ^[yY] ]]; then
+        for ip in "${OLD_IPS[@]:-}"; do
+            [ -n "$ip" ] || continue
+            [ "$ip" = "$NEW_IP" ] && continue
+            while iptables -C INPUT -p tcp -s "$ip" --dport "$PORT" -j ACCEPT 2>/dev/null; do
+                iptables -D INPUT -p tcp -s "$ip" --dport "$PORT" -j ACCEPT 2>/dev/null || break
+            done
+        done
+    fi
+    iptables -C INPUT -p tcp --dport "$PORT" -j DROP 2>/dev/null || \
+        iptables -I INPUT 2 -p tcp --dport "$PORT" -j DROP
+    netfilter-persistent save >/dev/null 2>&1 || true
+    echo -e "  ${GREEN}✓${NC} Firewall port $PORT diarahkan ke $NEW_IP"
+else
+    echo -e "  ${YELLOW}!${NC} iptables tidak ditemukan, atur firewall manual."
+fi
+
+# ------------------------------------------------------------
+# Restart agent
+# ------------------------------------------------------------
+systemctl restart kyt-node-agent
+sleep 2
+if systemctl is-active --quiet kyt-node-agent; then
+    echo -e "  ${GREEN}✓${NC} Agent aktif"
+else
+    echo -e "  ${RED}✗${NC} Agent gagal start. Cek: journalctl -u kyt-node-agent -n 50 --no-pager"
+    pause
+    exit 1
+fi
+if curl -sk --max-time 8 "https://127.0.0.1:${PORT}/v1/ping" >/dev/null; then
+    echo -e "  ${GREEN}✓${NC} Agent merespons di port $PORT"
+else
+    echo -e "  ${YELLOW}!${NC} Agent belum merespons. Cek service/certifikat."
+fi
+
+echo
+echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e " ${GREEN}VPS utama untuk node ini:${NC} ${BOLD}${NEW_IP}${NC}"
+echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo
+echo "Di VPS utama baru, pastikan:"
+echo "  1. Web panel sudah aktif dan data web sudah direstore"
+echo "  2. Domain web mengarah ke VPS utama baru"
+echo "  3. Di Admin → Multi-Server, klik Tes pada node ini"
+pause
