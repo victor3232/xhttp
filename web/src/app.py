@@ -785,6 +785,7 @@ def init_nodes() -> None:
             CREATE TABLE IF NOT EXISTS node_account_status (
                 account_id INTEGER PRIMARY KEY,
                 server_id INTEGER NOT NULL,
+                order_id INTEGER NOT NULL DEFAULT 0,
                 username TEXT NOT NULL DEFAULT '',
                 service TEXT NOT NULL DEFAULT '',
                 protocol TEXT NOT NULL DEFAULT '',
@@ -845,6 +846,7 @@ def init_nodes() -> None:
             ("orders", "server_id", "INTEGER NOT NULL DEFAULT 0"),
             ("payg_accounts", "server_id", "INTEGER NOT NULL DEFAULT 0"),
             ("usage_daily", "server_id", "INTEGER NOT NULL DEFAULT 0"),
+            ("node_account_status", "order_id", "INTEGER NOT NULL DEFAULT 0"),
         ):
             _ensure_column(conn, table, column, ddl)
         conn.commit()
@@ -1123,23 +1125,25 @@ def remove_account_on_server(server_id: int, service: str, protocol: str, userna
         raise ValueError(str(data.get("error") or "Gagal menghapus akun di node."))
 
 def cache_node_account_status(account_id: int, server_id: int, username: str,
-                              service: str, protocol: str, data: dict) -> None:
+                              service: str, protocol: str, data: dict,
+                              order_id: int = 0) -> None:
     sessions = data.get("sessions") if isinstance(data.get("sessions"), list) else []
     mullog = data.get("mullog") if isinstance(data.get("mullog"), dict) else None
     conn = db_connect()
     try:
         conn.execute(
-            "INSERT INTO node_account_status(account_id,server_id,username,service,protocol,"
+            "INSERT INTO node_account_status(account_id,server_id,order_id,username,service,protocol,"
             "usage_bytes,quota_bytes,ip_limit,expires_at,online,sessions_json,mullog_json,"
-            "updated_at,sync_error) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,'') "
+            "updated_at,sync_error) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'') "
             "ON CONFLICT(account_id) DO UPDATE SET server_id=excluded.server_id,"
-            "username=excluded.username,service=excluded.service,protocol=excluded.protocol,"
-            "usage_bytes=excluded.usage_bytes,quota_bytes=excluded.quota_bytes,"
-            "ip_limit=excluded.ip_limit,expires_at=excluded.expires_at,online=excluded.online,"
+            "order_id=excluded.order_id,username=excluded.username,service=excluded.service,"
+            "protocol=excluded.protocol,usage_bytes=excluded.usage_bytes,"
+            "quota_bytes=excluded.quota_bytes,ip_limit=excluded.ip_limit,"
+            "expires_at=excluded.expires_at,online=excluded.online,"
             "sessions_json=excluded.sessions_json,mullog_json=excluded.mullog_json,"
             "updated_at=excluded.updated_at,sync_error=''",
             (
-                int(account_id), int(server_id), username, service, protocol or "",
+                int(account_id), int(server_id), int(order_id), username, service, protocol or "",
                 int(data.get("usage_bytes") or 0), int(data.get("quota_bytes") or 0),
                 int(data.get("ip_limit") or 0), int(data.get("expires_at") or 0),
                 1 if int(data.get("online") or 0) > 0 else 0,
@@ -1147,6 +1151,19 @@ def cache_node_account_status(account_id: int, server_id: int, username: str,
                 json.dumps(mullog or {}, ensure_ascii=False),
                 int(time.time()),
             ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+def mark_node_sync_error(account_id: int, server_id: int, error: str) -> None:
+    conn = db_connect()
+    try:
+        conn.execute(
+            "INSERT INTO node_account_status(account_id,server_id,updated_at,sync_error) "
+            "VALUES(?,?,?,?) ON CONFLICT(account_id) DO UPDATE SET sync_error=excluded.sync_error,"
+            "updated_at=excluded.updated_at",
+            (int(account_id), int(server_id), int(time.time()), str(error)[:200]),
         )
         conn.commit()
     finally:
@@ -1287,8 +1304,210 @@ def remote_mullog(server_id: int, service: str, protocol: str, username: str,
     return bool(data.get("ok")), str(data.get("error") or "")
 
 
+def cached_order_node_status(order_id: int) -> dict | None:
+    return cached_node_account(-int(order_id))
+
+def refresh_remote_order(order_id: int) -> None:
+    oid = int(order_id)
+    conn = db_connect()
+    try:
+        row = conn.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return
+    sid = int(row["server_id"] or 0)
+    username = str(row["account_username"] or "")
+    if sid <= 0 or not username:
+        return
+    server = server_by_id(sid)
+    if not server:
+        return
+    service = "ssh" if row["protocol"] == "ssh" else "xray"
+    try:
+        data = node_request(
+            server, "GET", node_account_path(service, row["protocol"], username),
+            timeout=8, record=False,
+        )
+        if data.get("ok"):
+            cache_node_account_status(-oid, sid, username, service, row["protocol"], data,
+                                      order_id=oid)
+        else:
+            mark_node_sync_error(-oid, sid, str(data.get("error") or "not found"))
+    except NodeError as exc:
+        mark_node_sync_error(-oid, sid, str(exc))
+
+def schedule_remote_order_refresh(order_id: int) -> None:
+    key = -int(order_id)
+    with _REMOTE_REFRESH_LOCK:
+        if key in _REMOTE_REFRESHING:
+            return
+        _REMOTE_REFRESHING.add(key)
+
+    def worker():
+        try:
+            refresh_remote_order(int(order_id))
+        finally:
+            with _REMOTE_REFRESH_LOCK:
+                _REMOTE_REFRESHING.discard(key)
+
+    threading.Thread(target=worker, name="node-order-refresh", daemon=True).start()
+
+def node_sync_remote_accounts(only_server_id: int = 0, allowed_ids: set | None = None) -> int:
+    conn = db_connect()
+    try:
+        sql = ("SELECT id, server_id, username, service, protocol, 0 AS order_id "
+               "FROM accounts WHERE server_id>0 AND status='active'")
+        params = []
+        if int(only_server_id or 0) > 0:
+            sql += " AND server_id=?"
+            params.append(int(only_server_id))
+        account_rows = conn.execute(sql, params).fetchall()
+        sql2 = ("SELECT id AS order_id, server_id, account_username AS username, "
+                "CASE WHEN protocol='ssh' THEN 'ssh' ELSE 'xray' END AS service, protocol "
+                "FROM orders WHERE server_id>0 AND status='COMPLETED' AND account_username<>''")
+        params2 = []
+        if int(only_server_id or 0) > 0:
+            sql2 += " AND server_id=?"
+            params2.append(int(only_server_id))
+        order_rows = conn.execute(sql2, params2).fetchall()
+    finally:
+        conn.close()
+
+    servers = {}
+    conn = db_connect()
+    try:
+        for row in conn.execute("SELECT * FROM servers WHERE status='active'"):
+            servers[int(row["id"])] = row
+    finally:
+        conn.close()
+
+    jobs = []
+    for row in account_rows:
+        sid = int(row["server_id"])
+        if sid in servers and (allowed_ids is None or sid in allowed_ids):
+            jobs.append((servers[sid], row, int(row["id"]), 0))
+    for row in order_rows:
+        sid = int(row["server_id"])
+        if sid in servers and (allowed_ids is None or sid in allowed_ids):
+            jobs.append((servers[sid], row, -int(row["order_id"]), int(row["order_id"])))
+
+    def run(job):
+        server, row, key, oid = job
+        sid = int(row["server_id"])
+        username = str(row["username"] or "")
+        service = str(row["service"] or "")
+        protocol = str(row["protocol"] or "")
+        try:
+            data = node_request(
+                server, "GET", node_account_path(service, protocol, username),
+                timeout=10, record=False,
+            )
+            if data.get("ok"):
+                cache_node_account_status(key, sid, username, service, protocol, data, order_id=oid)
+                return True
+            mark_node_sync_error(key, sid, str(data.get("error") or "not found"))
+            return False
+        except NodeError as exc:
+            mark_node_sync_error(key, sid, str(exc))
+            return False
+
+    if not jobs:
+        return 0
+    from concurrent.futures import ThreadPoolExecutor
+    done = 0
+    with ThreadPoolExecutor(max_workers=4, thread_name_prefix="node-status") as pool:
+        for ok in pool.map(run, jobs):
+            done += 1 if ok else 0
+    return done
+
+def node_monitor_once(only_server_id: int = 0) -> dict:
+    """Cek health/latency node lalu sinkronkan status akun remote."""
+    summary = {"servers": 0, "ok": 0, "failed": 0, "synced": 0}
+    conn = db_connect()
+    try:
+        sql = "SELECT * FROM servers WHERE status='active'"
+        params = []
+        if int(only_server_id or 0) > 0:
+            sql += " AND id=?"
+            params.append(int(only_server_id))
+        rows = conn.execute(sql, params).fetchall()
+    finally:
+        conn.close()
+
+    healthy = set()
+    for server in rows:
+        sid = int(server["id"])
+        summary["servers"] += 1
+        started = time.time()
+        try:
+            data = node_request(server, "GET", "/v1/health", timeout=12, record=False)
+            latency = max(0, int((time.time() - started) * 1000))
+            ok = bool(data.get("ok"))
+            error = "" if ok else str(data.get("error") or "health gagal")
+            conn = db_connect()
+            try:
+                conn.execute(
+                    "INSERT INTO node_health(server_id,ok,latency_ms,services_json,accounts_json,"
+                    "version,updated_at,last_error) VALUES(?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(server_id) DO UPDATE SET ok=excluded.ok,"
+                    "latency_ms=excluded.latency_ms,services_json=excluded.services_json,"
+                    "accounts_json=excluded.accounts_json,version=excluded.version,"
+                    "updated_at=excluded.updated_at,last_error=excluded.last_error",
+                    (sid, 1 if ok else 0, latency,
+                     json.dumps(data.get("services") or {}, ensure_ascii=False),
+                     json.dumps(data.get("accounts") or {}, ensure_ascii=False),
+                     str(data.get("version") or "")[:30], int(time.time()), error[:240]),
+                )
+                conn.execute(
+                    "UPDATE servers SET last_seen=?, last_version=?, last_latency_ms=?,"
+                    " last_error=? WHERE id=?",
+                    (int(time.time()) if ok else int(server["last_seen"] or 0),
+                     str(data.get("version") or server["last_version"] or "")[:30],
+                     latency, error[:240], sid),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            if ok:
+                healthy.add(sid)
+                summary["ok"] += 1
+            else:
+                summary["failed"] += 1
+        except NodeError as exc:
+            latency = max(0, int((time.time() - started) * 1000))
+            summary["failed"] += 1
+            conn = db_connect()
+            try:
+                conn.execute(
+                    "INSERT INTO node_health(server_id,ok,latency_ms,updated_at,last_error) "
+                    "VALUES(?,0,?,?,?) ON CONFLICT(server_id) DO UPDATE SET ok=0,"
+                    "latency_ms=excluded.latency_ms,updated_at=excluded.updated_at,"
+                    "last_error=excluded.last_error",
+                    (sid, latency, int(time.time()), str(exc)[:240]),
+                )
+                conn.execute("UPDATE servers SET last_error=?, last_latency_ms=? WHERE id=?",
+                             (str(exc)[:240], latency, sid))
+                conn.commit()
+            finally:
+                conn.close()
+            logger.warning("monitor node %s gagal: %s", sid, exc)
+
+    if healthy:
+        summary["synced"] = node_sync_remote_accounts(only_server_id, healthy)
+    return summary
+
+def node_monitor_loop() -> None:
+    time.sleep(20)
+    while True:
+        try:
+            node_monitor_once()
+        except Exception:
+            logger.error("node monitor: %s", traceback.format_exc())
+        time.sleep(60)
+
 def node_request(server, method: str, path: str, payload=None, timeout: int = 20,
-                 idempotency_key: str = "") -> dict:
+                 idempotency_key: str = "", record: bool = True) -> dict:
     """Panggil agent node dengan HMAC. Hanya HTTPS yang diizinkan.
 
     Mendukung dua mode:
@@ -1338,7 +1557,7 @@ def node_request(server, method: str, path: str, payload=None, timeout: int = 20
                 sid = int(server["id"])
             except Exception:
                 sid = 0
-            if sid > 0:
+            if sid > 0 and record:
                 try:
                     conn = db_connect()
                     try:
@@ -1368,7 +1587,11 @@ def node_request(server, method: str, path: str, payload=None, timeout: int = 20
 def render_admin_nodes(session: sqlite3.Row, msg: str = "", test_id: int = 0) -> str:
     conn = db_connect()
     try:
-        servers = conn.execute("SELECT * FROM servers ORDER BY id").fetchall()
+        servers = conn.execute(
+            "SELECT s.*, h.latency_ms AS health_latency, h.ok AS health_ok,"
+            " h.last_error AS health_error FROM servers s"
+            " LEFT JOIN node_health h ON h.server_id=s.id ORDER BY s.id"
+        ).fetchall()
         tests = conn.execute(
             "SELECT t.*, s.name AS server_name FROM node_test_accounts t "
             "LEFT JOIN servers s ON s.id=t.server_id ORDER BY t.id DESC LIMIT 25"
@@ -1406,6 +1629,7 @@ def render_admin_nodes(session: sqlite3.Row, msg: str = "", test_id: int = 0) ->
     now = int(time.time())
     server_rows = ""
     for s in servers:
+        latency_text = ("%d ms" % int(s["health_latency"])) if s["health_latency"] else "-"
         online = bool(s["last_seen"]) and now - int(s["last_seen"]) < 180
         if s["status"] == "disabled":
             badge = '<span class="badge badge-bad">Disabled</span>'
@@ -1419,7 +1643,7 @@ def render_admin_nodes(session: sqlite3.Row, msg: str = "", test_id: int = 0) ->
         server_rows += (
             "<tr><td><b>%s</b><small>%s · %s · %s</small></td>"
             "<td><code>%s</code><small>key %s</small></td>"
-            "<td>%s<small>%s · %s</small>%s</td>"
+            "<td>%s<small>%s · %s · %s</small>%s</td>"
             "<td>%s</td><td>%.2f×</td><td>"
             '<a class="btn btn-tiny btn-ghost" href="/admin/nodes/settings?id=%s">Atur</a>'
             '<form method="post" action="/admin/nodes/test" class="inline-form">'
@@ -1445,7 +1669,7 @@ def render_admin_nodes(session: sqlite3.Row, msg: str = "", test_id: int = 0) ->
             % (e(s["name"]), e(s["code"]), e(s["region"]), e(s["isp"] or "-"),
                e(s["base_url"]),
                (e(str(s["api_key"])[:10]) + "…") if s["api_key"] else "legacy",
-               badge, e(s["last_version"] or "-"), e(last), err, int(s["max_slots"]),
+               badge, e(s["last_version"] or "-"), e(last), e(latency_text), err, int(s["max_slots"]),
                float(s["price_multiplier"] or 1), int(s["id"]),
                e(session["csrf"]), int(s["id"]),
                e(session["csrf"]), int(s["id"]), e(session["csrf"]), int(s["id"]),
@@ -5466,14 +5690,17 @@ def user_accounts(user_id: int) -> list[dict]:
         service = "ssh" if row["protocol"] == "ssh" else "xray"
         sid = int(row["server_id"] or 0)
         if sid > 0:
-            quota = int(row["quota_gb"] or 0) * 1024 ** 3
-            usage = 0
-            ip_limit = int(row["ip_limit"] or 0)
-            sessions = []
-            hold = False
-            state = None
+            cached = cached_order_node_status(int(row["id"]))
+            if not cached or now - int(cached.get("updated_at") or 0) > 60:
+                schedule_remote_order_refresh(int(row["id"]))
+            quota = int(cached.get("quota_bytes") or 0) if cached else int(row["quota_gb"] or 0) * 1024 ** 3
+            usage = int(cached.get("usage_bytes") or 0) if cached else 0
+            ip_limit = int(cached.get("ip_limit") or 0) if cached else int(row["ip_limit"] or 0)
+            sessions = list(cached.get("sessions") or []) if cached else []
+            state = cached.get("mullog") if cached else None
+            hold = bool(state and state.get("hold"))
             base_time = int(row["paid_at"] or row["created_at"] or 0)
-            expires = base_time + int(row["days"] or 0) * 86400
+            expires = int(cached.get("expires_at") or 0) if cached else base_time + int(row["days"] or 0) * 86400
             today = 0
         else:
             paths = account_paths(service, row["protocol"], username)
@@ -10952,6 +11179,7 @@ def main() -> int:
     except Exception:
         logger.warning("snapshot awal usage gagal: %s", traceback.format_exc())
     threading.Thread(target=usage_snapshot_loop, name="usage-snapshot", daemon=True).start()
+    threading.Thread(target=node_monitor_loop, name="node-monitor", daemon=True).start()
 
     if not Path(SSH_SCRIPT).exists():
         logger.warning("script %s tidak ditemukan", SSH_SCRIPT)
