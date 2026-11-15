@@ -1,7 +1,10 @@
 #!/bin/bash
 # Bootstrap installer HITS SSH; gunakan hanya pada VPS khusus yang baru.
 set -u
-RAW=https://raw.githubusercontent.com/victor3232/xhttp/main/premi.sh
+KBASE=https://raw.githubusercontent.com/victor3232/xhttp
+KAPI=https://api.github.com/repos/victor3232/xhttp/commits/main
+KSHA=$(wget -qO- --timeout=20 --tries=2 "$KAPI" 2>/dev/null | grep -o '"sha"[[:space:]]*:[[:space:]]*"[0-9a-f]\{40\}"' | head -n1 | grep -o '[0-9a-f]\{40\}')
+if [ -n "$KSHA" ]; then RAW="$KBASE/$KSHA/premi.sh"; else RAW="$KBASE/main/premi.sh"; fi
 SESSION=kyt-install
 if [ "$(id -u)" -ne 0 ]; then echo 'Jalankan sebagai root (sudo -i).' >&2; exit 1; fi
 if [ ! -t 0 ] || [ ! -t 1 ]; then echo 'Installer memerlukan terminal interaktif.' >&2; exit 1; fi
