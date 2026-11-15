@@ -26,7 +26,7 @@ apt-get install -y tmux wget ca-certificates || { echo 'Instalasi dependensi gag
 stage=$(mktemp -d /root/.kyt-installer.XXXXXXXX) || exit 1
 chmod 700 "$stage"
 script="$stage/premi.sh"
-if ! wget --https-only --timeout=30 --tries=3 -O "$script" "$RAW"; then echo "Unduhan gagal. Direktori kerja: $stage" >&2; exit 1; fi
+if ! wget --https-only --timeout=30 --tries=3 -O "$script" "${RAW}?v=$(date +%s)"; then echo "Unduhan gagal. Direktori kerja: $stage" >&2; exit 1; fi
 if [ ! -s "$script" ] || ! bash -n "$script"; then echo "Installer kosong atau sintaks tidak valid: $script" >&2; exit 1; fi
 chmod 700 "$script"
 echo "Installer: $script"
