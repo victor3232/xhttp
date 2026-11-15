@@ -4276,3 +4276,156 @@ html, body {
   font-size: 11px;
   line-height: 1.6;
 }
+
+/* ---------- multi-server picker (Phase 3) ---------- */
+.server-pick {
+  border: 0;
+  padding: 0;
+  margin: 26px 0 4px;
+}
+.server-pick legend {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-weight: 800;
+  font-size: .95rem;
+  color: var(--ink);
+  margin-bottom: 6px;
+}
+.server-pick legend span {
+  display: inline-grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+  background: var(--accent-bg);
+  color: var(--terracotta);
+  font-size: .72rem;
+  font-weight: 800;
+}
+.server-pick > .mini-label {
+  display: block;
+  margin: 0 0 12px;
+  font-weight: 600;
+  color: var(--muted);
+  letter-spacing: .02em;
+  text-transform: none;
+}
+.server-pick-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: 12px;
+}
+.server-pick-card {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 14px 44px 14px 16px;
+  border: 1px solid var(--line);
+  border-radius: 14px;
+  background: var(--surface-4);
+  cursor: pointer;
+  transition: border-color .16s ease, box-shadow .16s ease, transform .16s ease;
+}
+.server-pick-card:hover {
+  border-color: var(--line-strong);
+  transform: translateY(-1px);
+}
+.server-pick-card.selected {
+  border-color: var(--terracotta);
+  box-shadow: 0 0 0 3px var(--accent-ring);
+  background: var(--accent-bg);
+}
+.server-pick-card input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+.server-pick-flag {
+  font-size: 1.6rem;
+  line-height: 1;
+  flex: 0 0 auto;
+}
+.server-pick-copy {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.server-pick-copy b {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: .98rem;
+  color: var(--ink);
+}
+.server-pick-copy small {
+  color: var(--muted);
+  font-size: .78rem;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+.server-pick-code {
+  color: var(--muted-2) !important;
+  font-family: "JetBrains Mono", monospace;
+  font-size: .72rem !important;
+  text-transform: uppercase;
+  letter-spacing: .06em;
+}
+.server-pick-badge {
+  display: inline-block;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: var(--peach-2);
+  color: var(--brown);
+  font-size: .62rem;
+  font-weight: 800;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+}
+.server-pick-state {
+  margin-left: auto;
+  flex: 0 0 auto;
+  font-size: .68rem;
+  font-weight: 700;
+  color: var(--muted-2);
+}
+.server-pick-state.is-online {
+  color: var(--green);
+}
+.server-pick-mark {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  width: 20px;
+  height: 20px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  border: 1px solid var(--line-strong);
+  background: var(--white);
+  color: transparent;
+  font-size: .7rem;
+  font-weight: 800;
+}
+.server-pick-card.selected .server-pick-mark {
+  background: var(--terracotta);
+  border-color: var(--terracotta);
+  color: var(--on-accent);
+}
+@media (max-width: 640px) {
+  .server-pick-grid { grid-template-columns: 1fr; }
+  .server-pick-card { padding-right: 40px; }
+}
+.server-pick-card:has(input:checked) {
+  border-color: var(--terracotta);
+  box-shadow: 0 0 0 3px var(--accent-ring);
+  background: var(--accent-bg);
+}
+.server-pick-card:has(input:checked) .server-pick-mark {
+  background: var(--terracotta);
+  border-color: var(--terracotta);
+  color: var(--on-accent);
+}
