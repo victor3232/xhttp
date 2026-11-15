@@ -928,7 +928,7 @@ def local_isp_name() -> str:
     return (value or "VPS Utama")[:80]
 
 def server_settings_for(server_id: int, settings: dict | None = None) -> dict:
-    """Pengaturan per server. server_id=0 berarti VPS utama (A)."""
+    """Pengaturan per server. server_id=0 berarti VPS yang menjalankan panel web ini."""
     settings = settings or get_settings()
     keys = (
         "free_enabled", "premium_enabled", "payg_enabled",
@@ -1933,8 +1933,8 @@ def render_admin_nodes(session: sqlite3.Row, msg: str = "", test_id: int = 0) ->
   </div>
   {notice}
   <section class="panel admin-panel">
-    <div class="panel-head"><div><span class="mini-label">VPS UTAMA</span><h2>Server lokal (A)</h2></div>
-      <span class="panel-hint">Akun tanpa server_id berjalan di sini.</span></div>
+    <div class="panel-head"><div><span class="mini-label">VPS UTAMA</span><h2>Server lokal (web ini)</h2></div>
+      <span class="panel-hint">Panel web ini adalah VPS utama. Node yang di-add di sini mengarah ke sini; akun tanpa server_id berjalan di sini.</span></div>
     <div class="table-wrap"><table>
       <thead><tr><th>Server</th><th>ISP / Region</th><th>Status</th><th></th></tr></thead>
       <tbody><tr>
