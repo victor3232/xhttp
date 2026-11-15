@@ -4429,3 +4429,4 @@ html, body {
   border-color: var(--terracotta);
   color: var(--on-accent);
 }
+.muted { color: var(--muted-2); font-size: .72rem; }
