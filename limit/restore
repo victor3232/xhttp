@@ -560,25 +560,39 @@ done
 [ -d /etc/kyt-node ] && chmod 700 /etc/kyt-node 2>/dev/null
 [ -f /etc/kyt-node/agent.json ] && chmod 600 /etc/kyt-node/agent.json 2>/dev/null
 
-# Firewall agent node: hanya IP VPS utama yang boleh akses port agent.
+# Firewall agent node mengikuti allow_ips.
+# allow_ips kosong = port terbuka, autentikasi tetap lewat API Key + HMAC.
 if [ -f /etc/kyt-node/agent.json ] && command -v iptables >/dev/null 2>&1; then
     _agent_info=$(python3 - <<'PY_AGENT' 2>/dev/null
 import json
 try:
     d = json.load(open("/etc/kyt-node/agent.json"))
-    ips = d.get("allow_ips") or []
-    print("%s %s" % (ips[0] if ips else "", d.get("port") or 8787))
+    ips = " ".join(str(x) for x in (d.get("allow_ips") or []) if x)
+    print("%s|%s" % (ips, d.get("port") or 8787))
 except Exception:
-    print("")
+    print("|8787")
 PY_AGENT
 )
-    _master_ip=${_agent_info%% *}
-    _agent_port=${_agent_info##* }
-    if [ -n "$_master_ip" ] && [ -n "$_agent_port" ]; then
-        iptables -C INPUT -p tcp -s "$_master_ip" --dport "$_agent_port" -j ACCEPT 2>/dev/null ||             iptables -I INPUT 1 -p tcp -s "$_master_ip" --dport "$_agent_port" -j ACCEPT
-        iptables -C INPUT -p tcp --dport "$_agent_port" -j DROP 2>/dev/null ||             iptables -I INPUT 2 -p tcp --dport "$_agent_port" -j DROP
+    _agent_ips=${_agent_info%%|*}
+    _agent_port=${_agent_info##*|}
+    if [ -n "$_agent_port" ]; then
+        if [ -n "$_agent_ips" ]; then
+            for _ip in $_agent_ips; do
+                iptables -C INPUT -p tcp -s "$_ip" --dport "$_agent_port" -j ACCEPT 2>/dev/null || \
+                    iptables -I INPUT 1 -p tcp -s "$_ip" --dport "$_agent_port" -j ACCEPT
+            done
+            iptables -C INPUT -p tcp --dport "$_agent_port" -j DROP 2>/dev/null || \
+                iptables -I INPUT 2 -p tcp --dport "$_agent_port" -j DROP
+            echo -e "       -> firewall agent: ${GREEN}${_agent_ips} -> port ${_agent_port}${NC}"
+        else
+            while iptables -C INPUT -p tcp --dport "$_agent_port" -j DROP 2>/dev/null; do
+                iptables -D INPUT -p tcp --dport "$_agent_port" -j DROP 2>/dev/null || break
+            done
+            iptables -C INPUT -p tcp --dport "$_agent_port" -j ACCEPT 2>/dev/null || \
+                iptables -I INPUT 1 -p tcp --dport "$_agent_port" -j ACCEPT
+            echo -e "       -> firewall agent: ${GREEN}terbuka (HMAC) -> port ${_agent_port}${NC}"
+        fi
         netfilter-persistent save >/dev/null 2>&1 || true
-        echo -e "       -> firewall agent: ${GREEN}${_master_ip} -> port ${_agent_port}${NC}"
     fi
 fi
 [ -f /usr/local/sbin/vpnfree.conf.tpl ] && chmod 644 /usr/local/sbin/vpnfree.conf.tpl 2>/dev/null
