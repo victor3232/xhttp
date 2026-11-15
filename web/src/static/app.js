@@ -248,6 +248,16 @@
   var premiumSummary = $("#premium-summary");
   var premiumState = { protocol: "", code: "" };
 
+  // Pilih server di Premium (durasi) -> muat ulang harga khusus server tersebut.
+  if (premiumForm) {
+    $$('input[name="server_id"]', premiumForm).forEach(function (input) {
+      input.addEventListener("change", function () {
+        var sid = input.value || "0";
+        window.location.href = "/premium?server=" + encodeURIComponent(sid);
+      });
+    });
+  }
+
   function premiumItems(protocol) {
     return (premium.products || []).filter(function (p) { return p.protocol === protocol; });
   }
