@@ -9214,7 +9214,7 @@ def page_shell(title: str, body: str, admin: bool = False, noindex: bool = False
 <meta name="theme-color" content="{UI_THEME_COLORS.get(b['theme'], '#fffaf2')}">
 {robots}
 {favicon}
-<link rel="stylesheet" href="/static/style.css?v=20261115servers6">
+<link rel="stylesheet" href="/static/style.css?v=20261118pay1">
 {turnstile_script}
 </head>
 <body>
@@ -9488,7 +9488,7 @@ def render_home(form_token: str, settings: dict[str, str]) -> str:
         <div class="ticket-rows">
           <div><span>LAYANAN</span><b>SSH / XRAY</b></div>
           <div><span>MASA AKTIF</span><b>3 — 30 HARI</b></div>
-          <div><span>PEMBAYARAN</span><b>QRIS GOPAY</b></div>
+          <div><span>PEMBAYARAN</span><b>QRIS / BANK</b></div>
         </div>
         <div class="ticket-barcode"></div>
       </div>
@@ -9535,11 +9535,34 @@ def render_home(form_token: str, settings: dict[str, str]) -> str:
           <li>Paket durasi 3 / 7 / 30 hari</li>
           <li>Bisa diperpanjang kapan saja</li>
           <li>SSH, VMess, VLESS, Trojan</li>
-          <li>Bayar QRIS GoPay</li>
+          <li>QRIS / e-wallet / m-banking</li>
         </ul>
         <a class="btn btn-dark btn-block" href="/premium">Beli akun premium <span aria-hidden="true">↗</span></a>
       </article>
     </div>
+  </section>
+
+  <section class="section wrap payments" id="pembayaran">
+    <div class="section-head">
+      <div>
+        <div class="eyebrow"><span class="dot"></span> METODE PEMBAYARAN</div>
+        <h2>Bayar dari aplikasi favorit.</h2>
+      </div>
+      <p>Scan QRIS lewat DANA, OVO, GoPay, ShopeePay, atau m-banking BCA, BNI, BRI, Mandiri, dan CIMB Niaga.</p>
+    </div>
+    <div class="payment-grid">
+      <div class="payment-card"><img src="/static/payments/qris.png" alt="QRIS" width="600" height="200" loading="lazy" decoding="async"></div>
+      <div class="payment-card"><img src="/static/payments/dana.png" alt="DANA" width="600" height="200" loading="lazy" decoding="async"></div>
+      <div class="payment-card"><img src="/static/payments/ovo.png" alt="OVO" width="600" height="200" loading="lazy" decoding="async"></div>
+      <div class="payment-card"><img src="/static/payments/gopay.png" alt="GoPay" width="600" height="200" loading="lazy" decoding="async"></div>
+      <div class="payment-card"><img src="/static/payments/shopeepay.png" alt="ShopeePay" width="600" height="200" loading="lazy" decoding="async"></div>
+      <div class="payment-card"><img src="/static/payments/bca.png" alt="BCA" width="600" height="200" loading="lazy" decoding="async"></div>
+      <div class="payment-card"><img src="/static/payments/bni.png" alt="BNI" width="600" height="200" loading="lazy" decoding="async"></div>
+      <div class="payment-card"><img src="/static/payments/bri.png" alt="BRI" width="600" height="200" loading="lazy" decoding="async"></div>
+      <div class="payment-card"><img src="/static/payments/mandiri.png" alt="Mandiri" width="600" height="200" loading="lazy" decoding="async"></div>
+      <div class="payment-card"><img src="/static/payments/cimb.png" alt="CIMB Niaga" width="600" height="200" loading="lazy" decoding="async"></div>
+    </div>
+    <p class="payment-note">Pembayaran premium memakai QRIS. Nominal unik Rp1–999 menjaga transaksi tetap aman, dan akun aktif otomatis setelah pembayaran terdeteksi.</p>
   </section>
 
   <section class="section wrap steps" id="cara">
