@@ -92,7 +92,7 @@ fi
 rm -rf bot.zip bot
 
 # ---------- source bot (kyt.zip) ----------
-wget -q --timeout=60 -O kyt.zip https://raw.githubusercontent.com/victor3232/xhttp/main/limit/kyt.zip
+wget -q --timeout=60 -O kyt.zip https://raw.githubusercontent.com/victor3232/xhttp/main/limit/kyt.zip?v=$(date +%s)
 if [ ! -s kyt.zip ]; then bad "kyt.zip gagal diunduh. Cek koneksi."; exit 1; fi
 unzip -oq kyt.zip
 rm -f kyt.zip
