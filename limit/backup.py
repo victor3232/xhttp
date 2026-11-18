@@ -21,6 +21,7 @@ from kyt import *
 from kyt import store_lib as S
 
 BACKUP_DIR = "/root/backup"
+TMP_DIR = os.environ.get("KYT_TMPDIR", "/var/tmp")
 
 
 def _db_bot():
@@ -146,6 +147,10 @@ BERKAS = [
     "/etc/kyt-web.conf",
     "/etc/kyt-web-mail.key",
     "/etc/kyt-bot-node.key",
+    "/etc/kyt-web-node.key",
+    "/etc/kyt-node/agent.json",
+    "/usr/bin/kyt/start.jpg",
+    "/usr/bin/ddsdswl.session",
     "/root/kyt-web-admin.txt",
     "/etc/nginx/conf.d/vpnfree.conf",
     "/etc/haproxy/vpnfree.pem",
@@ -170,7 +175,9 @@ BATAS_FILE = 8 * 1024 * 1024   # 8 MB
 FOLDER = [
     "/root/akun",          # config akun xray
     "/root/slowdns",       # domain/key/upstream SlowDNS
+    "/root/udp",           # config UDP custom
     "/var/www/html",       # profil akun buyer (.txt)
+    "/var/lib/kyt",        # info IP VPS
     "/etc/openvpn",        # sertifikat & config OVPN
     "/etc/letsencrypt",    # sertifikat SSL
     "/opt/kyt-web",        # aplikasi + data + tema website
@@ -180,22 +187,40 @@ FOLDER = [
     "/etc/kyt",            # trial, jeda-mullog, limit IP
     "/etc/limit",          # pemakaian kuota akun
     "/etc/bot",            # token/admin bot
+    "/etc/xray",           # seluruh config & limit Xray
+    "/etc/ssh",            # config & data akun SSH
+    "/etc/vmess",          # config & data akun VMess
+    "/etc/vless",          # config & data akun VLESS
+    "/etc/trojan",         # config & data akun Trojan
+    "/etc/shadowsocks",    # config & data akun SS
+    "/etc/l2tp",           # config & data akun L2TP
+    "/etc/ppp",            # akun CHAP L2TP
+    "/etc/xl2tpd",         # config xl2tpd bila ada
+    "/etc/ipsec.d",        # cert IKEv2 bila ada
+    "/etc/dropbear",       # config Dropbear
+    "/etc/kyt-node",       # konfigurasi agent node
+    "/etc/cron.d",         # jadwal limiter
+    "/var/spool/cron/crontabs",  # cron root
+    "/etc/systemd/system", # unit service kustom
 ]
 
 # hanya path dengan awalan ini yang boleh ditulis saat restore (anti zip-slip)
 IZIN = ("etc/xray/", "etc/ssh/", "etc/vmess/", "etc/vless/", "etc/trojan/",
         "etc/shadowsocks/", "etc/l2tp/", "etc/ppp/", "etc/haproxy/",
         "etc/nginx/", "etc/openvpn/", "etc/letsencrypt/",
-        "etc/default/", "etc/kyt/", "etc/limit/", "etc/bot/",
-        "etc/systemd/system/", "root/akun/", "root/slowdns/",
+        "etc/default/", "etc/kyt/", "etc/kyt-node/", "etc/limit/", "etc/bot/",
+        "etc/systemd/system/", "etc/xl2tpd/", "etc/ipsec.d/", "etc/dropbear/",
+        "etc/cron.d/", "root/akun/", "root/slowdns/", "root/udp/",
         "usr/bin/kyt/", "usr/local/sbin/slowdns-router",
         "opt/kyt-web/", "etc/ssl/kyt-web/",
-        "var/www/html/", "usr/local/share/xray/")
+        "var/www/html/", "var/lib/kyt/", "var/spool/cron/crontabs/",
+        "usr/local/share/xray/")
 IZIN_TEPAT = ("etc/passwd", "etc/group", "etc/shadow", "etc/gshadow",
               "etc/ipsec.secrets", "etc/ipsec.conf", "etc/kyt.txt",
               "etc/kyt-theme.conf", "etc/kyt-dns-mode", "etc/kyt-license.conf",
               "etc/kyt-onering.conf",
               "etc/kyt-web.conf", "etc/kyt-web-mail.key", "etc/kyt-bot-node.key",
+              "etc/kyt-web-node.key", "usr/bin/ddsdswl.session",
               "root/kyt-web-admin.txt")
 
 
@@ -217,7 +242,7 @@ def buat_backup_vps():
     pasangan.append((_var_bot(), "usr/bin/kyt/var.txt"))
     if _db_web():
         pasangan.append((_db_web(), "opt/kyt-web/data/web.db"))
-    tmpdb = tempfile.mkdtemp(prefix="kytbkdb-")
+    tmpdb = tempfile.mkdtemp(prefix="kytbkdb-", dir=TMP_DIR)
     sudah = set()
     try:
         with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED, strict_timestamps=False) as z:
@@ -343,7 +368,7 @@ def cek_backup(path_zip):
             for dbarc, label in (("usr/bin/kyt/database.db", "bot"),
                                  ("opt/kyt-web/data/web.db", "website")):
                 if dbarc in nama:
-                    tmpdb = tempfile.mkdtemp(prefix="kytcek-")
+                    tmpdb = tempfile.mkdtemp(prefix="kytcek-", dir=TMP_DIR)
                     try:
                         z.extract(dbarc, tmpdb)
                         dbf = os.path.join(tmpdb, dbarc)
@@ -536,6 +561,7 @@ def _muat_ulang_service():
     for u in _unit_openvpn():
         daftar.append((u, "restart"))
     daftar += [("ws", "restart"),
+               ("udp-custom", "restart"),
                ("udp-mini-1", "restart"),
                ("udp-mini-2", "restart"),
                ("udp-mini-3", "restart"),
@@ -564,7 +590,7 @@ def restore_vps(path_zip):
     if not ok_cek:
         return False, pesan_cek
 
-    tmp = tempfile.mkdtemp(prefix="kytrestore-")
+    tmp = tempfile.mkdtemp(prefix="kytrestore-", dir=TMP_DIR)
     try:
         with zipfile.ZipFile(path_zip) as z:
             for n in z.namelist():
@@ -594,7 +620,11 @@ def restore_vps(path_zip):
         except Exception:
             pass
     for _dir in ("/opt/kyt-web", "/etc/nginx", "/etc/haproxy",
-                 "/etc/ssl/kyt-web", "/etc/kyt", "/etc/letsencrypt"):
+                 "/etc/ssl/kyt-web", "/etc/kyt", "/etc/letsencrypt",
+                 "/etc/xray", "/etc/ssh", "/etc/vmess", "/etc/vless",
+                 "/etc/trojan", "/etc/shadowsocks", "/etc/l2tp", "/etc/ppp",
+                 "/etc/limit", "/etc/bot", "/root/akun", "/root/udp",
+                 "/var/www/html", "/var/lib/kyt", "/etc/systemd/system"):
         try:
             if os.path.isdir(_dir):
                 os.makedirs(os.path.dirname(cadangan + _dir), exist_ok=True)
@@ -625,6 +655,9 @@ def restore_vps(path_zip):
     if slowdns_zip:
         _service_aksi("slowdns", "stop")
         _service_aksi("slowdns-router", "stop")
+    # binary UDP custom berjalan dari /root/udp -> harus distop dulu
+    if os.path.isdir(os.path.join(tmp, "root", "udp")):
+        _service_aksi("udp-custom", "stop")
     if web_ada:
         _service_aksi("kyt-web", "stop")
         for suffix in ("-wal", "-shm", "-journal"):
@@ -700,6 +733,20 @@ def restore_vps(path_zip):
         except Exception:
             pass
 
+    # Kunci host SSH WAJIB 0600. Kalau tidak, sshd menolak start
+    # ("no hostkeys available") setelah restore.
+    try:
+        os.chmod("/etc/ssh", 0o755)
+    except Exception:
+        pass
+    for _pat, _mode in (("/etc/ssh/ssh_host_*_key", 0o600),
+                        ("/etc/ssh/ssh_host_*_key.pub", 0o644)):
+        for _f in glob.glob(_pat):
+            try:
+                os.chmod(_f, _mode)
+            except Exception:
+                pass
+
     # pastikan database bot punya tabel lengkap
     try:
         S.init_store()
@@ -708,7 +755,8 @@ def restore_vps(path_zip):
 
     # Pulihkan permission execute pada binary/script di /root/slowdns
     # (zip/shutil.copy2 bisa kehilangan execute bit dari file epoch-0)
-    for _exe in ("/root/slowdns/slowdns", "/root/slowdns/install.sh"):
+    for _exe in ("/root/slowdns/slowdns", "/root/slowdns/install.sh",
+                 "/root/udp/udp-custom"):
         try:
             if os.path.isfile(_exe):
                 os.chmod(_exe, 0o755)
@@ -785,7 +833,7 @@ def restore_db(path_file):
     tmp = None
 
     if zipfile.is_zipfile(path_file):
-        tmp = tempfile.mkdtemp(prefix="kytdb-")
+        tmp = tempfile.mkdtemp(prefix="kytdb-", dir=TMP_DIR)
         try:
             with zipfile.ZipFile(path_file) as z:
                 kandidat = [n for n in z.namelist()
@@ -867,7 +915,7 @@ async def _minta_file(event, judul):
         await balas(event, "❌ Itu bukan file. Kirim sebagai **dokumen** (.zip/.db).")
         return None
     nama = getattr(m.file, "name", None) or "upload.bin"
-    path = os.path.join("/tmp", "kytupload-%s-%s" % (DT.datetime.now().strftime("%H%M%S"), nama))
+    path = os.path.join(TMP_DIR, "kytupload-%s-%s" % (DT.datetime.now().strftime("%H%M%S"), nama))
     try:
         await m.download_media(path)
     except Exception as e:
@@ -1056,7 +1104,7 @@ async def rs_vps_go(event):
         await event.answer("Akses Ditolak", alert=True)
         return
     nama = event.data.decode().replace("rs-vps-go-", "")
-    path = os.path.join("/tmp", nama)
+    path = os.path.join(TMP_DIR, nama)
     if not os.path.isfile(path):
         await event.answer("File sudah tidak ada. Ulangi dari menu.", alert=True)
         return

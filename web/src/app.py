@@ -4568,45 +4568,159 @@ def _xray_output_host(raw: str) -> str:
     )
     return match.group(1).strip() if match else ""
 
-def format_xray_output(raw: str, protocol: str = "", server_id: int = 0) -> str:
-    """Tambahkan info SlowDNS ke output Xray sesuai mode DNS server.
+ONERING_CONF = Path("/etc/kyt-onering.conf")
 
-    Mode xray-*  -> tampil Host, Host Slowdns, Pub Key, dan Mode SlowDNS.
-    Mode ssh/off -> baris SlowDNS lama dibuang supaya tidak menyesatkan.
-    """
+
+def onering_config() -> tuple[bool, str, list[str]]:
+    """Baca /etc/kyt-onering.conf: (aktif, host, daftar bug)."""
+    enabled = True
+    host = ""
+    bugs: list[str] = []
+    try:
+        for raw in ONERING_CONF.read_text(errors="ignore").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip().upper()
+            value = value.strip().strip("'\"")
+            if key == "ENABLED":
+                enabled = value.lower() in ("1", "true", "yes", "on")
+            elif key == "HOST" and value:
+                host = value
+            elif key == "BUGS":
+                for bug in re.split(r"[\s,]+", value):
+                    bug = bug.strip().strip("'\"")
+                    if bug and bug not in bugs:
+                        bugs.append(bug)
+    except OSError:
+        pass
+    return enabled, host, bugs
+
+
+def _onering_cred(raw: str, protocol: str) -> tuple[str, str]:
+    """Ambil kredensial + host dari output akun. Return (cred, host)."""
+    text = raw or ""
+    proto = (protocol or "").lower()
+    if proto == "vmess":
+        m = re.search(r"vmess://([A-Za-z0-9+/=_-]+)", text)
+        if m:
+            token = m.group(1).strip()
+            token += "=" * (-len(token) % 4)
+            try:
+                data = json.loads(base64.b64decode(token, altchars=b"-_").decode("utf-8", "ignore"))
+                return str(data.get("id") or ""), str(data.get("host") or data.get("add") or "")
+            except Exception:
+                pass
+    elif proto in ("vless", "trojan"):
+        m = re.search(r"%s://([^@\s]+)@([^:\s]+):(\d+)\?([^\s#]+)" % proto, text)
+        if m:
+            cred = urllib.parse.unquote(m.group(1)).strip()
+            query = urllib.parse.parse_qs(m.group(4))
+            host = (query.get("host") or [""])[0].strip()
+            return cred, host
+    m = re.search(r"(?im)^[ \t]*(?:UUID|User ID|Password|id)[ \t]*:[ \t]*"
+                  r"([0-9a-fA-F][0-9a-fA-F-]{15,})", text)
+    cred = m.group(1).strip() if m else ""
+    host = ""
+    mh = re.search(r"(?im)^[ \t]*(?:Host|host)[ \t]*:[ \t]*([^\s#]+)", text)
+    if mh:
+        host = mh.group(1).strip()
+    return cred, host
+
+
+def onering_links(protocol: str, raw: str) -> list[tuple[str, str]]:
+    """Buat link bug-SNI Onering (WS) untuk output akun website."""
+    proto = (protocol or "").lower()
+    if proto not in ("vmess", "vless", "trojan"):
+        return []
+    enabled, cfg_host, bugs = onering_config()
+    if not enabled or not bugs:
+        return []
+    cred, link_host = _onering_cred(raw, proto)
+    host = link_host or cfg_host
+    if not cred or not host:
+        return []
+    hasil: list[tuple[str, str]] = []
+    for bug in bugs:
+        sni = "onering:%s:%s" % (host, bug)
+        if proto == "vmess":
+            obj = {
+                "v": "2", "ps": "ONERING-WS", "add": bug, "port": "443",
+                "id": cred, "aid": "0", "net": "ws", "path": "/vmess",
+                "type": "none", "host": host, "tls": "tls", "sni": sni,
+            }
+            token = base64.b64encode(
+                json.dumps(obj, separators=(",", ":")).encode("utf-8")
+            ).decode("ascii")
+            link = "vmess://" + token
+        elif proto == "vless":
+            query = [
+                ("encryption", "none"), ("security", "tls"), ("type", "ws"),
+                ("host", host), ("sni", sni), ("fp", "chrome"), ("path", "/vless"),
+            ]
+            link = "vless://%s@%s:443?%s#ONERING-WS" % (
+                cred, bug, urllib.parse.urlencode(query))
+        else:
+            query = [
+                ("security", "tls"), ("type", "ws"), ("host", host),
+                ("sni", sni), ("fp", "chrome"), ("path", "/trojan-ws"),
+            ]
+            link = "trojan://%s@%s:443?%s#ONERING-WS" % (
+                cred, bug, urllib.parse.urlencode(query))
+        hasil.append(("WS", link))
+    return hasil
+
+
+def _tambah_onering(raw: str, protocol: str = "") -> str:
+    if not raw or "ONERING" in raw.upper():
+        return raw
+    links = onering_links(protocol, raw)
+    if not links:
+        return raw
+    block = [SSH_BOX_SEP, " BUG SNI / ONERING", SSH_BOX_SEP]
+    for label, link in links:
+        block.append(f" {label:<17}: {link}")
+    block.append(SSH_BOX_SEP)
+    return raw.rstrip("\n") + "\n" + "\n".join(block)
+
+
+def format_xray_output(raw: str, protocol: str = "", server_id: int = 0) -> str:
+    """Tambahkan info SlowDNS + link bug-SNI Onering ke output Xray."""
     sid = int(server_id or 0)
     raw = clean_output(raw or "")
+    prefix = ""
     if sid > 0:
         raw = REMOTE_DNS_FIELD_RE.sub("", raw)
         raw = re.sub(r"\n{3,}", "\n\n", raw).strip("\n")
         info = remote_slowdns_info(sid, "xray")
-        if not info:
-            return raw
-        dns = node_dns_info(sid)
-        host = str(dns.get("host") or "").strip() or _xray_output_host(raw)
-        block: list[str] = [SSH_BOX_SEP, " Xray DNS Account", SSH_BOX_SEP]
-        if host:
-            block.append(f" {'Host':<17}: {host}")
-        for label, value in info:
-            block.append(f" {label:<17}: {value}")
-        block.append(SSH_BOX_SEP)
-        return "\n".join(block) + "\n" + raw
-    raw = SLOWDNS_FIELD_RE.sub("", raw)
-    raw = re.sub(r"\n{3,}", "\n\n", raw).strip("\n")
-    if not raw:
-        return raw
-    info = slowdns_info("xray")
-    if not info:
-        return raw
-    settings = get_settings()
-    host = (settings.get("domain") or "").strip() or _xray_output_host(raw)
-    block: list[str] = [SSH_BOX_SEP, " Xray DNS Account", SSH_BOX_SEP]
-    if host:
-        block.append(f" {'Host':<17}: {host}")
-    for label, value in info:
-        block.append(f" {label:<17}: {value}")
-    block.append(SSH_BOX_SEP)
-    return "\n".join(block) + "\n" + raw
+        if info:
+            dns = node_dns_info(sid)
+            host = str(dns.get("host") or "").strip() or _xray_output_host(raw)
+            block: list[str] = [SSH_BOX_SEP, " Xray DNS Account", SSH_BOX_SEP]
+            if host:
+                block.append(f" {'Host':<17}: {host}")
+            for label, value in info:
+                block.append(f" {label:<17}: {value}")
+            block.append(SSH_BOX_SEP)
+            prefix = "\n".join(block) + "\n"
+    else:
+        raw = SLOWDNS_FIELD_RE.sub("", raw)
+        raw = re.sub(r"\n{3,}", "\n\n", raw).strip("\n")
+        info = slowdns_info("xray")
+        if info:
+            settings = get_settings()
+            host = (settings.get("domain") or "").strip() or _xray_output_host(raw)
+            block = [SSH_BOX_SEP, " Xray DNS Account", SSH_BOX_SEP]
+            if host:
+                block.append(f" {'Host':<17}: {host}")
+            for label, value in info:
+                block.append(f" {label:<17}: {value}")
+            block.append(SSH_BOX_SEP)
+            prefix = "\n".join(block) + "\n"
+    hasil = (prefix + raw) if raw else prefix.rstrip("\n")
+    return _tambah_onering(hasil, protocol)
+
 
 def format_account_output(service: str, protocol: str, raw: str, kind: str = "",
                           server_id: int = 0) -> str:

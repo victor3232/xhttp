@@ -135,10 +135,7 @@ ms-dns 8.8.8.8
 ms-dns 1.1.1.1
 asyncmap 0
 auth
-crtscts
-lock
 hide-password
-modem
 name l2tpd
 proxyarp
 lcp-echo-interval 30

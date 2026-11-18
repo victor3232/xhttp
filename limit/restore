@@ -234,7 +234,9 @@ echo -e "       -> ${GREEN}${CAD}${NC}"
 
 # ---------- 3. ekstrak ----------
 echo -e " ${CYAN}[3/5]${NC} Mengekstrak zip..."
-TMP=$(mktemp -d /tmp/kytrestore.XXXXXX)
+TMPBASE="${KYT_TMPDIR:-/var/tmp}"
+mkdir -p "$TMPBASE"
+TMP=$(mktemp -d "$TMPBASE/kytrestore.XXXXXX")
 if ! unzip -oq "$ZIP" -d "$TMP" 2>/dev/null; then
     echo -e " ${RED}Gagal mengekstrak. Restore dibatalkan.${NC}"
     rm -rf "$TMP"
@@ -305,6 +307,9 @@ if mode == "full":
         tipe = info.get("type")
         if tipe == "file":
             if not os.path.isfile(p):
+                # Backup lama mencatat .pyc padahal zip mengecualikannya.
+                if rel.endswith(".pyc") or "__pycache__" in rel.split("/"):
+                    continue
                 err.append("hilang: %s" % rel)
             elif os.path.getsize(p) != info.get("size"):
                 err.append("ukuran berubah: %s" % rel)
@@ -536,6 +541,14 @@ rm -rf "$TMP"
 for f in /etc/shadow /etc/gshadow; do
     [ -f "$f" ] && chmod 640 "$f" 2>/dev/null
 done
+# Kunci host SSH wajib 0600, kalau tidak sshd gagal start setelah restore.
+[ -d /etc/ssh ] && chmod 755 /etc/ssh 2>/dev/null
+for _k in /etc/ssh/ssh_host_*_key; do
+    [ -f "$_k" ] && chmod 600 "$_k" 2>/dev/null
+done
+for _k in /etc/ssh/ssh_host_*_key.pub; do
+    [ -f "$_k" ] && chmod 644 "$_k" 2>/dev/null
+done
 for f in /etc/ipsec.secrets /etc/ppp/chap-secrets /etc/xray/xray.key /etc/haproxy/hap.pem \
          /etc/kyt-web-mail.key /etc/kyt-web.conf /etc/kyt-web-node.key \
          /etc/kyt-node/agent.json /opt/kyt-web/data/web.db \
@@ -548,6 +561,7 @@ done
 # Pulihkan execute bit binary slowdns (bisa hilang setelah extract zip)
 [ -f /root/slowdns/slowdns ] && chmod 755 /root/slowdns/slowdns 2>/dev/null
 [ -f /root/slowdns/install.sh ] && chmod 755 /root/slowdns/install.sh 2>/dev/null
+[ -f /root/udp/udp-custom ] && chmod 755 /root/udp/udp-custom 2>/dev/null
 for f in /usr/local/sbin/jeda-mullog /usr/local/sbin/setting-jeda /usr/local/sbin/utility \
          /usr/local/sbin/kyt-web-configure-edge /usr/local/sbin/setting-web /usr/bin/limit-ip \
          /etc/xray/limit.ssh /usr/local/sbin/slowdns-router /usr/local/sbin/slowdns-rcvbuf \
@@ -679,7 +693,7 @@ ipsec reload >/dev/null 2>&1
 
 # ---------- hitung akun ----------
 hitung() { grep -oE "^$1 [^ ]+" "$2" 2>/dev/null | awk '{print $2}' | sort -u | wc -l; }
-AKUN_SSH=$(awk -F: '$3 >= 1000 && $1 != "nobody" && $7 ~ /(nologin|false)/ {print $1}' /etc/passwd 2>/dev/null | wc -l)
+AKUN_SSH=$(awk '/^#ssh# /{print $2}' /etc/ssh/.ssh.db 2>/dev/null | sort -u | wc -l)
 AKUN_VM=$(hitung "###" /etc/xray/config.json)
 AKUN_VL=$(hitung "#&"  /etc/xray/config.json)
 AKUN_TR=$(hitung "#!"  /etc/xray/config.json)

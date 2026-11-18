@@ -152,6 +152,7 @@ BERKAS="
 FOLDER="
 /var/www/html
 /etc/l2tp
+/etc/ppp
 /etc/xl2tpd
 /etc/ipsec.d
 /etc/openvpn
@@ -178,7 +179,9 @@ FOLDER="
 
 echo -e " ${CYAN}[1/4]${NC} Mengumpulkan data akun..."
 JUMLAH=0
-SEMENTARA=$(mktemp -d /tmp/kytbackup.XXXXXX)
+TMPBASE="${KYT_TMPDIR:-/var/tmp}"
+mkdir -p "$TMPBASE"
+SEMENTARA=$(mktemp -d "$TMPBASE/kytbackup.XXXXXX")
 LEWAT=""
 
 siapkan() {
@@ -353,6 +356,10 @@ def db_info(rel):
 hashes = {}
 for walk_root, _dirs, files in os.walk(root):
     for fn in files:
+        # zip dibuat dengan -x "*.pyc": jangan catat pyc di manifest,
+        # kalau tidak verifikasi restore akan menganggap file "hilang".
+        if fn.endswith(".pyc") or "__pycache__" in walk_root.split(os.sep):
+            continue
         p = os.path.join(walk_root, fn)
         rel = os.path.relpath(p, root).replace(os.sep, "/")
         if rel == "kyt-backup-manifest.json":

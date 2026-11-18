@@ -43,6 +43,12 @@ res1() {
         printf "# Onering bug SNI\nENABLED=0\nHOST=%s\nBUGS=\n" "$(cat /etc/xray/domain 2>/dev/null)" > /etc/kyt-onering.conf
         chmod 644 /etc/kyt-onering.conf
     fi
+    # pppd 2.5 (Debian 13) tidak mengenal crtscts/lock/modem.
+    # Baris itu membuat L2TP gagal connect setelah restore/install.
+    if [ -f /etc/ppp/options.xl2tpd ]; then
+        sed -i -e '/^crtscts$/d' -e '/^lock$/d' -e '/^modem$/d' /etc/ppp/options.xl2tpd
+        systemctl restart xl2tpd >/dev/null 2>&1 || true
+    fi
     # Refresh limiter quota Xray: akun yang quota-nya habis TIDAK dihapus,
     # hanya dinonaktifkan supaya bisa diperpanjang.
     for _p in vmess vless trojan shadowsocks; do
