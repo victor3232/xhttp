@@ -201,7 +201,6 @@ FOLDER = [
     "/etc/kyt-node",       # konfigurasi agent node
     "/etc/cron.d",         # jadwal limiter
     "/var/spool/cron/crontabs",  # cron root
-    "/etc/systemd/system", # unit service kustom
 ]
 
 # hanya path dengan awalan ini yang boleh ditulis saat restore (anti zip-slip)
