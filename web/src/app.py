@@ -4689,6 +4689,8 @@ def format_xray_output(raw: str, protocol: str = "", server_id: int = 0) -> str:
     """Tambahkan info SlowDNS + link bug-SNI Onering ke output Xray."""
     sid = int(server_id or 0)
     raw = clean_output(raw or "")
+    # Output VLESS lama memakai garis 🎱 putus-putus. Samakan dengan UI VMess.
+    raw = re.sub(r"🎱[^\n]*?🎱", "━━━━━━━━━━━━━━━━━━━", raw)
     prefix = ""
     if sid > 0:
         raw = REMOTE_DNS_FIELD_RE.sub("", raw)
