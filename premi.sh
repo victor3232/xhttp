@@ -1171,6 +1171,11 @@ function menu(){
     fi
     rm -rf menu
     rm -rf menu.zip
+    # Onering bug SNI: host = domain VPS, bug ditambah lewat: kyt-onering add bug.domain
+    if [ ! -s /etc/kyt-onering.conf ]; then
+        printf "# Onering bug SNI\nHOST=%s\nBUGS=\n" "$(cat /etc/xray/domain 2>/dev/null)" > /etc/kyt-onering.conf
+        chmod 644 /etc/kyt-onering.conf
+    fi
 }
 
 # Timer Mullog (suspend sementara akun SSH/Xray)

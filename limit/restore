@@ -413,6 +413,7 @@ if [ -d "$AKAR/etc" ]; then
     [ -d "$AKAR/etc/default" ]      && salin "$AKAR/etc/default"      "/etc/default"
     [ -f "$AKAR/etc/kyt.txt" ]      && salin "$AKAR/etc/kyt.txt"      "/etc/kyt.txt"
     [ -f "$AKAR/etc/kyt-theme.conf" ] && salin "$AKAR/etc/kyt-theme.conf" "/etc/kyt-theme.conf"
+    [ -f "$AKAR/etc/kyt-onering.conf" ] && salin "$AKAR/etc/kyt-onering.conf" "/etc/kyt-onering.conf"
     [ -f "$AKAR/etc/kyt-license.conf" ] && salin "$AKAR/etc/kyt-license.conf" "/etc/kyt-license.conf"
     [ -d "$AKAR/etc/kyt" ]          && salin "$AKAR/etc/kyt"          "/etc/kyt"
     [ -d "$AKAR/etc/limit" ]        && salin "$AKAR/etc/limit"        "/etc/limit"

@@ -77,6 +77,7 @@ BERKAS="
 /etc/xray/isp
 /etc/xray/dns
 /etc/kyt-dns-mode
+/etc/kyt-onering.conf
 /usr/local/sbin/slowdns-router
 /etc/systemd/system/slowdns-router.service
 /etc/xray/xray.crt

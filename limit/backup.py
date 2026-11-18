@@ -129,6 +129,7 @@ BERKAS = [
     "/etc/ipsec.conf",
     "/etc/kyt-theme.conf",
     "/etc/kyt-dns-mode",
+    "/etc/kyt-onering.conf",
     "/etc/kyt-license.conf",
     "/usr/local/sbin/slowdns-router",
     "/etc/systemd/system/slowdns-router.service",
@@ -144,6 +145,7 @@ BERKAS = [
     "/etc/kyt/jeda-mullog.conf",
     "/etc/kyt-web.conf",
     "/etc/kyt-web-mail.key",
+    "/etc/kyt-bot-node.key",
     "/root/kyt-web-admin.txt",
     "/etc/nginx/conf.d/vpnfree.conf",
     "/etc/haproxy/vpnfree.pem",
@@ -192,7 +194,8 @@ IZIN = ("etc/xray/", "etc/ssh/", "etc/vmess/", "etc/vless/", "etc/trojan/",
 IZIN_TEPAT = ("etc/passwd", "etc/group", "etc/shadow", "etc/gshadow",
               "etc/ipsec.secrets", "etc/ipsec.conf", "etc/kyt.txt",
               "etc/kyt-theme.conf", "etc/kyt-dns-mode", "etc/kyt-license.conf",
-              "etc/kyt-web.conf", "etc/kyt-web-mail.key",
+              "etc/kyt-onering.conf",
+              "etc/kyt-web.conf", "etc/kyt-web-mail.key", "etc/kyt-bot-node.key",
               "root/kyt-web-admin.txt")
 
 
@@ -364,7 +367,7 @@ def cek_backup(path_zip):
         "etc/l2tp/.l2tp.db", "etc/ppp/chap-secrets", "etc/ipsec.secrets",
         "etc/xray/xray.crt", "etc/haproxy/hap.pem",
         "usr/bin/kyt/gomerch_token.json", "etc/bot/.bot.db",
-        "etc/kyt-web.conf", "etc/kyt-web-mail.key",
+        "etc/kyt-web.conf", "etc/kyt-web-mail.key", "etc/kyt-bot-node.key",
     )]
     if hilang:
         return False, ("Backup tidak lengkap. Tidak ada: %s"
