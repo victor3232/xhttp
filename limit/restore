@@ -109,7 +109,20 @@ if [[ "$PILIH" == "t" || "$PILIH" == "T" ]]; then
     read -rp " Paste File ID: " FIDS
     [ -z "$FIDS" ] && { menu-backup; exit 0; }
     echo -e " ${CYAN}Downloading dari Telegram...${NC}"
-    FPATH=$(curl -s "https://api.telegram.org/bot${KEY}/getFile?file_id=${FIDS}" | python3 -c "import sys,json;print(json.load(sys.stdin).get('result',{}).get('file_path',''))" 2>/dev/null)
+    get_file_path() {
+        curl -s --max-time 20 "https://api.telegram.org/bot${1}/getFile?file_id=${FIDS}" \
+            | python3 -c "import sys,json;print(json.load(sys.stdin).get('result',{}).get('file_path',''))" 2>/dev/null
+    }
+    FPATH=$(get_file_path "$KEY")
+    # Di VPS baru, token bot bisa berbeda dengan token yang mengunggah backup.
+    # Kalau file_id tidak dikenali, minta token bot asli (pemilik file).
+    if [ -z "$FPATH" ]; then
+        echo -e " ${YELLOW}File ID tidak dikenali oleh token bot di VPS ini.${NC}"
+        read -rp " Bot Token pemilik file backup (Enter=batal): " KEY2
+        [ -z "$KEY2" ] && { menu-backup; exit 0; }
+        KEY="$KEY2"
+        FPATH=$(get_file_path "$KEY")
+    fi
     if [ -z "$FPATH" ]; then
         echo -e " ${RED}File ID tidak valid atau bot error.${NC}"
         read -n1 -s -rp " Press any key..."; menu-backup; exit 1
