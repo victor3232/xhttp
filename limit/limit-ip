@@ -12,8 +12,10 @@ export -f wget curl 2>/dev/null || true
 # Per-user limit files are authoritative: missing/0 = unlimited.
 set -u
 
-LOG=/var/log/xray/access.log
+LOG="${XRAY_ACCESS_LOG:-/var/log/xray/access.log}"
 LOCK=/run/xray-limit-ip.lock
+DRY_RUN="${LIMIT_IP_DRY_RUN:-0}"
+ONCE="${LIMIT_IP_ONCE:-0}"
 
 case "${1:-}" in
   vmip) MARK='###';  PROTO='vmess';       DB=/etc/vmess/.vmess.db;       DIR=/etc/kyt/limit/vmess/ip ;;
@@ -78,6 +80,19 @@ count_user_ips() {
     ' "$LOG" 2>/dev/null | sort -u
 }
 
+group_networks() {
+    # Satu jaringan seluler sering berputar IP dalam /24 yang sama.
+    # Hitung /24 (IPv4) sebagai satu "IP" supaya tidak salah suspend.
+    awk 'NF {
+        if ($0 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {
+            split($0, a, ".")
+            print a[1] "." a[2] "." a[3] ".0/24"
+        } else {
+            print $0
+        }
+    }' | sort -u
+}
+
 delete_user() {
     local user="$1" exp
     exec 9>"$LOCK"
@@ -93,7 +108,7 @@ delete_user() {
 }
 
 while true; do
-    sleep 60
+    [ "$ONCE" = "1" ] || sleep 60
     [ -r "$LOG" ] || continue
     [ -d "$DIR" ] || continue
     for file in "$DIR"/*; do
@@ -108,7 +123,7 @@ while true; do
         fi
         # Ignore access-log entries from before the last restore. This prevents
         # an immediate re-suspend when the configured duration is < 10 minutes.
-        _cut_epoch=$(date -d '10 minutes ago' +%s 2>/dev/null || date +%s)
+        _cut_epoch=$(date -d '5 minutes ago' +%s 2>/dev/null || date +%s)
         _last_restore=""
         [ -x /usr/local/sbin/jeda-mullog ] && _last_restore=$(/usr/local/sbin/jeda-mullog last-restore xray "$PROTO" "$user" 2>/dev/null)
         if [[ "$_last_restore" =~ ^[0-9]+$ ]] && [ "$_last_restore" -gt "$_cut_epoch" ]; then
@@ -117,7 +132,13 @@ while true; do
         cutoff=$(date -d "@$_cut_epoch" '+%Y/%m/%d %H:%M:%S' 2>/dev/null || date '+%Y/%m/%d %H:%M:%S')
         mapfile -t ips < <(count_user_ips "$user" "$cutoff")
         count=${#ips[@]}
-        if [ "$count" -gt "$iplimit" ]; then
+        mapfile -t nets < <(printf '%s\n' "${ips[@]}" | group_networks)
+        net_count=${#nets[@]}
+        if [ "$net_count" -gt "$iplimit" ]; then
+            if [ "$DRY_RUN" = "1" ]; then
+                echo "would suspend $user raw=$count nets=$net_count limit=$iplimit"
+                continue
+            fi
             _jeda_rc=2
             if [ -x /usr/local/sbin/jeda-mullog ]; then
                 /usr/local/sbin/jeda-mullog suspend xray "$PROTO" "$user" "$iplimit" "$count" >/dev/null 2>&1
@@ -136,4 +157,5 @@ while true; do
             fi
         fi
     done
+    [ "$ONCE" = "1" ] && exit 0
 done

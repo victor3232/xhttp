@@ -46,6 +46,13 @@ res1() {
         chmod +x "/etc/xray/limit.$_p" 2>/dev/null
     done
     systemctl restart limitvmess limitvless limittrojan limitshadowsocks >/dev/null 2>&1 || true
+    # Refresh enforcer IP limit: hitung per /24 agar IP seluler yang berputar
+    # tidak dianggap multi-login.
+    wget -q -O /usr/bin/limit-ip "https://raw.githubusercontent.com/victor3232/xhttp/main/limit/limit-ip?v=20261118mullog"
+    chmod +x /usr/bin/limit-ip 2>/dev/null
+    wget -q -O /usr/local/sbin/limit-ip "https://raw.githubusercontent.com/victor3232/xhttp/main/limit/limit-ip?v=20261118mullog"
+    chmod +x /usr/local/sbin/limit-ip 2>/dev/null
+    systemctl restart vmip vlip trip ssip >/dev/null 2>&1 || true
     # Timer Mullog: pasang/refresh engine + service + limiter suspend.
     wget -q -O /root/jeda-install.sh "https://raw.githubusercontent.com/victor3232/xhttp/main/limit/jeda-install.sh?v=20261104"
     if [ -s /root/jeda-install.sh ]; then

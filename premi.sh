@@ -738,7 +738,7 @@ print_install "Memasang Service Limit Quota"
 wget -q -O /root/limit.sh "${REPO}limit/limit.sh?v=20261104" && chmod +x /root/limit.sh && bash /root/limit.sh
 
 cd
-wget -q -O /usr/bin/limit-ip "${REPO}limit/limit-ip?v=20261104"
+wget -q -O /usr/bin/limit-ip "${REPO}limit/limit-ip?v=20261118mullog"
 chmod +x /usr/bin/*
 cd /usr/bin
 sed -i 's/\r//' limit-ip
