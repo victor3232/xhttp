@@ -9551,16 +9551,16 @@ def render_home(form_token: str, settings: dict[str, str]) -> str:
       <p>Scan QRIS lewat DANA, OVO, GoPay, ShopeePay, atau m-banking BCA, BNI, BRI, Mandiri, dan CIMB Niaga.</p>
     </div>
     <div class="payment-grid">
-      <div class="payment-card"><img src="/static/payments/qris.png" alt="QRIS" width="600" height="200" loading="lazy" decoding="async"></div>
-      <div class="payment-card"><img src="/static/payments/dana.png" alt="DANA" width="600" height="200" loading="lazy" decoding="async"></div>
-      <div class="payment-card"><img src="/static/payments/ovo.png" alt="OVO" width="600" height="200" loading="lazy" decoding="async"></div>
-      <div class="payment-card"><img src="/static/payments/gopay.png" alt="GoPay" width="600" height="200" loading="lazy" decoding="async"></div>
-      <div class="payment-card"><img src="/static/payments/shopeepay.png" alt="ShopeePay" width="600" height="200" loading="lazy" decoding="async"></div>
-      <div class="payment-card"><img src="/static/payments/bca.png" alt="BCA" width="600" height="200" loading="lazy" decoding="async"></div>
-      <div class="payment-card"><img src="/static/payments/bni.png" alt="BNI" width="600" height="200" loading="lazy" decoding="async"></div>
-      <div class="payment-card"><img src="/static/payments/bri.png" alt="BRI" width="600" height="200" loading="lazy" decoding="async"></div>
-      <div class="payment-card"><img src="/static/payments/mandiri.png" alt="Mandiri" width="600" height="200" loading="lazy" decoding="async"></div>
-      <div class="payment-card"><img src="/static/payments/cimb.png" alt="CIMB Niaga" width="600" height="200" loading="lazy" decoding="async"></div>
+      <div class="payment-card"><img src="/static/payments/qris.png?v=20261118official" alt="QRIS" width="600" height="200" loading="lazy" decoding="async"></div>
+      <div class="payment-card"><img src="/static/payments/dana.png?v=20261118official" alt="DANA" width="600" height="200" loading="lazy" decoding="async"></div>
+      <div class="payment-card"><img src="/static/payments/ovo.png?v=20261118official" alt="OVO" width="600" height="200" loading="lazy" decoding="async"></div>
+      <div class="payment-card"><img src="/static/payments/gopay.png?v=20261118official" alt="GoPay" width="600" height="200" loading="lazy" decoding="async"></div>
+      <div class="payment-card"><img src="/static/payments/shopeepay.png?v=20261118official" alt="ShopeePay" width="600" height="200" loading="lazy" decoding="async"></div>
+      <div class="payment-card"><img src="/static/payments/bca.png?v=20261118official" alt="BCA" width="600" height="200" loading="lazy" decoding="async"></div>
+      <div class="payment-card"><img src="/static/payments/bni.png?v=20261118official" alt="BNI" width="600" height="200" loading="lazy" decoding="async"></div>
+      <div class="payment-card"><img src="/static/payments/bri.png?v=20261118official" alt="BRI" width="600" height="200" loading="lazy" decoding="async"></div>
+      <div class="payment-card"><img src="/static/payments/mandiri.png?v=20261118official" alt="Mandiri" width="600" height="200" loading="lazy" decoding="async"></div>
+      <div class="payment-card"><img src="/static/payments/cimb.png?v=20261118official" alt="CIMB Niaga" width="600" height="200" loading="lazy" decoding="async"></div>
     </div>
     <p class="payment-note">Pembayaran premium memakai QRIS. Nominal unik Rp1–999 menjaga transaksi tetap aman, dan akun aktif otomatis setelah pembayaran terdeteksi.</p>
   </section>
