@@ -40,7 +40,7 @@ res1() {
     rm -rf menu
     rm -rf menu.zip
     if [ ! -s /etc/kyt-onering.conf ]; then
-        printf "# Onering bug SNI\nHOST=%s\nBUGS=\n" "$(cat /etc/xray/domain 2>/dev/null)" > /etc/kyt-onering.conf
+        printf "# Onering bug SNI\nENABLED=0\nHOST=%s\nBUGS=\n" "$(cat /etc/xray/domain 2>/dev/null)" > /etc/kyt-onering.conf
         chmod 644 /etc/kyt-onering.conf
     fi
     # Refresh limiter quota Xray: akun yang quota-nya habis TIDAK dihapus,
