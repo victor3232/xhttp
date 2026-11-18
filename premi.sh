@@ -1,7 +1,31 @@
 #!/bin/bash
 # ==========================================
-# FIX: Agar tidak muncul layar pink (Interactive)
+# FIX: Agar tidak muncul layar pink / needrestart (Ubuntu 22/24)
 export DEBIAN_FRONTEND=noninteractive
+export NEEDRESTART_MODE=a
+export NEEDRESTART_SUSPEND=1
+export APT_LISTCHANGES_FRONTEND=none
+
+# Cegah prompt konflik config dpkg di semua apt-get.
+if [ -d /etc/apt/apt.conf.d ]; then
+    cat > /etc/apt/apt.conf.d/99kyt-noninteractive <<'EOF'
+Dpkg::Options {
+   "--force-confdef";
+   "--force-confold";
+};
+EOF
+fi
+
+# Prompt Enter yang tidak menggantung saat ditinggal di tmux.
+tunggu_enter() {
+    local pesan="$1" detik="${2:-8}"
+    if [ "${KYT_AUTO:-0}" = "1" ] || [ ! -t 0 ]; then
+        return 0
+    fi
+    echo -e "$pesan"
+    read -t "$detik" -r -p "(otomatis lanjut dalam ${detik} detik - tekan Enter untuk langsung) " _ || true
+    echo ""
+}
 
 # Paksa IPv4 dan sediakan pengambil binary berbasis base64.
 wget() { command wget -4 "$@"; }
@@ -185,8 +209,7 @@ fi
 
 # // Validate Successfull
 echo ""
-read -p "$( echo -e "Press ${GRAY}[ ${NC}${green}Enter${NC} ${GRAY}]${NC} For Starting Installation") "
-echo ""
+tunggu_enter "$( echo -e "Press ${GRAY}[ ${NC}${green}Enter${NC} ${GRAY}]${NC} For Starting Installation")" 8
 clear
 if [ "${EUID}" -ne 0 ]; then
 		echo "You need to run this script as root"
@@ -303,7 +326,7 @@ function first_setup(){
     # === LOGIC UBUNTU ===
     if [[ "$OS_ID" == "ubuntu" ]]; then
         echo "Setup Dependencies Ubuntu $OS_VERSION..."
-        sudo apt update -y
+        apt update -y
         apt-get install --no-install-recommends software-properties-common -y
         
         if [[ "$OS_VERSION" == "22.04" ]] || [[ "$OS_VERSION" == "24.04" ]]; then
@@ -359,7 +382,7 @@ function first_setup(){
             echo deb "[signed-by=/usr/share/keyrings/haproxy.debian.net.gpg]" \
                 http://haproxy.debian.net buster-backports-1.8 main \
                 >/etc/apt/sources.list.d/haproxy.list
-            sudo apt-get update
+            apt-get update
             apt-get -y install haproxy=1.8.\*
         else
             # Debian 13 (trixie) dst
@@ -382,7 +405,7 @@ function nginx_install() {
     if [[ $(cat /etc/os-release | grep -w ID | head -n1 | sed 's/=//g' | sed 's/"//g' | sed 's/ID//g') == "ubuntu" ]]; then
         print_install "Setup nginx For OS Is $(cat /etc/os-release | grep -w PRETTY_NAME | head -n1 | sed 's/=//g' | sed 's/"//g' | sed 's/PRETTY_NAME//g')"
         # // sudo add-apt-repository ppa:nginx/stable -y 
-        sudo apt-get install nginx -y 
+        apt-get install nginx -y 
     elif [[ $(cat /etc/os-release | grep -w ID | head -n1 | sed 's/=//g' | sed 's/"//g' | sed 's/ID//g') == "debian" ]]; then
         print_success "Setup nginx For OS Is $(cat /etc/os-release | grep -w PRETTY_NAME | head -n1 | sed 's/=//g' | sed 's/"//g' | sed 's/PRETTY_NAME//g')"
         apt -y install nginx 
@@ -418,12 +441,12 @@ function base_package() {
         systemctl enable --now systemd-timesyncd >/dev/null 2>&1 || true
     fi
     apt_pasang sudo
-    sudo apt-get clean all
-    sudo apt-get autoremove -y
-    sudo apt-get install -y debconf-utils
-    sudo apt-get remove --purge exim4 -y
-    sudo apt-get remove --purge ufw firewalld -y
-    sudo apt-get install -y --no-install-recommends software-properties-common
+    apt-get clean all
+    apt-get autoremove -y
+    apt-get install -y debconf-utils
+    apt-get remove --purge exim4 -y
+    apt-get remove --purge ufw firewalld -y
+    apt-get install -y --no-install-recommends software-properties-common
     echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections
     echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections
     
@@ -1407,5 +1430,13 @@ secs_to_human "$(($(date +%s) - ${start}))"
 [ -n "$username" ] && sudo hostnamectl set-hostname "$username" 2>/dev/null
 echo -e "${green} Script Successfull Installed"
 echo ""
-read -p "$( echo -e "Press ${YELLOW}[ ${NC}${YELLOW}Enter${NC} ${YELLOW}]${NC} For Reboot") "
-reboot
+if [ "${KYT_NO_REBOOT:-0}" = "1" ]; then
+    echo "Reboot dilewati (KYT_NO_REBOOT=1)."
+else
+    echo "Reboot otomatis dalam 10 detik..."
+    if [ -t 0 ]; then
+        read -t 10 -r -p "Press Enter untuk reboot sekarang " _ || true
+        echo ""
+    fi
+    reboot
+fi

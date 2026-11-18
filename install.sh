@@ -34,5 +34,5 @@ if [ ! -s "$script" ] || ! bash -n "$script"; then echo "Installer kosong atau s
 chmod 700 "$script"
 echo "Installer: $script"
 echo "Jika SSH putus, sambungkan kembali sebagai root: tmux attach -t $SESSION"
-echo 'Installer bersifat interaktif dan mungkin meminta reboot.'
-tmux new-session -s "$SESSION" "bash '$script'; status=\$?; printf '\nInstaller keluar dengan status %s. Tekan Enter untuk menutup.\n' \"\$status\"; read -r"
+echo 'Installer akan lanjut otomatis; reboot otomatis setelah selesai (KYT_NO_REBOOT=1 untuk skip).'
+tmux new-session -s "$SESSION" "bash '$script'; status=\$?; printf '\nInstaller keluar dengan status %s. Menutup otomatis dalam 30 detik.\n' \"\$status\"; read -t 30 -r || true"
