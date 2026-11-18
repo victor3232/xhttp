@@ -1,4 +1,8 @@
 #!/bin/bash
+# Auto Force IPv4
+wget() { command wget -4 "$@"; }
+curl() { command curl -4 "$@"; }
+export -f wget curl 2>/dev/null || true
 function send-log(){
 CHATID=$(grep -E "^#bot# " "/etc/bot/.bot.db" | cut -d ' ' -f 3)
 KEY=$(grep -E "^#bot# " "/etc/bot/.bot.db" | cut -d ' ' -f 2)
@@ -67,18 +71,14 @@ for user in ${data[@]}
       if [ -e /etc/limit/shadowsocks/${user} ]; then
       Usage=$(cat /etc/limit/shadowsocks/${user});
       if [[ ${Usage} -gt ${checkLimit} ]]; then
-      exp=($(cat /etc/shadowsocks/.shadowsocks.db | grep '^###' | cut -d ' ' -f 2 | sort | uniq))
-      sed -i "/^#!# $user $exp/,/^},{/d" /etc/xray/config.json
-      sed -i "/^### $user $exp/d" /etc/shadowsocks/.shadowsocks.db
       bol=$(cat /etc/limit/shadowsocks/${user});
       total=$(con ${bol})
-      send-log
-        rm -f /etc/shadowsocks/$user
-        rm -f /etc/funny/limit/shadowsocks/ip/${user}
-        rm -f /etc/limit/shadowsocks/$user
-        rm -f /etc/limit/shadowsocks/quota/$user
-        rm -f /var/www/html/sodosokws-$user.txt
-      systemctl restart xray >> /dev/null 2>&1
+      total2=$(con ${checkLimit})
+      /usr/local/sbin/kyt-account-state expire ss "$user" "$(date +%F)" >/dev/null 2>&1
+      if [ "$?" -eq 0 ]; then
+          send-log
+          systemctl restart xray >> /dev/null 2>&1
+      fi
       else
       echo ""
       fi

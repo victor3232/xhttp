@@ -1408,6 +1408,17 @@ def renew_local_ssh_account(username: str, days: int, ip_limit: int,
                    stderr=subprocess.DEVNULL, timeout=20)
     subprocess.run(["chage", "-E", iso, username], stdout=subprocess.DEVNULL,
                    stderr=subprocess.DEVNULL, timeout=20)
+    subprocess.run(["passwd", "-u", username], stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL, timeout=20)
+    subprocess.run(["usermod", "-U", username], stdout=subprocess.DEVNULL,
+                   stderr=subprocess.DEVNULL, timeout=20)
+    try:
+        usage_path = Path(f"/etc/limit/ssh/{username}")
+        usage_path.parent.mkdir(parents=True, exist_ok=True)
+        usage_path.write_text("0\n")
+        Path(f"/etc/limit/ssh/{username}.lock").unlink(missing_ok=True)
+    except OSError:
+        pass
     if int(quota_gb or 0) > 0:
         try:
             Path(f"/etc/ssh/{username}").write_text(str(int(quota_gb) * 1024 ** 3))

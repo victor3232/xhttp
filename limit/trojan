@@ -1,4 +1,8 @@
 #!/bin/bash
+# Auto Force IPv4
+wget() { command wget -4 "$@"; }
+curl() { command curl -4 "$@"; }
+export -f wget curl 2>/dev/null || true
 function send-log(){
 CHATID=$(grep -E "^#bot# " "/etc/bot/.bot.db" 2>/dev/null | cut -d ' ' -f 3)
 KEY=$(grep -E "^#bot# " "/etc/bot/.bot.db" 2>/dev/null | cut -d ' ' -f 2)
@@ -73,17 +77,13 @@ for user in ${data[@]}
       if [ -e /etc/limit/trojan/${user} ]; then
       Usage=$(cat /etc/limit/trojan/${user});
       if [[ ${Usage} -gt ${checkLimit} ]]; then
-      exp=$(grep -w "^#! $user" "/etc/xray/config.json" | cut -d ' ' -f 3 | sort | uniq)
-      sed -i "/^#! $user $exp/,/^},{/d" /etc/xray/config.json
-      sed -i "/^#! $user $exp/d" /etc/trojan/.trojan.db
        total=$(con ${Usage})
-       send-log
-       rm -f /etc/funny/limit/trojan/ip/$user
-       rm -f /etc/limit/trojan/$user
-       rm -f /etc/limit/trojan/quota/$user
-       rm -f /etc/trojan/$user
-	   rm -f /var/www/html/trojan-$user.txt
-      systemctl restart xray >> /dev/null 2>&1
+       total2=$(con ${checkLimit})
+       /usr/local/sbin/kyt-account-state expire trojan "$user" "$(date +%F)" >/dev/null 2>&1
+       if [ "$?" -eq 0 ]; then
+           send-log
+           systemctl restart xray >> /dev/null 2>&1
+       fi
       else
       echo ""
       fi

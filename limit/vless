@@ -1,4 +1,8 @@
 #!/bin/bash
+# Auto Force IPv4
+wget() { command wget -4 "$@"; }
+curl() { command curl -4 "$@"; }
+export -f wget curl 2>/dev/null || true
 function send-log(){
 CHATID=$(grep -E "^#bot# " "/etc/bot/.bot.db" 2>/dev/null | cut -d ' ' -f 3)
 KEY=$(grep -E "^#bot# " "/etc/bot/.bot.db" 2>/dev/null | cut -d ' ' -f 2)
@@ -77,16 +81,11 @@ for user in ${data[@]}
       if [[ ${Usage} -gt ${checkLimit} ]]; then
       total=$(con ${Usage})
       total2=$(con ${checkLimit})
-      exp=$(grep -w "^#& $user" "/etc/xray/config.json" | cut -d ' ' -f 3 | sort | uniq)
-      sed -i "/^#& $user $exp/,/^},{/d" /etc/xray/config.json
-      sed -i "/^#& $user $exp/d" /etc/vless/.vless.db
-      send-log
-      rm -f /etc/funny/limit/vless/ip/$user
-	  rm -f /etc/vless/$user
-	  rm -f /etc/limit/vless/$user
-	  rm -f /etc/limit/vless/quota/$user
-	  rm -f /var/www/html/vless-$user.txt
-      systemctl restart xray >> /dev/null 2>&1
+      /usr/local/sbin/kyt-account-state expire vless "$user" "$(date +%F)" >/dev/null 2>&1
+      if [ "$?" -eq 0 ]; then
+          send-log
+          systemctl restart xray >> /dev/null 2>&1
+      fi
       else
       echo ""
       fi

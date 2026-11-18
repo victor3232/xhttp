@@ -1,4 +1,8 @@
 #!/bin/bash
+# Auto Force IPv4
+wget() { command wget -4 "$@"; }
+curl() { command curl -4 "$@"; }
+export -f wget curl 2>/dev/null || true
 function send-log(){
 CHATID=$(grep -E "^#bot# " "/etc/bot/.bot.db" 2>/dev/null | cut -d ' ' -f 3)
 KEY=$(grep -E "^#bot# " "/etc/bot/.bot.db" 2>/dev/null | cut -d ' ' -f 2)
@@ -35,69 +39,78 @@ function con() {
 }
 
 
-  while true; do
-  sleep 5
-  data=($(cat /etc/xray/config.json | grep '^###' | cut -d ' ' -f 2 | sort | uniq))
+DRY_RUN="${LIMIT_VMESS_DRY_RUN:-0}"
+INTERVAL="${LIMIT_VMESS_INTERVAL:-30}"
+ONCE="${LIMIT_VMESS_ONCE:-0}"
+
+while true; do
+  [ "$ONCE" = "1" ] || sleep "$INTERVAL"
+  data=($(grep '^###' /etc/xray/config.json | cut -d ' ' -f2 | sort | uniq))
   if [[ ! -e /etc/limit/vmess ]]; then
-  mkdir -p /etc/limit/vmess
+    mkdir -p /etc/limit/vmess
   fi
-  for user in ${data[@]}
-  do
-  xray api stats --server=127.0.0.1:10000 -name "user>>>${user}>>>traffic>>>downlink" >& /tmp/${user}
-  getThis=$(cat /tmp/${user} | awk '{print $1}');
-  if [[ ${getThis} != "failed" ]]; then
-        downlink=$(xray api stats --server=127.0.0.1:10000 -name "user>>>${user}>>>traffic>>>downlink" | grep -w "value" | awk '{print $2}' | cut -d '"' -f2);
-        if [ -e /etc/limit/vmess/${user} ]; then
-        plus2=$(cat /etc/limit/vmess/${user});
-        if [[ ${#plus2} -gt 0 ]]; then
-        plus3=$(( ${downlink} + ${plus2} ));
-        echo "${plus3}" > /etc/limit/vmess/"${user}"
-        xray api stats --server=127.0.0.1:10000 -name "user>>>${user}>>>traffic>>>downlink" -reset > /dev/null 2>&1
-        else
-        echo "${downlink}" > /etc/limit/vmess/"${user}"
-        xray api stats --server=127.0.0.1:10000 -name "user>>>${user}>>>traffic>>>downlink" -reset > /dev/null 2>&1
-        fi
-        else
-        echo "${downlink}" > /etc/limit/vmess/"${user}"
-        xray api stats --server=127.0.0.1:10000 -name "user>>>${user}>>>traffic>>>downlink" -reset > /dev/null 2>&1
-        fi
-        else
-      echo ""
-   fi
-done
-# Check ur Account
-for user in ${data[@]}
-  do
+
+  stats_json=$(timeout 10 xray api statsquery --server=127.0.0.1:10000 -pattern 'user>>>' -reset=false 2>/dev/null)
+  stats_file=$(mktemp /tmp/vmess_stats.XXXXXX)
+  printf '%s' "$stats_json" | python3 -c '
+import sys, json
+users = set(sys.argv[1:])
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for item in data.get("stat", []):
+    name = item.get("name", "")
+    if not name.startswith("user>>>"):
+        continue
+    parts = name.split(">>>")
+    if len(parts) < 4 or parts[1] not in users or parts[3] != "downlink":
+        continue
+    try:
+        value = int(item.get("value", 0))
+    except (TypeError, ValueError):
+        continue
+    if value > 0:
+        print("%s\t%d" % (parts[1], value))
+' "${data[@]}" > "$stats_file"
+
+  while IFS=$'\t' read -r user downlink; do
+    [ -n "$user" ] || continue
+    [[ "$downlink" =~ ^[0-9]+$ ]] || continue
+    if [ "$DRY_RUN" = "1" ]; then
+      echo "would add $user $downlink"
+      continue
+    fi
+    plus2=$(cat /etc/limit/vmess/"${user}" 2>/dev/null)
+    [[ "$plus2" =~ ^[0-9]+$ ]] || plus2=0
+    echo "$((downlink + plus2))" > /etc/limit/vmess/"${user}"
+    timeout 5 xray api stats --server=127.0.0.1:10000 -name "user>>>${user}>>>traffic>>>downlink" -reset >/dev/null 2>&1
+  done < "$stats_file"
+  rm -f "$stats_file"
+
+  # Check ur Account
+  for user in ${data[@]}; do
     if [ -e /etc/vmess/${user} ]; then
-      checkLimit=$(cat /etc/vmess/${user});
+      checkLimit=$(cat /etc/vmess/${user})
       if [[ ${#checkLimit} -gt 1 ]]; then
-      if [ -e /etc/limit/vmess/${user} ]; then
-      Usage=$(cat /etc/limit/vmess/${user});
-      total=$(con ${Usage})
-      total2=$(con ${checkLimit})
-      if [[ ${Usage} -gt ${checkLimit} ]]; then
-      exp=$(grep -w "^### $user" "/etc/xray/config.json" | cut -d ' ' -f 3 | sort | uniq)
-      sed -i "/^### $user $exp/,/^},{/d" /etc/xray/config.json
-      sed -i "/^### $user $exp/d" /etc/vmess/.vmess.db
-      send-log
-      rm -rf /etc/limit/vmess/${user}
-      rm -f /etc/kyt/limit/vmess/ip/$user
-	  rm -f /etc/vmess/$user
-	  rm -f /etc/limit/vmess/$user
-	  rm -f /etc/limit/vmess/quota/$user
-	  rm -f /var/www/html/vmess-$user.txt
-      systemctl restart xray >> /dev/null 2>&1
-      else
-      echo ""
+        if [ -e /etc/limit/vmess/${user} ]; then
+          Usage=$(cat /etc/limit/vmess/${user})
+          total=$(con ${Usage})
+          total2=$(con ${checkLimit})
+          if [[ ${Usage} -gt ${checkLimit} ]]; then
+            if [ "$DRY_RUN" = "1" ]; then
+              echo "would disable quota $user usage=$Usage limit=$checkLimit"
+            else
+              /usr/local/sbin/kyt-account-state expire vmess "$user" "$(date +%F)" >/dev/null 2>&1
+              if [ "$?" -eq 0 ]; then
+                send-log
+                systemctl restart xray >> /dev/null 2>&1
+              fi
+            fi
+          fi
+        fi
       fi
-      else
-      echo ""
-      fi
-      else
-      echo ""
-      fi
-      else
-      echo ""
     fi
   done
+  [ "$ONCE" = "1" ] && exit 0
 done

@@ -525,6 +525,20 @@ def _renew(service: str, protocol: str, user: str, payload: dict) -> dict:
                        stderr=subprocess.DEVNULL, timeout=20)
         subprocess.run(["chage", "-E", new_iso, user], stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL, timeout=20)
+        subprocess.run(["usermod", "-U", user], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=20)
+        subprocess.run(["passwd", "-u", user], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=20)
+        # Renew = periode baru: reset pemakaian kuota dan lepas lock quota-ssh.
+        try:
+            with open(paths["usage"], "w") as fh:
+                fh.write("0\n")
+        except Exception:
+            pass
+        try:
+            os.remove(paths["usage"] + ".lock")
+        except Exception:
+            pass
         if quota_gb is not None:
             q = max(0, min(10000, int(quota_gb)))
             if q > 0:
