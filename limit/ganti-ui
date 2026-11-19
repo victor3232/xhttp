@@ -1,0 +1,71 @@
+#!/bin/bash
+clear
+
+DASH="/usr/local/sbin/menu-dashboard"
+CLASSIC="/usr/local/sbin/menu-classic"
+ACTIVE="/usr/local/sbin/menu"
+
+if [ ! -f "$DASH" ] || [ ! -f "$CLASSIC" ]; then
+    echo " File template UI tidak lengkap."
+    echo " Butuh: $DASH dan $CLASSIC"
+    read -n 1 -s -r -p " Tekan apa saja..."
+    utility
+    exit 1
+fi
+
+if cmp -s "$ACTIVE" "$CLASSIC"; then
+    CUR=1; CURNAME="UI AWAL / KLASIK"
+elif cmp -s "$ACTIVE" "$DASH"; then
+    CUR=2; CURNAME="UI DASHBOARD"
+else
+    CUR=2; CURNAME="UI DASHBOARD (custom)"
+fi
+
+C=$'\033[38;2;80;220;255m'
+W=$'\033[97m'
+G=$'\033[92m'
+Y=$'\033[93m'
+N=$'\033[0m'
+B=$'\033[1m'
+
+echo ""
+printf ' %s%sGANTI MODE UI%s\n' "$B" "$W" "$N"
+printf ' %s%s%s\n' "$C" "──────────────────────────────────────────────" "$N"
+printf ' %sMode aktif : %s%d) %s%s\n' "$W" "$G" "$CUR" "$CURNAME" "$N"
+printf ' %s%s%s\n' "$C" "──────────────────────────────────────────────" "$N"
+printf '  %s1)%s %sUI AWAL / KLASIK%s\n' "$Y" "$N" "$W" "$N"
+printf '      tampilan kotak lama, menu utama klasik\n'
+printf '  %s2)%s %sUI DASHBOARD%s  %s(sekarang)%s\n' "$Y" "$N" "$W" "$N" "$G" "$N"
+printf '      tampilan dashboard, LIST ACCOUNTS kotak, theme-aware\n'
+printf ' %s%s%s\n' "$C" "──────────────────────────────────────────────" "$N"
+printf '  %s0)%s Kembali ke Utility\n' "$Y" "$N"
+printf ' %s%s%s\n' "$C" "──────────────────────────────────────────────" "$N"
+echo ""
+read -rp " Pilih mode [1-2 / 0]: " opt
+
+case "$opt" in
+    1)
+        cp -f "$CLASSIC" "$ACTIVE" && chmod 755 "$ACTIVE"
+        echo ""
+        echo " Mode UI diganti ke: UI AWAL / KLASIK"
+        sleep 1
+        clear
+        menu
+        ;;
+    2)
+        cp -f "$DASH" "$ACTIVE" && chmod 755 "$ACTIVE"
+        echo ""
+        echo " Mode UI diganti ke: UI DASHBOARD"
+        sleep 1
+        clear
+        menu
+        ;;
+    0)
+        utility
+        ;;
+    *)
+        echo " Pilihan tidak valid."
+        sleep 1
+        ganti-ui
+        ;;
+esac

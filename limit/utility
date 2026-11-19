@@ -33,7 +33,7 @@ sline
 sbar "MENU TAMBAHAN"
 sline
 echo -e " $(sopt2 1 "CEK RUNNING SERVICE")$(sopt2 11 "BCKUP & RESTORE BOT")"
-echo -e " $(sopt2 2 "INSTALL UDP")$(sopt2 12 "DELL ALL EXP")"
+echo -e " $(sopt2 2 "INSTALL UDP")$(sopt2 12 "NONAKTIFKAN EXPIRED")"
 echo -e " $(sopt2 3 "ADD BOT TELEGRAM")$(sopt2 13 "ADD BOT NOTIFIKASI")"
 echo -e " $(sopt2 4 "UPDATE SCRIPT")$(sopt2 14 "MONITOR")"
 echo -e " $(sopt2 5 "RESTART SERVICE")$(sopt2 15 "INSTALL DNS NONTON")"
@@ -46,12 +46,12 @@ echo -e " $(sopt2 21 "GANTI TEMA WARNA UI")$(sopt2 22 "CHECK BANDWIDTH")"
 echo -e " $(sopt2 23 "LIMIT SPEED")$(sopt2 24 "SLOWDNS ON/OFF")"
 echo -e " $(sopt2 25 "TIMER MULLOG")$(sopt2 26 "SETTING WEBSITE")"
 echo -e " $(sopt2 27 "TRIAL MANAGER")$(sopt2 28 "ADD SERVER")"
-echo -e " $(sopt2 29 "SET VPS UTAMA")"
+echo -e " $(sopt2 29 "SET VPS UTAMA")$(sopt2 30 "GANTI MODE UI")"
 sline
 echo -e " $(sopt2 0 "Back To Menu")"
 sline
 printf '\n'
-printf ' %sSelect From Options %s[1-29 / 0]%s : %s' "$SN" "$SB" "$SN" "$SR"
+printf ' %sSelect From Options %s[1-30 / 0]%s : %s' "$SN" "$SB" "$SN" "$SR"
 read -r menu
 case $menu in
 1) clear ;
@@ -140,6 +140,9 @@ case $menu in
    ;;
 29) clear ;
    set-master
+   ;;
+30) clear ;
+   ganti-ui
    ;;
 0) clear ;
    menu
