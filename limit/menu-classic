@@ -1,0 +1,155 @@
+#!/bin/bash
+# Guard against non-interactive terminal loop (cron/pipe/closed SSH)
+if [ ! -t 0 ] && [ -z "${SSH_TTY:-}" ]; then
+    exit 0
+fi
+clear
+ISP=$(cat /etc/xray/isp 2>/dev/null)
+CITY=$(cat /etc/xray/city 2>/dev/null)
+domain=$(cat /etc/xray/domain 2>/dev/null)
+IPVPS=$(curl -s --max-time 3 ipv4.icanhazip.com)
+MODEL=$(grep -w PRETTY_NAME /etc/os-release 2>/dev/null | cut -d'"' -f2)
+CPU_MODEL=$(awk -F: '/model name/ {gsub(/^[ \t]+/,"",$2); print $2; exit}' /proc/cpuinfo)
+CPU_CORES=$(nproc 2>/dev/null || echo 1)
+RAM_TOTAL=$(free -m | awk 'NR==2 {print $2}')
+RAM_USED=$(free -m | awk 'NR==2 {print $3}')
+RAM_GB=$(awk "BEGIN { printf \"%.0f\", $RAM_TOTAL / 1024 }")
+[[ "$RAM_GB" -lt 1 ]] && RAM_GB=1
+uptime_info=$(uptime -p 2>/dev/null | sed 's/^up //')
+
+_xray=$(systemctl is-active xray 2>/dev/null)
+_ws=$(systemctl is-active ws 2>/dev/null)
+[[ "$_ws" != "active" ]] && _ws=$(systemctl is-active ws-ssh 2>/dev/null)
+_ovpn=$(systemctl is-active openvpn 2>/dev/null)
+[[ "$_ovpn" != "active" ]] && _ovpn=$(systemctl is-active openvpn-server@server-tcp 2>/dev/null)
+
+ssh1=0
+while read -r _u; do
+    [ -n "$_u" ] || continue
+    _uid="$(id -u "$_u" 2>/dev/null)" || continue
+    [ "${_uid:-0}" -ge 1000 ] && ssh1=$((ssh1+1))
+done < <(awk '/^#ssh# /{print $2}' /etc/ssh/.ssh.db 2>/dev/null | sort -u)
+vmc=$(grep -c -E '^### ' /etc/xray/config.json 2>/dev/null); vma=$((vmc/5))
+vlx=$(grep -c -E '^#& ' /etc/xray/config.json 2>/dev/null); vla=$((vlx/5))
+trx=$(grep -c -E '^#! ' /etc/xray/config.json 2>/dev/null); trb=$((trx/5))
+ssx=$(grep -oE '^#!# [^ ]+' /etc/xray/config.json 2>/dev/null | awk '{print $2}' | sort -u | wc -l); ssa=$ssx
+l2tx=$(grep -oE '^### [^ ]+' /etc/l2tp/.l2tp.db 2>/dev/null | awk '{print $2}' | sort -u | wc -l); l2ta=${l2tx:-0}
+total=$(( ssh1 + vma + vla + trb + ssa + l2ta ))
+
+LICENSE_CONF="/etc/kyt-license.conf"
+LICENSE_URL=""
+[ -s "$LICENSE_CONF" ] && LICENSE_URL=$(tr -d '\r\n' < "$LICENSE_CONF" 2>/dev/null)
+LICENSE_URL="${KYT_LICENSE_URL:-${LICENSE_URL:-https://raw.githubusercontent.com/victor3232/xhttp/main}}"
+data_ip="${LICENSE_URL%/}/izin"
+MYIP="$IPVPS"
+username=$(curl -4 -sS --max-time 5 "$data_ip" 2>/dev/null | grep "$MYIP" | awk '{print $2}')
+exp=$(curl -4 -sS --max-time 5 "$data_ip" 2>/dev/null | grep "$MYIP" | awk '{print $3}')
+today=$(date +%Y-%m-%d)
+if [[ -n "$exp" && "$today" < "$exp" ]]; then _sts="Active"; _sc=$'\033[92m'; else _sts="Expired"; _sc=$'\033[91m'; fi
+
+stxt() { [[ "$1" == "active" ]] && printf 'ON' || printf 'OFF'; }
+scol() { [[ "$1" == "active" ]] && printf '\033[92m' || printf '\033[91m'; }
+sdot() { [[ "$1" == "active" ]] && printf '\033[92m●' || printf '\033[91m●'; }
+_up=0; for _s in "$_xray" "$_ws" "$_ovpn"; do [[ "$_s" == "active" ]] && _up=$((_up+1)); done
+if (( _up == 3 )); then _ov="GOOD"; _oc=$'\033[92m'; elif (( _up > 0 )); then _ov="WARN"; _oc=$'\033[93m'; else _ov="FAIL"; _oc=$'\033[91m'; fi
+
+# Tema UI tersimpan di /etc/kyt-theme.conf; gold adalah default.
+THEME=$(grep -E '^THEME=' /etc/kyt-theme.conf 2>/dev/null | cut -d= -f2 | tr -d ' ' | tr 'a-z' 'A-Z')
+case "$THEME" in
+  RED)    A=$'\033[38;2;248;113;113m'; AB=$'\033[38;2;185;28;28m';  AD=$'\033[38;2;127;29;29m';;
+  BLUE)   A=$'\033[38;2;96;165;250m';  AB=$'\033[38;2;29;78;216m';  AD=$'\033[38;2;30;64;175m';;
+  CYAN)   A=$'\033[38;2;34;211;238m';  AB=$'\033[38;2;8;145;178m';   AD=$'\033[38;2;22;101;120m';;
+  GREEN)  A=$'\033[38;2;74;222;128m';  AB=$'\033[38;2;21;128;61m';   AD=$'\033[38;2;22;101;52m';;
+  PURPLE) A=$'\033[38;2;192;132;252m'; AB=$'\033[38;2;126;34;206m';  AD=$'\033[38;2;88;28;135m';;
+  PINK)   A=$'\033[38;2;244;114;182m'; AB=$'\033[38;2;190;24;93m';   AD=$'\033[38;2;131;24;67m';;
+  WHITE)  A=$'\033[97m';              AB=$'\033[37m';              AD=$'\033[90m';;
+  *)      THEME=GOLD; A=$'\033[38;2;255;191;36m'; AB=$'\033[38;2;204;153;0m'; AD=$'\033[38;2;153;115;0m';;
+esac
+W=$'\033[38;2;255;255;255m'
+G=$'\033[92m'
+Y=$'\033[93m'
+R=$'\033[91m'
+B=$'\033[1m'
+N=$'\033[0m'
+
+L=61
+d() { printf '─%.0s' $(seq 1 $L); }
+ds() { printf '─%.0s' $(seq 1 "$1"); }
+t() { printf ' %s┌%s┐%s\n' "$AB" "$(d)" "$N"; }
+b() { printf ' %s└%s┘%s\n' "$AB" "$(d)" "$N"; }
+m() { printf ' %s├%s┤%s\n' "$AB" "$(d)" "$N"; }
+r() {
+    local c="$1" p
+    p=$(printf '%s' "$c" | sed 's/\x1b\[[0-9;]*m//g')
+    printf ' %s│%s%s%*s%s│%s\n' "$AB" "$N" "$c" "$((L-${#p}))" "" "$AB" "$N"
+}
+rc() {
+    local c="$1" p pad
+    p=$(printf '%s' "$c" | sed 's/\x1b\[[0-9;]*m//g')
+    pad=$(( (L - ${#p}) / 2 ))
+    printf ' %s│%s%*s%s%*s%s│%s\n' "$AB" "$N" "$pad" "" "$c" "$((L - ${#p} - pad))" "" "$AB" "$N"
+}
+hdr() {
+    local text="$1" tlen=${#1} side rest
+    side=$(( (L - tlen - 4) / 2 ))
+    rest=$(( L - side - tlen - 4 ))
+    printf ' %s%s %s│%s %s%s%s %s│%s %s%s\n' "$AD" "$(ds $((side-1)))" "$AB" "$N" "$A" "$B" "$text" "$AB" "$N" "$AD" "$(ds $((rest-1)))$N"
+}
+
+echo ""
+hdr "HITS SSH TUNNELING"
+t
+r "$(printf ' %s%-9s%s: %s%-47.47s%s' "$W" "OS"     "$AD" "$W" "$MODEL" "$N")"
+r "$(printf ' %s%-9s%s: %s%-47.47s%s' "$W" "CPU"    "$AD" "$W" "${CPU_CORES} Core ${CPU_MODEL}" "$N")"
+r "$(printf ' %s%-9s%s: %s%-47.47s%s' "$W" "RAM"    "$AD" "$W" "${RAM_USED}M / ${RAM_TOTAL}M (${RAM_GB} GB)" "$N")"
+r "$(printf ' %s%-9s%s: %s%-47.47s%s' "$W" "ISP"    "$AD" "$W" "${ISP} - ${CITY}" "$N")"
+r "$(printf ' %s%-9s%s: %s%-47.47s%s' "$W" "IP"     "$AD" "$W" "$IPVPS" "$N")"
+r "$(printf ' %s%-9s%s: %s%-47.47s%s' "$W" "DOMAIN" "$AD" "$W" "$domain" "$N")"
+r "$(printf ' %s%-9s%s: %s%-47.47s%s' "$W" "UPTIME" "$AD" "$W" "$uptime_info" "$N")"
+b
+echo ""
+t
+_xr="$(sdot "$_xray") ${W}XRAY${N} $(scol "$_xray")$(stxt "$_xray")${N}"
+_sw="$(sdot "$_ws") ${W}SSH-WS${N} $(scol "$_ws")$(stxt "$_ws")${N}"
+_ov2="$(sdot "$_ovpn") ${W}OPENVPN${N} $(scol "$_ovpn")$(stxt "$_ovpn")${N}"
+_gd="$(sdot "$([ $_up -gt 0 ] && echo active || echo x)") ${_oc}${B}${_ov}${N}"
+r " ${_xr}  ${AD}|${N}  ${_sw}  ${AD}|${N}  ${_ov2}  ${AD}|${N}  ${_gd}"
+b
+echo ""
+t
+_ct="${username:-N/A}, ${_sts} (${exp:-N/A})"
+rc "${W}Client${N} ${AD}:${N} ${_sc}${_ct}${N}"
+b
+echo ""
+t
+_acc="${W}SSH:${Y}${ssh1}${N}${AD}|${N}${W}VMESS:${Y}${vma}${N}${AD}|${N}${W}VLESS:${Y}${vla}${N}${AD}|${N}${W}TROJAN:${Y}${trb}${N}${AD}|${N}${W}SHADOW.S:${Y}${ssa}${N}${AD}|${N}${W}L2TP:${Y}${l2ta}${N}${AD}|${N}${W}TOTAL:${Y}${B}${total}${N}"
+r " ${_acc}"
+b
+echo ""
+hdr "MAIN MENU"
+t
+r "$(printf '  %s 1.%s  %s%-19s%s  %s 6.%s  %s%-19s%s' "$Y" "$N" "$W" "SSH / OpenVPN" "$N" "$Y" "$N" "$W" "L2TP / IKEv2" "$N")"
+r "$(printf '  %s 2.%s  %s%-19s%s  %s 7.%s  %s%-19s%s' "$Y" "$N" "$W" "VMess"         "$N" "$Y" "$N" "$W" "All Xray (Semua)" "$N")"
+r "$(printf '  %s 3.%s  %s%-19s%s  %s 8.%s  %s%-19s%s' "$Y" "$N" "$W" "VLess"         "$N" "$Y" "$N" "$W" "Backup & Restore" "$N")"
+r "$(printf '  %s 4.%s  %s%-19s%s  %s 9.%s  %s%-19s%s' "$Y" "$N" "$W" "Trojan"        "$N" "$Y" "$N" "$W" "Utility"          "$N")"
+r "$(printf '  %s 5.%s  %s%-19s%s' "$Y" "$N" "$W" "Shadowsocks" "$N")"
+b
+echo ""
+printf ' %s➜%s %sSelect %s[1-9]%s:%s ' "$Y" "$N" "$W" "$Y" "$W" "$N"
+if ! read -r opt; then
+    exit 0
+fi
+echo ""
+case $opt in
+1) clear; m-sshws ;;
+2) clear; m-vmess ;;
+3) clear; m-vless ;;
+4) clear; m-trojan ;;
+5) clear; m-ssws ;;
+6) clear; m-l2tp ;;
+7) clear; add-allxray ;;
+8) clear; menu-backup ;;
+9) clear; utility ;;
+0|x|q) clear; exit 0 ;;
+*) clear; exec menu ;;
+esac
