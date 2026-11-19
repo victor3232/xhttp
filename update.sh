@@ -43,8 +43,6 @@ res1() {
         printf "# Onering bug SNI\nENABLED=0\nHOST=%s\nBUGS=\n" "$(cat /etc/xray/domain 2>/dev/null)" > /etc/kyt-onering.conf
         chmod 644 /etc/kyt-onering.conf
     fi
-    # Tema default UI baru (putih/mono). Tidak menimpa pilihan user.
-    [ -s /etc/kyt-theme.conf ] || echo "THEME=WHITE" > /etc/kyt-theme.conf
     # pppd 2.5 (Debian 13) tidak mengenal crtscts/lock/modem.
     # Baris itu membuat L2TP gagal connect setelah restore/install.
     if [ -f /etc/ppp/options.xl2tpd ]; then
