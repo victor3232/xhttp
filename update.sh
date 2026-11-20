@@ -40,7 +40,7 @@ res1() {
     rm -rf menu
     rm -rf menu.zip
     if [ ! -s /etc/kyt-onering.conf ]; then
-        printf "# Onering bug SNI\nENABLED=0\nHOST=%s\nBUGS=\n" "$(cat /etc/xray/domain 2>/dev/null)" > /etc/kyt-onering.conf
+        printf "# Onering bug SNI\nENABLED=1\nHOST=%s\nBUGS=support.zoom.us\n" "$(cat /etc/xray/domain 2>/dev/null)" > /etc/kyt-onering.conf
         chmod 644 /etc/kyt-onering.conf
     fi
     # pppd 2.5 (Debian 13) tidak mengenal crtscts/lock/modem.
