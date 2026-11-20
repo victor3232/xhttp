@@ -1,0 +1,443 @@
+#!/bin/bash
+
+# ==== GARIS RGB (selaras dengan menu utama) ====
+KYTRB=("255;0;0" "255;64;0" "255;128;0" "255;192;0" "255;255;0" "192;255;0" \
+"128;255;0" "64;255;0" "0;255;0" "0;255;64" "0;255;128" "0;255;192" \
+"0;255;255" "0;192;255" "0;128;255" "0;64;255" "0;0;255" "64;0;255" \
+"128;0;255" "192;0;255" "255;0;255" "255;0;192" "255;0;128" "255;0;64")
+kytline() {
+    local n="${1:-19}" i=0 out="" c
+    while [ "$i" -lt "$n" ]; do
+        c=${KYTRB[$(( i % ${#KYTRB[@]} ))]}
+        out+=$'\033[38;2;'"$c"$'m━'
+        i=$((i+1))
+    done
+    printf '%s\033[0m\n' "$out"
+}
+kytrb() {
+    local n="${1:-19}" i=0 out="" c
+    while [ "$i" -lt "$n" ]; do
+        c=${KYTRB[$(( i % ${#KYTRB[@]} ))]}
+        out+=$'\033[38;2;'"$c"$'m━'
+        i=$((i+1))
+    done
+    printf '%s\033[0m' "$out"
+}
+# ==== akhir garis RGB ====
+Green="\e[92;1m"
+RED="\033[31m"
+YELLOW="\033[33m"
+BLUE="\033[36m"
+FONT="\033[0m"
+NS=$( cat /etc/xray/dns )
+PUB=$( cat /etc/slowdns/server.pub )
+GREENBG="\033[42;37m"
+REDBG="\033[41;37m"
+OK="${Green}--->${FONT}"
+ERROR="${RED}[ERROR]${FONT}"
+GRAY="\e[1;30m"
+NC='\e[0m'
+red='\e[1;31m'
+green='\e[0;32m'
+DF='\e[39m'
+Bold='\e[1m'
+Blink='\e[5m'
+yell='\e[33m'
+red='\e[31m'
+green='\e[32m'
+blue='\e[34m'
+PURPLE='\e[35m'
+cyan='\e[36m'
+Lred='\e[91m'
+Lgreen='\e[92m'
+Lyellow='\e[93m'
+NC='\e[0m'
+GREEN='\033[0;32m'
+ORANGE='\033[0;33m'
+LIGHT='\033[0;37m'
+grenbo="\e[92;1m"
+red() { echo -e "\\033[32;1m${*}\\033[0m"; }
+# Getting
+export CHATID=$(grep -E "^#bot# " "/etc/bot/.bot.db" 2>/dev/null | cut -d ' ' -f 3)
+export KEY=$(grep -E "^#bot# " "/etc/bot/.bot.db" 2>/dev/null | cut -d ' ' -f 2)
+export TIME="10"
+export URL="https://api.telegram.org/bot$KEY/sendMessage"
+clear
+#IZIN SCRIPT
+MYIP=$(curl -sS ipv4.icanhazip.com)
+echo -e "\e[32mloading...\e[0m"
+clear
+# Valid Script
+ipsaya=$(wget -qO- ipv4.icanhazip.com)
+data_server=$(curl -v --insecure --silent https://google.com/ 2>&1 | grep Date | sed -e 's/< Date: //')
+date_list=$(date +"%Y-%m-%d" -d "$data_server")
+LICENSE_CONF="/etc/kyt-license.conf"
+LICENSE_URL=""
+[ -s "$LICENSE_CONF" ] && LICENSE_URL=$(tr -d '\r\n' < "$LICENSE_CONF" 2>/dev/null)
+LICENSE_URL="${KYT_LICENSE_URL:-${LICENSE_URL:-https://raw.githubusercontent.com/victor3232/xhttp/main}}"
+data_ip="${LICENSE_URL%/}/izin"
+checking_sc() {
+  # --- ambil file izin, dengan batas waktu (tidak bisa menggantung) ---
+  _izin_txt=""
+  # Paksa IPv4; sebagian provider memblokir IPv6 dan mirror bisa membalas AKSES DITOLAK.
+  if command -v curl >/dev/null 2>&1; then
+    _izin_txt=$(curl -4 -fsSL --max-time 15 "$data_ip" 2>/dev/null)
+  fi
+  if [ -z "$_izin_txt" ] || printf '%s' "$_izin_txt" | grep -q 'AKSES DITOLAK'; then
+    if command -v wget >/dev/null 2>&1; then
+      _izin_txt=$(wget -4 -q --timeout=15 --tries=2 -O- "$data_ip" 2>/dev/null)
+    fi
+  fi
+  if printf '%s' "$_izin_txt" | grep -q 'AKSES DITOLAK'; then
+    _izin_txt=""
+  fi
+
+  # --- tidak bisa cek (internet/repo bermasalah) -> JANGAN blokir ---
+  if [ -z "$_izin_txt" ]; then
+    echo -e "[1;93m────────────────────────────────────────────[0m"
+    echo -e "[0;33m  Tidak bisa memeriksa file izin (koneksi/repo).[0m"
+    echo -e "[0;33m  Script dilanjutkan.[0m"
+    echo -e "[1;93m────────────────────────────────────────────[0m"
+    sleep 2
+    return 0
+  fi
+
+  _useexp=$(echo "$_izin_txt" | grep -w "$ipsaya" | awk '{print $3}' | head -n1)
+
+  # IP terdaftar dan masih berlaku -> lanjut
+  if [ -n "$_useexp" ] && [[ ! "$date_list" > "$_useexp" ]]; then
+    return 0
+  fi
+
+  # --- IP belum terdaftar / kedaluwarsa -> BERHENTI (tidak reboot) ---
+  echo -e "[1;93m────────────────────────────────────────────[0m"
+  echo -e "[42m          HITS SSH TUNNELING          [0m"
+  echo -e "[1;93m────────────────────────────────────────────[0m"
+  echo ""
+  echo -e "            ${RED}PERMISSION DENIED !${NC}"
+  if [ -z "$_useexp" ]; then
+    echo -e "   [0;33mIP VPS ini BELUM terdaftar di file izin:[0m"
+  else
+    echo -e "   [0;33mMasa izin VPS ini sudah BERAKHIR ($_useexp):[0m"
+  fi
+  echo -e "   [0;33mYour VPS${NC} $ipsaya [0;33mHas been Banned${NC}"
+  echo -e "[1;93m────────────────────────────────────────────[0m"
+  echo ""
+  echo -e "[0;33m  Script dihentikan. VPS TIDAK direboot.[0m"
+  echo -e "[0;33m  Tambahkan/perpanjang IP VPS ini di file 'izin'[0m"
+  echo -e "[0;33m  pada repo, lalu jalankan lagi scriptnya.[0m"
+  echo -e "[0;33m  Format: ### nama 2026-12-31 $ipsaya[0m"
+  echo ""
+  sleep 4
+  exit 1
+}
+checking_sc
+echo -e "\e[32mloading...\e[0m"
+clear
+
+domain=$(cat /etc/xray/domain)
+clear
+until [[ $user =~ ^[a-zA-Z0-9_]+$ && ${CLIENT_EXISTS} == '0' ]]; do
+  kytline 19
+  echo -e " CREATE VLESS ACCOUNT           "
+  kytline 19
+  read -rp "User: " -e user
+  CLIENT_EXISTS=$(grep -w $user /etc/xray/config.json | wc -l)
+
+  if [[ ${CLIENT_EXISTS} == '1' ]]; then
+    clear
+  kytline 19
+  echo -e " CREATE VLESS ACCOUNT           "
+  kytline 19
+    echo ""
+    echo "A client with the specified name was already created, please choose another name."
+    echo ""
+    kytline 19
+    read -n 1 -s -r -p "Press any key to back on menu"
+    menu
+  fi
+done
+uuid=$(cat /proc/sys/kernel/random/uuid)
+read -p "Expired (days): " masaaktif
+read -p "Limit User (GB): " Quota
+read -p "Limit User (IP): " iplimit
+tgl=$(date -d "$masaaktif days" +"%d")
+bln=$(date -d "$masaaktif days" +"%b")
+thn=$(date -d "$masaaktif days" +"%Y")
+expe="$tgl $bln, $thn"
+MASA_LABEL="${KYT_MASA_LABEL:-$masaaktif Hari}"
+EXPIRE_LABEL="${KYT_EXPIRES_LABEL:-$expe}"
+tgl2=$(date +"%d")
+bln2=$(date +"%b")
+thn2=$(date +"%Y")
+tnggl="$tgl2 $bln2, $thn2"
+exp=$(date -d "$masaaktif days" +"%Y-%m-%d")
+sed -i '/#vless$/a\#& '"$user $exp"'\
+},{"id": "'""$uuid""'","email": "'""$user""'"' /etc/xray/config.json
+sed -i '/#vlessgrpc$/a\#& '"$user $exp"'\
+},{"id": "'""$uuid""'","email": "'""$user""'"' /etc/xray/config.json
+sed -i '/#vlesshu$/a\#& '"$user $exp"'\
+},{"id": "'""$uuid""'","email": "'""$user""'"' /etc/xray/config.json
+sed -i '/#vlessxh$/a\#& '"$user $exp"'\
+},{"id": "'""$uuid""'","email": "'""$user""'"' /etc/xray/config.json
+sed -i '/#vlextls$/a\#& '"$user $exp"'\
+},{"id": "'""$uuid""'","flow": "'"xtls-rprx-vision"'","email": "'""$user""'"' /etc/xray/config.json
+
+vlesslink1="vless://${uuid}@${domain}:443?path=/vless&security=tls&encryption=none&type=ws#${user}"
+vlesslink2="vless://${uuid}@${domain}:80?path=/vless&encryption=none&type=ws#${user}"
+vlesslink3="vless://${uuid}@${domain}:443?mode=gun&security=tls&encryption=none&type=grpc&serviceName=vless-grpc&sni=${domain}#${user}"
+vlesslink4="vless://${uuid}@${domain}:443?path=/vless-hu&security=tls&encryption=none&type=httpupgrade&sni=${domain}#${user}"
+vlesslink5="vless://${uuid}@${domain}:443?path=/vless-xhttp&security=tls&encryption=none&type=xhttp&sni=${domain}#${user}"
+vlesslink6="vless://${uuid}@${domain}:8443?type=tcp&security=tls&encryption=none&flow=xtls-rprx-vision&sni=${domain}#${user}"
+if [ ! -e /etc/vless ]; then
+  mkdir -p /etc/vless
+fi
+
+if [[ $iplimit -gt 0 ]]; then
+mkdir -p /etc/kyt/limit/vless/ip
+echo -e "$iplimit" > /etc/kyt/limit/vless/ip/$user
+else
+echo > /dev/null
+fi
+
+if [ -z ${Quota} ]; then
+  Quota="0"
+fi
+
+c=$(echo "${Quota}" | sed 's/[^0-9]*//g')
+d=$((${c} * 1024 * 1024 * 1024))
+
+if [[ ${c} != "0" ]]; then
+  echo "${d}" >/etc/vless/${user}
+fi
+DATADB=$(cat /etc/vless/.vless.db | grep "^###" | grep -w "${user}" | awk '{print $2}')
+if [[ "${DATADB}" != '' ]]; then
+  sed -i "/\b${user}\b/d" /etc/vless/.vless.db
+fi
+echo "### ${user} ${exp} ${uuid} ${Quota} ${iplimit}" >>/etc/vless/.vless.db
+clear
+cat >/var/www/html/vless-$user.txt <<-END
+
+━━━━━━━━━━━━━━━━━━━
+HITS SSH 
+━━━━━━━━━━━━━━━━━━━
+$(slowdns-info xray)
+# Format Vless WS TLS
+
+- name: Vless-$user-WS TLS
+  server: ${domain}
+  port: 443
+  type: vless
+  uuid: ${uuid}
+  cipher: auto
+  tls: true
+  skip-cert-verify: true
+  servername: ${domain}
+  network: ws
+  ws-opts:
+    path: /vless
+    headers:
+      Host: ${domain}
+
+# Format Vless WS Non TLS
+
+- name: Vless-$user-WS (CDN) Non TLS
+  server: ${domain}
+  port: 80
+  type: vless
+  uuid: ${uuid}
+  cipher: auto
+  tls: false
+  skip-cert-verify: false
+  servername: ${domain}
+  network: ws
+  ws-opts:
+    path: /vless
+    headers:
+      Host: ${domain}
+  udp: true
+
+# Format Vless gRPC (SNI)
+
+- name: Vless-$user-gRPC (SNI)
+  server: ${domain}
+  port: 443
+  type: vless
+  uuid: ${uuid}
+  cipher: auto
+  tls: true
+  skip-cert-verify: true
+  servername: ${domain}
+  network: grpc
+  grpc-opts:
+  grpc-mode: gun
+    grpc-service-name: vless-grpc
+
+# Format Vless HTTPUpgrade (Upgrade)
+
+- name: Vless-$user-HTTPUpgrade
+  server: ${domain}
+  port: 443
+  type: vless
+  uuid: ${uuid}
+  cipher: auto
+  tls: true
+  skip-cert-verify: true
+  servername: ${domain}
+  network: httpupgrade
+  http-upgrade-opts:
+    path: /vless-hu
+    headers:
+      Host: ${domain}
+
+# Format Vless XHTTP
+
+- name: Vless-$user-XHTTP
+  server: ${domain}
+  port: 443
+  type: vless
+  uuid: ${uuid}
+  cipher: auto
+  tls: true
+  skip-cert-verify: true
+  servername: ${domain}
+  network: xhttp
+  xhttp-opts:
+    path: /vless-xhttp
+    headers:
+      Host: ${domain}
+
+# Format Vless XTLS-Vision (TCP TLS)
+
+- name: Vless-$user-XTLS-Vision
+  server: ${domain}
+  port: 8443
+  type: vless
+  uuid: ${uuid}
+  cipher: auto
+  tls: true
+  flow: xtls-rprx-vision
+  skip-cert-verify: true
+  servername: ${domain}
+  network: tcp
+
+━━━━━━━━━━━━━━━━━━━
+Link Akun Vless 
+━━━━━━━━━━━━━━━━━━━
+Link WS TLS     : 
+${vlesslink1}
+━━━━━━━━━━━━━━━━━━━
+Link WS NTLS    : 
+${vlesslink2}
+━━━━━━━━━━━━━━━━━━━
+Link GRPC       : 
+${vlesslink3}
+━━━━━━━━━━━━━━━━━━━
+Link HTTPUpgrade: 
+${vlesslink4}
+━━━━━━━━━━━━━━━━━━━
+Link XHTTP      : 
+${vlesslink5}
+━━━━━━━━━━━━━━━━━━━
+Link XTLS-Vision: 
+${vlesslink6}
+━━━━━━━━━━━━━━━━━━━
+
+
+END
+
+__onl_txt=$(/usr/local/sbin/kyt-onering links vless "$user" "$uuid" "$domain" 2>/dev/null || true)
+if [ -n "$__onl_txt" ]; then
+  printf '\nONERING / BUG SNI\n%s\n' "$__onl_txt" >> /var/www/html/vless-$user.txt
+fi
+
+TEXT="
+<code>━━━━━━━━━━━━━━━━━━━</code>
+<code>AKUN VLESS GRATIS</code>
+<code>━━━━━━━━━━━━━━━━━━━</code>
+<code>Remarks          : </code><code>${user}</code>
+<code>Domain           : </code><code>${domain}</code>
+<code>User ID          : </code><code>${uuid}</code>
+<code>Limit Quota      : </code><code>${Quota} GB</code>
+<code>Limit IP         : </code><code>${iplimit} IP</code>
+<code>Aktif Selama     : </code><code>${MASA_LABEL}</code>
+<code>Berakhir Pada    : </code><code>${EXPIRE_LABEL}</code>
+$(slowdns-info xray)
+<code>━━━━━━━━━━━━━━━━━━━</code>
+<code>Link WS TLS      : </code>
+<code>${vlesslink1}</code>
+<code>━━━━━━━━━━━━━━━━━━━</code>
+<code>Link WS NTLS     : </code>
+<code>${vlesslink2}</code>
+<code>━━━━━━━━━━━━━━━━━━━</code>
+<code>Link GRPC        : </code>
+<code>${vlesslink3}</code>
+<code>━━━━━━━━━━━━━━━━━━━</code>
+<code>Link HTTPUpgrade : </code>
+<code>${vlesslink4}</code>
+<code>━━━━━━━━━━━━━━━━━━━</code>
+<code>Link XHTTP       : </code>
+<code>${vlesslink5}</code>
+<code>━━━━━━━━━━━━━━━━━━━</code>
+<code>Link XTLS-Vision : </code>
+<code>${vlesslink6}</code>
+<code>━━━━━━━━━━━━━━━━━━━</code>
+"
+
+curl -s --max-time "${TIME:-10}" \
+  -d "chat_id=$CHATID" \
+  -d "disable_web_page_preview=1" \
+  -d "parse_mode=HTML" \
+  --data-urlencode "text=$TEXT" \
+  "$URL" >/dev/null
+
+systemctl restart xray
+systemctl restart nginx
+clear
+echo -e ""
+kytline 19
+echo -e " CREATE VLESS ACCOUNT           "
+kytline 19
+echo -e "Remarks     : ${user}"
+echo -e "Domain      : ${domain}"
+echo -e "User Quota  : ${Quota} GB"
+echo -e "User Ip       : ${iplimit} IP"
+echo -e "port TLS    : 400-900"
+#echo -e "Port DNS    : 443"
+echo -e "Port NTLS   : 80, 8080, 8081-9999"
+echo -e "Port HTTPUpgrade : 443"
+echo -e "Port XHTTP  : 443"
+echo -e "Port Vision : 8443"
+echo -e "User ID     : ${uuid}"
+#echo -e "Xray Dns.   : ${NS}"
+#echo -e "Pubkey.     : ${PUB}"
+echo -e "Encryption  : none"
+echo -e "Path TLS    : /vless "
+echo -e "ServiceName : vless-grpc"
+slowdns-info xray
+kytline 19
+echo -e "Link WS TLS : ${vlesslink1}"
+kytline 19
+echo -e "Link WS NTLS: ${vlesslink2}"
+kytline 19
+echo -e "Link GRPC   : ${vlesslink3}"
+kytline 19
+echo -e "Link HUPGRD : ${vlesslink4}"
+kytline 19
+echo -e "Link XHTTP  : ${vlesslink5}"
+kytline 19
+echo -e "Link VISION : ${vlesslink6}"
+kytline 19
+__onl=$(/usr/local/sbin/kyt-onering links vless "$user" "$uuid" "$domain" 2>/dev/null || true)
+if [ -n "$__onl" ]; then
+  echo -e "ONERING / BUG SNI"
+  kytline 19
+  printf '%s\n' "$__onl"
+  kytline 19
+fi
+echo -e "Format OpenClash : https://${domain}:81/vless-$user.txt"
+kytline 19
+echo -e "Aktif Selama     : $MASA_LABEL"
+echo -e "Dibuat Pada      : $tnggl"
+echo -e "Berakhir Pada    : $EXPIRE_LABEL"
+kytline 19
